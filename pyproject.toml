@@ -1,0 +1,19 @@
+[project]
+name = "shiroko-tools"
+version = "0"
+description = "Build-time tooling for the Shiroko renderer."
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+tools = [
+    "fonttools==4.60.1",
+    "freetype-py==2.5.1",
+    "uharfbuzz==0.51.1",
+    "pillow==11.3.0",
+    "pooch==1.9.0",
+    "xxhash>=4.0.1",
+]

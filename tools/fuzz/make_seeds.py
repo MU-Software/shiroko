@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Writes fuzz seeds into OUT/<target>/seed-* (run by the build, target fuzz_seeds).
+
+fuzz_package also starts from reduced real packages baked by the build for its cell size.
+tests/fuzz/corpus/<target>/ holds only regression inputs.
+"""
+import pathlib
+import struct
+import sys
+
+ROOT = pathlib.Path(sys.argv[1])
+
+
+def u16(v):
+    return struct.pack("<H", v & 0xFFFF)
+
+
+def i8(*vs):
+    return bytes(v & 0xFF for v in vs)
+
+
+# fuzz_tilemap: cfg, then ops (see tests/fuzz/fuzz_tilemap.c).
+def resize(rows, cols, font=0):
+    return bytes([3 | font << 3, rows, cols])
+
+
+def cell(row, col, s, span=1, flags=0, color=200):
+    return bytes([0]) + i8(row, col) + bytes([span - 1, flags, color, len(s)]) + s
+
+
+def text(row, col, s, wrap=True, run=None, flags=0, color=200):
+    fl = (1 if wrap else 0) | (2 if run else 0)
+    ra, rb = run or (0, 0)
+    return bytes([1]) + i8(row, col) + bytes([fl, ra, rb, flags, color]) + u16(len(s)) + s + bytes([0x08, 50])
+
+
+def clear(row, col, rows, cols, flags=0x80, color=90):
+    return bytes([2]) + i8(row, col, rows, cols) + bytes([flags, color])
+
+
+def measure(s, cols, wrap=True):
+    return bytes([4]) + i8(cols) + bytes([1 if wrap else 0]) + u16(len(s)) + s
+
+
+RENDER = bytes([5])
+
+
+def tick(t):
+    return bytes([6, t])
+
+
+def move(x, y, hide=False):
+    return bytes([7 | 8 | (0 if not hide else 16)]) + i8(x, y)
+
+
+# fuzz_driver: cfg, width, height, stride padding, seed, then batches of [count, commands...].
+def fill(rect, color=(255, 0, 0), dim=0):
+    return bytes([1, dim]) + i8(*rect) + bytes(color) + bytes([0, 0, 0, 0]) + u16(0) + i8(0, 0)
+
+
+def src_cmd(kind, rect, fmt, sw, sh, stride, length, origin=(0, 0)):
+    return bytes([kind, 0]) + i8(*rect) + bytes([200, 100, 50, fmt]) + i8(sw, sh) + bytes([stride]) + u16(length) + i8(*origin)
+
+
+def rotate(rot):
+    return bytes([5, 0]) + i8(0, 0, 0, 0) + bytes([0, 0, 0, 0, 0, 0, 0]) + u16(0) + i8(0, 0) + bytes([rot])
+
+
+def group(rect, clip, color=40):
+    return bytes([6]) + i8(*rect) + i8(*clip) + bytes([color])
+
+
+END = bytes([7])
+
+
+def batch(*cmds):
+    return bytes([len(cmds) - 1 + sum(1 for c in cmds if c[0] == 6)]) + b"".join(cmds)
+
+
+# fuzz_compositor: setup, then [op, arg, extra...] (see tests/fuzz/fuzz_compositor.c).
+def layer(slot, z, rect):
+    return bytes([0, slot]) + i8(z, *rect)
+
+
+def lfill(slot, rect, r=200):
+    return bytes([5, slot, 6, slot]) + i8(*rect) + bytes([r]) + bytes([8, slot])
+
+
+def image(slot, w, h):
+    return bytes([9, slot, w - 1, h - 1])
+
+
+def limage(slot, k, src, at):
+    return bytes([5, slot, 7, slot, k]) + i8(*src, *at) + bytes([8, slot])
+
+
+SUBMIT, PUMP = bytes([12, 0]), bytes([13, 0])
+
+
+def check(arg=0):
+    return bytes([25, 0x10 | arg])
+
+
+SEEDS = {
+    "fuzz_tilemap": [
+        # cached opaque rows whose inputs change one at a time (catches stale row-cache hits)
+        bytes([0x51]) + bytes([3 | 16, 1, 8]) + cell(0, 1, b"A", flags=0x80, color=0x11) + RENDER
+        + cell(0, 1, b"A", flags=0x80, color=0x12) + RENDER + cell(0, 1, b"A", flags=0x80, color=0x22) + RENDER
+        + cell(0, 1, b"A", 2, flags=0x80, color=0x22) + RENDER
+        + clear(0, 0, 1, 8, flags=0) + cell(0, 2, b"A", 2, flags=0x80, color=0x22) + RENDER
+        + cell(0, 2, b"A", 2, flags=0x88, color=0x22) + RENDER + cell(0, 2, b"B", 2, flags=0x88, color=0x22) + RENDER
+        + bytes([3 | 16, 2, 8]) + RENDER,
+        bytes([0]) + resize(3, 8) + text(0, 0, "A가😀B\tx\nwrap é".encode()) + RENDER,
+        bytes([2]) + resize(3, 8) + cell(0, 0, b"$", flags=0x80) + cell(0, 1, "가".encode(), 2)
+        + cell(1, 0, "👩‍💻".encode(), 2, 0x08) + cell(2, 7, b"", flags=0x80) + RENDER + cell(1, 1, b"x") + RENDER,
+        bytes([1 | 2 | 0x30]) + resize(4, 10) + text(0, 0, b"row one\nrow two\nrow three", run=(4, 7)) + RENDER
+        + move(-4, 8) + RENDER + clear(1, 2, 2, 4) + RENDER,
+        bytes([4 | 8]) + resize(2, 8) + cell(0, 0, b"b", flags=0x20) + cell(1, 0, b"c", flags=0x60) + RENDER
+        + tick(10) + RENDER + tick(10) + RENDER,
+        bytes([2]) + resize(3, 8) + text(0, 0, b"abc") + RENDER + resize(2, 4, 1) + RENDER + resize(0, 0) + RENDER,
+        bytes([2]) + resize(2, 6) + RENDER + cell(0, 5, "가".encode(), 2) + cell(5, 0, b"a") + cell(0, 0, b"\x1b")
+        + cell(0, 0, b"\xe1\x80") + text(0, 0, b"x", flags=0xFF) + clear(0, 0, 9, 9) + RENDER,
+        bytes([0]) + measure("👩‍💻🇰🇷👍🏽❤️❤A️⌚︎".encode(), 8) + measure(b"A\r\nB\rC\nD\n\n  ", 4)
+        + measure("가".encode(), 1) + measure(b"e" + "́".encode() * 20, 8) + measure(b"x", -1)
+        + measure(b"A\x1b[31mB", 8, False),
+        # Fails while the layout extent misses the columns of a TAB piece that wraps (library bug, reported).
+        bytes([0]) + measure(b"A\tB\t\tC", 3),
+    ],
+    "fuzz_driver": [
+        bytes([0, 23, 19, 0, 1]) + batch(fill((0, 0, 24, 20)), fill((2, 2, 10, 10), dim=1)),
+        bytes([1, 15, 15, 1, 2]) + batch(src_cmd(2, (1, 1, 9, 9), 0, 8, 8, 4, 64)),
+        bytes([0, 10, 10, 2, 3]) + batch(src_cmd(3, (0, 0, 4, 4), 2, 4, 4, 16, 64), src_cmd(4, (1, 1, 3, 3), 3, 4, 4, 8, 32)),
+        bytes([1, 7, 11, 0, 4]) + batch(rotate(1)) + batch(rotate(2)),
+        bytes([0, 5, 5, 0, 5]) + batch(fill((-3, -3, 30, 30))) + batch(src_cmd(2, (0, 0, 3, 3), 1, 2, 2, 2, 4)),
+        bytes([2 | 4, 16, 12, 0, 6]) + batch(group((0, 0, 16, 6), (0, 0, 16, 6)), fill((1, 1, 5, 5)), END)
+        + batch(group((0, 6, 16, 12), (4, 0, 12, 6)), src_cmd(2, (1, 7, 9, 11), 1, 8, 8, 8, 64), END)
+        + batch(group((0, 0, 16, 6), (2, 2, 6, 4)), fill((1, 1, 5, 5)), END),
+        bytes([4, 16, 12, 0, 7]) + batch(group((0, 0, 16, 6), (0, 0, 16, 6)), END) + batch(END) + batch(group((0, 0, 8, 8), (0, 0, 9, 9))),
+    ],
+    "fuzz_package": [
+        b"\x00",
+        b"\x00SHRFPKG1" + bytes(120),
+        b"\x08" + b"SHRFPKG1" + struct.pack("<HHIIIQQ", 2, 128, 1, 1, 0, 128, 200) + bytes(72),
+    ],
+    "fuzz_compositor": [
+        bytes([1]) + layer(0, 0, (0, 0, 64, 48)) + lfill(0, (4, 4, 40, 30)) + SUBMIT + PUMP + check(),
+        bytes([0 | 8 | 32]) + layer(0, 1, (-8, -8, 40, 40)) + layer(1, 0, (10, 10, 60, 44)) + lfill(0, (0, 0, 30, 30))
+        + lfill(1, (0, 0, 64, 64), 90) + image(0, 8, 8) + limage(1, 0, (0, 0, 8, 8), (2, 2)) + SUBMIT + PUMP
+        + bytes([21, 1, 21, 0]) + bytes([3, 1, 3]) + SUBMIT + PUMP + bytes([4, 0]) + check() + bytes([4, 0x80])
+        + bytes([10, 0]) + i8(0, 0, 4, 4) + check(),
+        bytes([1 | 32]) + layer(0, 0, (0, 0, 64, 48)) + lfill(0, (4, 4, 40, 30)) + bytes([25, 1]) + check()
+        + bytes([25, 2]) + check() + bytes([25, 3]) + check() + bytes([25, 8]) + check() + bytes([25, 4]) + check(),
+        bytes([2 | 4 | 32]) + layer(0, 0, (0, 0, 64, 48)) + lfill(0, (0, 0, 8, 8)) + bytes([23, 2]) + SUBMIT + PUMP
+        + bytes([19, 200]) + bytes([22, 0]) + PUMP + bytes([23, 1]) + PUMP + check(),
+        bytes([1]) + bytes([17, 1]) + SUBMIT + PUMP + bytes([17, 4]) + SUBMIT + PUMP + PUMP + bytes([15, 3]) + SUBMIT
+        + PUMP + bytes([15, 0, 16, 1]) + SUBMIT + PUMP + bytes([16, 3, 24, 1]) + SUBMIT + PUMP + bytes([24, 0]) + check(),
+        bytes([1 | 8]) + image(0, 4, 4) + image(1, 8, 8) + image(2, 8, 8) + layer(0, 0, (0, 0, 64, 48))
+        + limage(0, 1, (0, 0, 8, 8), (0, 0)) + bytes([11, 1]) + SUBMIT + PUMP + bytes([10, 0]) + i8(0, 0, 2, 2)
+        + bytes([1, 0]) + PUMP + bytes([9, 1, 3, 3]),
+    ],
+}
+
+for name, seeds in SEEDS.items():
+    d = ROOT / name
+    d.mkdir(parents=True, exist_ok=True)
+    for old in d.glob("seed-*"):
+        old.unlink()
+    for i, data in enumerate(seeds):
+        (d / f"seed-{i:02d}").write_bytes(data)

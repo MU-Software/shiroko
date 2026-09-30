@@ -1,0 +1,60 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "host",
+      "displayName": "Host debug (core, tests, headless example)",
+      "binaryDir": "${sourceDir}/build/host",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "host-rgbx",
+      "displayName": "Host debug with RGBX8888 screen pixels",
+      "binaryDir": "${sourceDir}/build/host-rgbx",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SHIROKO_PIXEL_FORMAT": "RGBX8888"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Host release",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "host",
+      "configurePreset": "host"
+    },
+    {
+      "name": "host-rgbx",
+      "configurePreset": "host-rgbx"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "host",
+      "configurePreset": "host",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "host-rgbx",
+      "configurePreset": "host-rgbx",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

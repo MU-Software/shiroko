@@ -1,0 +1,85 @@
+Shiroko
+Copyright (c) 2026 MUsoftware
+SPDX-License-Identifier: MIT (LICENSE)
+
+Third-party material compiled into the library:
+
+Unicode character data
+  The Unicode tables are generated at build time into the build tree
+  (<build dir>/generated/shr_gen_unicode_tables.c) by
+  tools/unicode/gen_unicode_tables.py from the Unicode 17.0.0 Character
+  Database and emoji data (fonts/text_profile.lock.json).
+  Copyright © Unicode, Inc. Unicode License v3 (LICENSES/Unicode-3.0.txt).
+
+Nerd Fonts codepoint set v3.4.0
+  The Nerd Fonts codepoint set in the text profile is the Private Use part of
+  the cmap of SymbolsNerdFontMono-Regular.ttf in NerdFontsSymbolsOnly v3.4.0
+  (fonts/text_profile.lock.json "nerd_font"). Copyright (c) 2014 Ryan L
+  McIntyre. MIT AND OFL-1.1 (LICENSES/Nerd-Fonts-LICENSE.md; component
+  licences in fonts/fonts.lock.json "licenses.nerd").
+
+Built-in emergency font
+  The built-in package is generated per cell size into the build tree
+  (<build dir>/generated/shr_gen_builtin_package.c) by
+  `tools/fontpack/fontpack.py builtin`: bitmaps rasterised from Meslo LG S
+  Regular v1.2.1 (modified: subset to ASCII and U+FFFD, rasterised, repacked).
+  Copyright © 2009 Apple Inc. Copyright © 2006 by Tavmjong Bah.
+  Copyright © 2003 by Bitstream, Inc. Apache License 2.0
+  (LICENSES/Apache-2.0.txt); inherited Bitstream Vera / Arev notices in
+  LICENSES/Meslo-inherited-DejaVu-Bitstream.txt.
+
+xxHash (vcpkg port xxhash, inlined into the library)
+  Copyright (c) 2012-2021 Yann Collet. All rights reserved.
+  BSD-2-Clause:
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+
+uthash (vcpkg port uthash, header macros expanded into the library)
+  Copyright (c) 2005-2021, Troy D. Hanson http://troydhanson.github.com/uthash/
+  All rights reserved.
+  BSD-1-Clause:
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+      * Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+  IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+  TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+  PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+  OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+  EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+  PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+  PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+  LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Font packages (<build dir>/fonts, installed to share/shiroko/fonts; not part
+of the library) carry their own NOTICE, LICENSES/ and inventory.json written
+by tools/fontpack/fontpack.py.
+
+The examples/vt consumer links libghostty-vt (MIT, Ghostty authors) built with
+Zig 0.16.0; that app, not the library, must preserve those notices.

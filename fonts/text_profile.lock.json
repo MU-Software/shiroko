@@ -1,0 +1,87 @@
+{
+  "format": 1,
+  "unicode_version": "17.0.0",
+  "rules_version": 4,
+  "tab_stop": 4,
+  "cluster_max_scalars": 16,
+  "cluster_max_bytes": 64,
+  "sources": {
+    "UnicodeData.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt",
+      "sha256": "2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c"
+    },
+    "EastAsianWidth.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt",
+      "sha256": "ea7ce50f3444a050333448dffef1cadd9325af55cbb764b4a2280faf52170a33"
+    },
+    "DerivedCoreProperties.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt",
+      "sha256": "24c7fed1195c482faaefd5c1e7eb821c5ee1fb6de07ecdbaa64b56a99da22c08"
+    },
+    "GraphemeBreakProperty.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/GraphemeBreakProperty.txt",
+      "sha256": "d6b51d1d2ae5c33b451b7ed994b48f1f4dc62b2272a5831e7fd418514a6bae89"
+    },
+    "GraphemeBreakTest.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/GraphemeBreakTest.txt",
+      "sha256": "e2d134d2c52919bace503ebb6a551c1855fe1a1faec18478c78fff254a1793ec"
+    },
+    "emoji-data.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/emoji/emoji-data.txt",
+      "sha256": "2cb2bb9455cda83e8481541ecf5b6dfda66a3bb89efa3fa7c5297eccf607b72b"
+    },
+    "emoji-variation-sequences.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/emoji/emoji-variation-sequences.txt",
+      "sha256": "bb3d09ef03f206012c7532dd52dc0a21c9efddba0135ea4cf0d9201b8b9bba7e"
+    },
+    "emoji-sequences.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/emoji/emoji-sequences.txt",
+      "sha256": "12cc8267dc33cbd11ed32bcf6fc5dc2ad9c7a77bae1bdfba2f41b1b9b3ead8dd"
+    },
+    "emoji-zwj-sequences.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/emoji/emoji-zwj-sequences.txt",
+      "sha256": "5b25441daed2322b068c5e70cda522946a4f0274df864445a1965a92e5fc5cad"
+    },
+    "emoji-test.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/emoji/emoji-test.txt",
+      "sha256": "1d8a944f88d7952f7ef7c5167fef3c67995bcae24543949710231b03a201acda"
+    },
+    "Scripts.txt": {
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/Scripts.txt",
+      "sha256": "9f5e50d3abaee7d6ce09480f325c706f485ae3240912527e651954d2d6b035bf"
+    },
+    "NerdFontsSymbolsOnly-v3.4.0.zip": {
+      "url": "https://github.com/ryanoasis/nerd-fonts/releases/download/v3.4.0/NerdFontsSymbolsOnly.zip",
+      "sha256": "8e617904b980fe3648a4b116808788fe50c99d2d495376cb7c0badbd8a564c47"
+    }
+  },
+  "nerd_font": {
+    "comment": "Nerd provider: every Private Use scalar in this font's cmap.",
+    "file": "NerdFontsSymbolsOnly-v3.4.0.zip",
+    "member": "SymbolsNerdFontMono-Regular.ttf",
+    "sha256": "f0f624d9b474bea1662cf7e862d44aebe1ae1f6c7f9cb7a0ca5d0e5ac9561c60"
+  },
+  "cjk_class": {
+    "comment": "Provider selection only (locale CJK face); never affects width.",
+    "scripts": [
+      "Hangul",
+      "Han",
+      "Hiragana",
+      "Katakana",
+      "Bopomofo"
+    ],
+    "ranges": [
+      "2E80..2EFF",
+      "2F00..2FDF",
+      "2FF0..2FFF",
+      "3000..303F",
+      "3190..319F",
+      "31C0..31EF",
+      "3200..32FF",
+      "3300..33FF",
+      "FE10..FE1F",
+      "FE30..FE4F",
+      "FF00..FFEF"
+    ]
+  }
+}

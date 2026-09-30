@@ -1,0 +1,8 @@
+The shiroko_vt example links libghostty-vt, built from third_party/ghostty with
+-Dvt-features=-all,+render-state,+grid_introspection -Dsimd=false.
+Licence texts are in that submodule and in Zig's package cache (~/.cache/zig/p)
+after the first build.
+
+Ghostty            MIT    third_party/ghostty/LICENSE
+uucode             MIT    uucode package LICENSE.md (Unicode tables compiled into Ghostty)
+Zig compiler_rt    MIT    Zig LICENSE

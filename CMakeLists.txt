@@ -1,0 +1,185 @@
+cmake_minimum_required(VERSION 3.21)
+# Dependencies come from vcpkg; the toolchain must be known before project().
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  if(NOT CMAKE_TOOLCHAIN_FILE)
+    if(NOT DEFINED ENV{VCPKG_ROOT})
+      message(FATAL_ERROR "Shiroko needs vcpkg: set VCPKG_ROOT or CMAKE_TOOLCHAIN_FILE")
+    endif()
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+  endif()
+  if(NOT DEFINED SHIROKO_BUILD_TESTS OR SHIROKO_BUILD_TESTS)
+    set(VCPKG_MANIFEST_FEATURES tests)
+  endif()
+endif()
+project(shiroko VERSION 0.1.0 LANGUAGES C)
+
+option(SHIROKO_BUILD_TESTS "Build host unit tests" ${PROJECT_IS_TOP_LEVEL})
+option(SHIROKO_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+set(SHIROKO_SANITIZE "" CACHE STRING "Comma-separated sanitizers (address,leak,memory,thread,undefined,hwaddress,realtime)")
+option(SHIROKO_FUZZ "Build libFuzzer targets" OFF)
+
+set(SHIROKO_REALTIME OFF)
+
+if(SHIROKO_SANITIZE)
+  string(REPLACE "," ";" _san "${SHIROKO_SANITIZE}")
+  set(_known address leak memory thread undefined hwaddress realtime)
+  set(_exclusive 0)
+  foreach(s IN LISTS _san)
+    if(NOT s IN_LIST _known)
+      message(FATAL_ERROR "SHIROKO_SANITIZE: unknown sanitizer '${s}'")
+    endif()
+    if(s MATCHES "^(address|memory|thread|hwaddress)$")
+      math(EXPR _exclusive "${_exclusive} + 1")
+    endif()
+    if(CMAKE_C_COMPILER_ID STREQUAL "AppleClang" AND NOT s MATCHES "^(address|thread|undefined)$")
+      message(FATAL_ERROR "SHIROKO_SANITIZE: '${s}' is not supported by Apple Clang; use `make test-<name>-linux`")
+    endif()
+    if(s STREQUAL "realtime")
+      set(SHIROKO_REALTIME ON)
+    endif()
+  endforeach()
+  if(_exclusive GREATER 1)
+    message(FATAL_ERROR "SHIROKO_SANITIZE: address, memory, thread and hwaddress cannot be combined")
+  endif()
+
+  set(_flags "-fsanitize=${SHIROKO_SANITIZE}" -fno-omit-frame-pointer -fno-sanitize-recover=all -g)
+  if("undefined" IN_LIST _san)
+    # float-divide-by-zero is not part of `undefined`.
+    list(APPEND _flags -fsanitize=float-divide-by-zero)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+      list(APPEND _flags -fsanitize=integer)
+    endif()
+  endif()
+  if("memory" IN_LIST _san)
+    list(APPEND _flags -fsanitize-memory-track-origins=2)
+  endif()
+  if("hwaddress" IN_LIST _san)
+    # GNU ld mislinks HWASan tagged globals (SIGILL before main); use lld.
+    add_link_options(-fuse-ld=lld)
+  endif()
+  add_compile_options(${_flags})
+  add_link_options("-fsanitize=${SHIROKO_SANITIZE}")
+  if("undefined" IN_LIST _san)
+    add_link_options(-fsanitize=float-divide-by-zero $<$<C_COMPILER_ID:Clang,AppleClang>:-fsanitize=integer>)
+  endif()
+endif()
+
+if(SHIROKO_FUZZ)
+  if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR "SHIROKO_FUZZ needs LLVM clang with libFuzzer (not ${CMAKE_C_COMPILER_ID})")
+  endif()
+  add_compile_options(-fsanitize=fuzzer-no-link)
+endif()
+
+option(SHIROKO_WERROR "Treat warnings in the library and tests as errors" OFF)
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+  set(SHIROKO_WARNINGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion
+    $<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration> $<$<BOOL:${SHIROKO_WERROR}>:-Werror>)
+endif()
+
+option(SHIROKO_COVERAGE "Clang source-based coverage" OFF)
+if(SHIROKO_COVERAGE)
+  add_compile_options(-fprofile-instr-generate -fcoverage-mapping -fprofile-update=atomic)
+  add_compile_definitions(NDEBUG) # utlist's asserts: their failing side can only abort
+  add_link_options(-fprofile-instr-generate)
+endif()
+
+set(SHIROKO_CELL_WIDTH 8 CACHE STRING "Cell width in pixels baked into fonts and text (1..64)")
+set(SHIROKO_CELL_HEIGHT 16 CACHE STRING "Cell height (line height) in pixels (1..127)")
+# Glyph records hold a wide glyph (2 cells) and its bearing in a byte and an i8.
+if(NOT SHIROKO_CELL_WIDTH MATCHES "^[1-9][0-9]?$" OR SHIROKO_CELL_WIDTH GREATER 64 OR
+   NOT SHIROKO_CELL_HEIGHT MATCHES "^[1-9][0-9]*$" OR SHIROKO_CELL_HEIGHT GREATER 127)
+  message(FATAL_ERROR "SHIROKO_CELL_WIDTH must be in 1..64 and SHIROKO_CELL_HEIGHT in 1..127")
+endif()
+set(SHIROKO_PIXEL_FORMAT RGB565 CACHE STRING "Screen pixel format: RGB565 or RGBX8888")
+set_property(CACHE SHIROKO_PIXEL_FORMAT PROPERTY STRINGS RGB565 RGBX8888)
+if(NOT SHIROKO_PIXEL_FORMAT MATCHES "^(RGB565|RGBX8888)$")
+  message(FATAL_ERROR "SHIROKO_PIXEL_FORMAT must be RGB565 or RGBX8888")
+endif()
+add_library(shiroko_config INTERFACE)
+target_compile_definitions(shiroko_config INTERFACE SHR_CELL_WIDTH=${SHIROKO_CELL_WIDTH}
+  SHR_CELL_HEIGHT=${SHIROKO_CELL_HEIGHT} SHR_PIXEL_FORMAT=SHR_FORMAT_${SHIROKO_PIXEL_FORMAT}
+  $<$<BOOL:${SHIROKO_REALTIME}>:SHR_REALTIME_CHECKS=1>)
+target_include_directories(shiroko_config INTERFACE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/ports/software/include>
+  $<INSTALL_INTERFACE:include>)
+
+# Each part sees only the include directories of the parts below it, and relative includes may not
+# leave its directory: shared <- compositor <- resources <- layers; ports see shared only.
+find_path(UTHASH_INCLUDE_DIR utlist.h REQUIRED)
+function(shiroko_part name dir)
+  file(GLOB_RECURSE files CONFIGURE_DEPENDS ${dir}/*.c ${dir}/*.h)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${files})
+  foreach(f IN LISTS files)
+    file(STRINGS ${f} bad REGEX "^[ \t]*#[ \t]*include[ \t]*\"[^\"]*\\.\\.")
+    if(bad)
+      message(FATAL_ERROR "${f}: relative includes may not leave ${dir}: ${bad}")
+    endif()
+  endforeach()
+  list(FILTER files INCLUDE REGEX "\\.c$")
+  add_library(${name} OBJECT ${files} ${SHIROKO_PART_${name}_EXTRA})
+  target_link_libraries(${name} PRIVATE shiroko_config)
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${dir})
+  target_include_directories(${name} SYSTEM PRIVATE ${UTHASH_INCLUDE_DIR})
+  foreach(below IN LISTS ARGN)
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${below})
+  endforeach()
+  target_compile_options(${name} PRIVATE ${SHIROKO_WARNINGS})
+  set_property(GLOBAL APPEND PROPERTY SHIROKO_PARTS ${name})
+endfunction()
+
+shiroko_part(shiroko_shared cores/shared)
+shiroko_part(shiroko_compositor cores/compositor cores/shared)
+shiroko_part(shiroko_pl_res_bitmap_font cores/pl_res_bitmap_font cores/compositor cores/shared)
+shiroko_part(shiroko_pl_res_image cores/pl_res_image cores/compositor cores/shared)
+shiroko_part(shiroko_pl_lyr_tilemap cores/pl_lyr_tilemap cores/pl_res_bitmap_font cores/compositor cores/shared)
+shiroko_part(shiroko_port_software ports/software cores/shared)
+
+include(GNUInstallDirs)
+include(cmake/shiroko_fonts.cmake)
+
+get_property(SHIROKO_PARTS GLOBAL PROPERTY SHIROKO_PARTS)
+set(SHIROKO_OBJECTS "")
+foreach(part IN LISTS SHIROKO_PARTS)
+  list(APPEND SHIROKO_OBJECTS $<TARGET_OBJECTS:${part}>)
+endforeach()
+add_library(shiroko STATIC ${SHIROKO_OBJECTS})
+add_library(shiroko::shiroko ALIAS shiroko)
+target_link_libraries(shiroko PUBLIC shiroko_config)
+
+install(TARGETS shiroko shiroko_config EXPORT shirokoTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/shiroko ports/software/include/shiroko DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT shirokoTargets NAMESPACE shiroko:: FILE shirokoConfig.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shiroko)
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/shirokoConfigVersion.cmake
+  COMPATIBILITY SameMinorVersion)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/shirokoConfigVersion.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shiroko)
+install(FILES LICENSE NOTICE DESTINATION ${CMAKE_INSTALL_DATADIR}/shiroko)
+install(DIRECTORY LICENSES DESTINATION ${CMAKE_INSTALL_DATADIR}/shiroko)
+
+if(SHIROKO_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
+
+if(SHIROKO_BUILD_TESTS OR SHIROKO_FUZZ)
+  add_subdirectory(tests/fuzz)
+endif()
+
+if(SHIROKO_BUILD_EXAMPLES)
+  add_subdirectory(examples/headless)
+  if(SHIROKO_BUILD_TESTS)
+    add_test(NAME example_headless COMMAND shiroko_headless ${CMAKE_BINARY_DIR}/shiroko-headless.ppm
+      ${CMAKE_BINARY_DIR}/fonts)
+    set_tests_properties(example_headless PROPERTIES TIMEOUT 300)
+  endif()
+endif()

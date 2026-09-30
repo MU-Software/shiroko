@@ -1,0 +1,148 @@
+{
+  "format": 1,
+  "page_bytes": 102400,
+  "raster": {
+    "load": "target_light",
+    "render": "normal"
+  },
+  "a8": [],
+  "latin_corpus": [],
+  "packages": {
+    "latin": {
+      "role": "latin",
+      "license": "meslo",
+      "faces": {
+        "regular": "meslo-lgs-regular",
+        "bold": "meslo-lgs-bold"
+      },
+      "styles": {
+        "regular": "regular",
+        "bold": "bold",
+        "italic": "regular",
+        "bold_italic": "bold"
+      }
+    },
+    "cjk-ko": {
+      "role": "cjk",
+      "locale": "ko",
+      "license": "noto-cjk",
+      "faces": {
+        "regular": "noto-cjk-kr-regular",
+        "bold": "noto-cjk-kr-bold"
+      },
+      "styles": {
+        "regular": "regular",
+        "bold": "bold",
+        "italic": "regular",
+        "bold_italic": "bold"
+      }
+    },
+    "symbols": {
+      "role": "symbols",
+      "license": "noto-symbols2",
+      "faces": {
+        "regular": "noto-symbols2-regular"
+      },
+      "styles": {
+        "regular": "regular",
+        "bold": "regular",
+        "italic": "regular",
+        "bold_italic": "regular"
+      }
+    },
+    "emoji": {
+      "role": "emoji",
+      "license": "noto-emoji",
+      "faces": {
+        "regular": "noto-emoji-400"
+      },
+      "styles": {
+        "regular": "regular",
+        "bold": "regular",
+        "italic": "regular",
+        "bold_italic": "regular"
+      }
+    },
+    "nerd": {
+      "role": "nerd",
+      "license": "nerd",
+      "faces": {
+        "regular": "nerd-mono-regular"
+      },
+      "styles": {
+        "regular": "regular",
+        "bold": "regular",
+        "italic": "regular",
+        "bold_italic": "regular"
+      }
+    },
+    "cjk-ja": {
+      "role": "cjk",
+      "locale": "ja",
+      "license": "noto-cjk",
+      "faces": {
+        "regular": "noto-cjk-jp-regular",
+        "bold": "noto-cjk-jp-bold"
+      },
+      "styles": {
+        "regular": "regular",
+        "bold": "bold",
+        "italic": "regular",
+        "bold_italic": "bold"
+      }
+    },
+    "cjk-zh-Hans": {
+      "role": "cjk",
+      "locale": "zh-Hans",
+      "license": "noto-cjk",
+      "faces": {
+        "regular": "noto-cjk-sc-regular",
+        "bold": "noto-cjk-sc-bold"
+      },
+      "styles": {
+        "regular": "regular",
+        "bold": "bold",
+        "italic": "regular",
+        "bold_italic": "bold"
+      }
+    },
+    "cjk-zh-Hant": {
+      "role": "cjk",
+      "locale": "zh-Hant",
+      "license": "noto-cjk",
+      "faces": {
+        "regular": "noto-cjk-tc-regular",
+        "bold": "noto-cjk-tc-bold"
+      },
+      "styles": {
+        "regular": "regular",
+        "bold": "bold",
+        "italic": "regular",
+        "bold_italic": "bold"
+      }
+    },
+    "cjk-zh-HK": {
+      "role": "cjk",
+      "locale": "zh-HK",
+      "license": "noto-cjk",
+      "faces": {
+        "regular": "noto-cjk-hk-regular",
+        "bold": "noto-cjk-hk-bold"
+      },
+      "styles": {
+        "regular": "regular",
+        "bold": "bold",
+        "italic": "regular",
+        "bold_italic": "bold"
+      }
+    }
+  },
+  "default": [
+    "latin",
+    "cjk-ko",
+    "symbols",
+    "emoji",
+    "nerd"
+  ],
+  "coverage_allowlist": {}
+}
