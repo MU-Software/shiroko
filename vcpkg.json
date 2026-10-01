@@ -40,6 +40,12 @@
       "dependencies": [
         "sdl3"
       ]
+    },
+    "zstd": {
+      "description": "zstd-compressed font packages",
+      "dependencies": [
+        "zstd"
+      ]
     }
   },
   "license": "MIT"

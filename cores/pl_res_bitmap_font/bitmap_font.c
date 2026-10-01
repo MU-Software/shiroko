@@ -6,6 +6,7 @@ static bool has_async(const shr__pkg *pkg) { return !pkg->mapped && pkg->src.rea
 
 static void font_free(shr_pl_res_bitmap_font *f) {
     for (int r = 0; r < ROLE_COUNT; r++) shr__pkg_release(&f->pkg[r]);
+    shr__zfree(f);
     shr__vec_free(&f->wants, &f->al);
     shr__vec_free(&f->clusters, &f->al);
     shr__vec_free(&f->pool, &f->al);
@@ -140,8 +141,8 @@ shr_status shr_pl_res_bitmap_font_create(shr_context *ctx, const shr_pl_res_bitm
     builtin->src.data = shr__builtin_package;
     builtin->src.size = shr__builtin_package_size;
     const char *why;
-    shr__pkg_map(builtin, shr__builtin_package, shr__builtin_package_size, &why); /* checked by the build */
-    shr_status st = shr__pages_builtin(builtin);
+    shr_status st = shr__pkg_map(builtin, &why); /* checked by the build: stored, used in place */
+    if (st == SHR_OK) st = shr__pages_builtin(builtin);
     if (st != SHR_OK) {
         font_free(f);
         return st;

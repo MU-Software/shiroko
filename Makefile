@@ -2,7 +2,7 @@
 # from the sources in FONT_CACHE, which Make fetches first together with the uv tools environment.
 # Run `make fontpack-fetch` once before running targets in parallel with -j.
 
-.PHONY: test core-test render-test render-export headless-run bench tools-env fontpack-fetch fontpack fontpack-locales \
+.PHONY: test test-nozstd core-test render-test render-export headless-run bench tools-env fontpack-fetch fontpack fontpack-locales \
         test-asan test-ubsan test-tsan sanitizer-image test-asan-linux test-lsan-linux test-msan-linux \
         test-tsan-linux test-ubsan-linux test-hwasan-linux test-rtsan-linux test-sanitizers \
         fuzz fuzz-msan vt-run desktop-run coverage test-gcc gcc-image clean
@@ -52,6 +52,12 @@ test: $(FETCHED)
 	cmake --build --preset $(PRESET)
 	ctest --preset $(PRESET) -j$(NPROC)
 
+# Without zstd: stored packages only.
+test-nozstd: $(FETCHED)
+	cmake -S . -B build/nozstd $(CMAKE_HOST) -DCMAKE_BUILD_TYPE=Debug -DSHIROKO_ZSTD=OFF -DSHIROKO_BUILD_EXAMPLES=OFF
+	cmake --build build/nozstd
+	cd build/nozstd && ctest --output-on-failure -j$(NPROC)
+
 core-test: $(FETCHED)
 	cmake --preset $(PRESET) $(CMAKE_HOST)
 	cmake --build --preset $(PRESET) --target test_tilemap test_grapheme
@@ -83,16 +89,22 @@ LLVM_COV ?= llvm-cov
 endif
 COV := build/coverage
 COV_MIN ?= 100
-coverage: $(FETCHED)
-	cmake -S . -B $(COV) $(CMAKE_HOST) -DCMAKE_BUILD_TYPE=Debug -DSHIROKO_COVERAGE=ON -DSHIROKO_BUILD_EXAMPLES=OFF
-	cmake --build $(COV)
-	rm -rf $(COV)/profiles && cd $(COV) && LLVM_PROFILE_FILE=$(CURDIR)/$(COV)/profiles/%p.profraw ctest -j$(NPROC)
-	$(LLVM_PROFDATA) merge -o $(COV)/all.profdata $(COV)/profiles/*.profraw
-	objs=$$(for f in $(COV)/tests/test_* $(COV)/tests/fuzz/fuzz_*; do printf -- '-object %s ' "$$f"; done) && \
-	    $(LLVM_COV) report -instr-profile $(COV)/all.profdata $(COV)/tests/test_shared $$objs \
-	    -ignore-filename-regex='shr_gen_|vcpkg_installed' cores ports/software | tee $(COV)/report.txt
-	awk '/^TOTAL/ { for (i = 4; i <= NF; i += 3) if ($$i + 0 < $(COV_MIN)) bad = 1 } END { exit bad }' $(COV)/report.txt \
+# One build per configuration: $(1) build dir, $(2) CMake options, $(3) sources reported.
+define cov_run
+	cmake -S . -B $(1) $(CMAKE_HOST) -DCMAKE_BUILD_TYPE=Debug -DSHIROKO_COVERAGE=ON -DSHIROKO_BUILD_EXAMPLES=OFF $(2)
+	cmake --build $(1)
+	rm -rf $(1)/profiles && cd $(1) && LLVM_PROFILE_FILE=$(CURDIR)/$(1)/profiles/%p.profraw ctest -j$(NPROC)
+	$(LLVM_PROFDATA) merge -o $(1)/all.profdata $(1)/profiles/*.profraw
+	objs=$$(for f in $(1)/tests/test_* $(1)/tests/fuzz/fuzz_*; do printf -- '-object %s ' "$$f"; done) && \
+	    $(LLVM_COV) report -instr-profile $(1)/all.profdata $(1)/tests/test_shared $$objs \
+	    -ignore-filename-regex='shr_gen_|vcpkg_installed' $(3) | tee $(1)/report.txt
+	awk '/^TOTAL/ { for (i = 4; i <= NF; i += 3) if ($$i + 0 < $(COV_MIN)) bad = 1 } END { exit bad }' $(1)/report.txt \
 	    || { echo "coverage below $(COV_MIN)%"; exit 1; }
+endef
+# The font plugin also without zstd, where decode.c is stored-only.
+coverage: $(FETCHED)
+	$(call cov_run,$(COV),,cores ports/software)
+	$(call cov_run,$(COV)-nozstd,-DSHIROKO_ZSTD=OFF,cores/pl_res_bitmap_font)
 
 bench: $(FETCHED)
 	cmake --preset release $(CMAKE_HOST)
@@ -136,9 +148,12 @@ SAN_DOCKER := $(DOCKER_RUN) --cap-add SYS_PTRACE --security-opt seccomp=unconfin
 sanitizer-image:
 	docker build -t $(SAN_IMAGE) --build-context tools=. -f docker/sanitizers/Dockerfile docker/sanitizers
 
+# MSan builds take their vcpkg libraries (zstd) instrumented too.
+san_triplets = $(if $(filter memory,$(1)),-DVCPKG_OVERLAY_TRIPLETS=/src/cmake/triplets-msan)
+
 define linux_san
 	$(SAN_DOCKER) bash -c 'set -e; cmake -S . -B build/linux-$(1) $(CMAKE_CELL) -DCMAKE_BUILD_TYPE=Debug \
-	    -DSHIROKO_SANITIZE=$(2) -DSHIROKO_BUILD_EXAMPLES=OFF >/dev/null && \
+	    -DSHIROKO_SANITIZE=$(2) $(call san_triplets,$(2)) -DSHIROKO_BUILD_EXAMPLES=OFF >/dev/null && \
 	    cmake --build build/linux-$(1) -j4 && cd build/linux-$(1) && ctest --output-on-failure -j$$(nproc)'
 	@printf "  ✓ %s\n" "$(1) [linux]"
 endef
@@ -165,7 +180,8 @@ test-sanitizers: test-asan test-ubsan test-tsan test-asan-linux test-lsan-linux 
 # Inputs: seeds written by the build (target fuzz_seeds) plus the regressions in tests/fuzz/corpus/<target>.
 define fuzz_run
 	$(SAN_DOCKER) bash -c 'set -e; b=build/linux-fuzz-$(1); cmake -S . -B $$b $(CMAKE_CELL) -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-	    -DSHIROKO_FUZZ=ON -DSHIROKO_BUILD_TESTS=OFF -DSHIROKO_BUILD_EXAMPLES=OFF -DSHIROKO_SANITIZE=$(2) >/dev/null && \
+	    -DSHIROKO_FUZZ=ON -DSHIROKO_BUILD_TESTS=OFF -DSHIROKO_BUILD_EXAMPLES=OFF -DSHIROKO_SANITIZE=$(2) \
+	    $(call san_triplets,$(2)) >/dev/null && \
 	    cmake --build $$b -j4 --target $(FUZZ_TARGETS) fuzz_seeds && mkdir -p build/fuzz-logs && pids= && \
 	    for t in $(FUZZ_TARGETS); do \
 	      mkdir -p build/fuzz-corpus/$$t build/fuzz-artifacts/$$t $$b/tests/fuzz/seeds/$$t; \

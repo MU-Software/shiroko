@@ -19,6 +19,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   if(SHIROKO_EXAMPLE_DESKTOP)
     list(APPEND VCPKG_MANIFEST_FEATURES desktop)
   endif()
+  if((NOT DEFINED SHIROKO_ZSTD OR SHIROKO_ZSTD) AND NOT SHIROKO_ZSTD_TARGET)
+    list(APPEND VCPKG_MANIFEST_FEATURES zstd)
+  endif()
 endif()
 project(shiroko VERSION 0.1.0 LANGUAGES C)
 
@@ -26,6 +29,8 @@ option(SHIROKO_BUILD_TESTS "Build host unit tests" ${PROJECT_IS_TOP_LEVEL})
 option(SHIROKO_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
 option(SHIROKO_PORT_ANGLE "Build the OpenGL ES driver on ANGLE (ports/angle, target shiroko_angle)" OFF)
 option(SHIROKO_EXAMPLE_DESKTOP "Build the SDL3 desktop example (examples/desktop; ANGLE mode with SHIROKO_PORT_ANGLE)" OFF)
+option(SHIROKO_ZSTD "Read zstd-compressed font packages (else stored packages only)" ON)
+set(SHIROKO_ZSTD_TARGET "" CACHE STRING "Existing zstd target to link instead of find_package(zstd), e.g. an ESP-IDF component")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -116,7 +121,7 @@ endif()
 add_library(shiroko_config INTERFACE)
 target_compile_definitions(shiroko_config INTERFACE SHR_CELL_WIDTH=${SHIROKO_CELL_WIDTH}
   SHR_CELL_HEIGHT=${SHIROKO_CELL_HEIGHT} SHR_PIXEL_FORMAT=SHR_FORMAT_${SHIROKO_PIXEL_FORMAT}
-  $<$<BOOL:${SHIROKO_REALTIME}>:SHR_REALTIME_CHECKS=1>)
+  $<$<BOOL:${SHIROKO_REALTIME}>:SHR_REALTIME_CHECKS=1> $<$<BOOL:${SHIROKO_ZSTD}>:SHR_ZSTD=1>)
 target_include_directories(shiroko_config INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/ports/software/include>
@@ -165,14 +170,31 @@ add_library(shiroko STATIC ${SHIROKO_OBJECTS})
 add_library(shiroko::shiroko ALIAS shiroko)
 target_link_libraries(shiroko PUBLIC shiroko_config)
 
+# Only cores/pl_res_bitmap_font/decode.c includes zstd.h. A SHIROKO_ZSTD_TARGET belongs to the embedding project
+# (e.g. an ESP-IDF component): linked in its build, not part of the installed package.
+set(_config "")
+if(SHIROKO_ZSTD)
+  set(_zstd ${SHIROKO_ZSTD_TARGET})
+  if(NOT _zstd)
+    find_package(zstd CONFIG REQUIRED)
+    set(_zstd zstd::libzstd)
+    set(_config "include(CMakeFindDependencyMacro)\nfind_dependency(zstd CONFIG)\n")
+    target_link_libraries(shiroko PUBLIC $<INSTALL_INTERFACE:zstd::libzstd>)
+  endif()
+  target_include_directories(shiroko_pl_res_bitmap_font SYSTEM PRIVATE
+    $<TARGET_PROPERTY:${_zstd},INTERFACE_INCLUDE_DIRECTORIES>)
+  target_link_libraries(shiroko PUBLIC $<BUILD_INTERFACE:${_zstd}>)
+endif()
+
 install(TARGETS shiroko shiroko_config EXPORT shirokoTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/shiroko ports/software/include/shiroko DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(EXPORT shirokoTargets NAMESPACE shiroko:: FILE shirokoConfig.cmake
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shiroko)
+install(EXPORT shirokoTargets NAMESPACE shiroko:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shiroko)
+file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shirokoConfig.cmake
+  CONTENT "${_config}include(\${CMAKE_CURRENT_LIST_DIR}/shirokoTargets.cmake)\n" @ONLY)
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/shirokoConfigVersion.cmake
   COMPATIBILITY SameMinorVersion)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/shirokoConfigVersion.cmake
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/shirokoConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/shirokoConfigVersion.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shiroko)
 install(FILES LICENSE NOTICE DESTINATION ${CMAKE_INSTALL_DATADIR}/shiroko)
 install(DIRECTORY LICENSES DESTINATION ${CMAKE_INSTALL_DATADIR}/shiroko)

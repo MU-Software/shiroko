@@ -35,7 +35,7 @@ set(SHIROKO_PYTHON ${CMAKE_COMMAND} -E env --unset=VIRTUAL_ENV PYTHONDONTWRITEBY
   SHIROKO_UNICODE_TABLES=${_unicode}
   ${SHIROKO_UV} run --project ${_src} --frozen --no-sync --offline --no-python-downloads python)
 set(SHIROKO_FONTPACK ${SHIROKO_PYTHON} ${_src}/tools/fontpack/fontpack.py)
-execute_process(COMMAND ${SHIROKO_PYTHON} -c "import fontTools, freetype, uharfbuzz, PIL, pooch, xxhash"
+execute_process(COMMAND ${SHIROKO_PYTHON} -c "import fontTools, freetype, uharfbuzz, PIL, pooch, xxhash, zstandard"
   WORKING_DIRECTORY ${_src} RESULT_VARIABLE _ok OUTPUT_QUIET ERROR_QUIET)
 if(NOT _ok EQUAL 0)
   message(FATAL_ERROR "The uv tools environment is missing: run `make fontpack-fetch` in ${_src}")
@@ -73,8 +73,9 @@ foreach(i RANGE ${_last})
   string(JSON _name GET "${_config}" default ${i})
   list(APPEND _outputs ${_fonts}/shiroko-${_name}.shrf)
 endforeach()
+set(_method $<IF:$<BOOL:${SHIROKO_ZSTD}>,zstd,stored>)
 add_custom_command(OUTPUT ${_outputs}
-  COMMAND ${SHIROKO_FONTPACK} build --cell ${_cell} --out ${_fonts}
+  COMMAND ${SHIROKO_FONTPACK} build --cell ${_cell} --out ${_fonts} --method ${_method}
   DEPENDS ${SHIROKO_FONT_DEPS} WORKING_DIRECTORY ${_src} VERBATIM
   COMMENT "Baking font packages (${_cell}) into ${_fonts}")
 # Runtime data, not needed to link the library: built by default only in a top-level build.

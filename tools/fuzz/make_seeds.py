@@ -99,10 +99,12 @@ def batch(*cmds):
     return bytes([len(cmds) - 1 + sum(1 for c in cmds if c[0] == 6)]) + b"".join(cmds)
 
 
-# fuzz_package: a sealed header of one A4 section of a `size`-byte package (another text profile).
+# fuzz_package: a sealed A4 header and empty box index of a `size`-byte package (another text profile).
 def header(version, size):
-    head = b"SHRFPKG1" + struct.pack("<HHIIIQQ", version, 128, 1, 1, 0, 128, size) + bytes(32)
-    return head + struct.pack("<Q", xxhash.xxh3_64_intdigest(head)) + bytes(48)
+    sidx = struct.pack("<I4sHHIII", 24, b"sidx", 0, 1, 8, 0, 0)
+    head = struct.pack("<I4sHHIHHIIIQQ32sQ32x", 128, b"shrf", 0, 1, 112, version, 0, 1, 0, len(sidx), size, 128,
+                       bytes(32), xxhash.xxh3_64_intdigest(sidx))
+    return head + struct.pack("<Q", xxhash.xxh3_64_intdigest(head)) + sidx
 
 
 # fuzz_compositor: setup, then [op, arg, extra...] (see tests/fuzz/fuzz_compositor.c).
@@ -199,10 +201,10 @@ SEEDS = {
         + batch(register(3, 1 | 0x80, 4, 4, 4, 0, 16)) + batch(register(0, 1, 1, 1, 1, 0, 1)) + batch(register(7, 1, 1, 1, 1, 0, 1)),
     ],
     "fuzz_package": [
-        b"\x00",
-        b"\x00SHRFPKG1" + bytes(120),
-        b"\x08" + header(4, 200) + bytes(72),
-        b"\x00" + header(3, 200) + bytes(72),
+        b"\x00\x00",
+        b"\x00\x00SHRFPKG1" + bytes(120),
+        b"\x08\x01" + header(5, 200) + bytes(48),
+        b"\x00\x00" + header(4, 200) + bytes(48),
     ],
     "fuzz_compositor": [
         bytes([1]) + layer(0, 0, (0, 0, 64, 48)) + lfill(0, (4, 4, 40, 30)) + SUBMIT + PUMP + check(),
