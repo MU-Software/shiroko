@@ -271,7 +271,7 @@ int main(int argc, char **argv) {
     a.buf = malloc(a.buf_len);
 
     shr_framebuffer_driver drv;
-    check("driver", shr_software_driver_create(&sa, 1u << 20, &drv));
+    check("driver", shr_software_driver_create(&sa, 1u << 20, 256, &drv));
     shr_output out;
     shr_output_init(&out);
     out.user = &a, out.flags = SHR_OUTPUT_RELEASE_ON_PRESENT | SHR_OUTPUT_PRESERVES_CONTENT;

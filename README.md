@@ -101,6 +101,8 @@ OpenGL ES 3.0 for CPU memory and GPU surfaces (`shr_angle_surface_create()`, `SH
 is a driver handle, so they can also be COPY/ROTATE sources such as a composition;
 `shr_angle_surface_texture(driver, surface, &texture)` gives the GL texture, top row first). Every call needs the EGL
 context the driver was created with current on the calling thread and returns `SHR_E_STATE` otherwise.
+Registered buffers become layers of GL array textures (A4 kept packed, the shader picks the nibble), and a batch draws
+as instanced quads with their clip, so a full screen of text is one or a few draws.
 `shr_angle_offscreen_create()` makes an EGL pbuffer context for tests and tools;
 `SHIROKO_ANGLE_BACKEND` picks its backend (`metal`, `opengl`, `vulkan`, `d3d11`, `default`; unset: `metal` on macOS,
 `opengl` elsewhere) and the others are tried when it fails. FILL, COPY, ROTATE and every RGBX8888 command match the
@@ -116,9 +118,9 @@ exported in `shirokoConfig.cmake`.
 `SHIROKO_PORT_ANGLE`) shows the `tests/render` scenes and full-window load modes (`scroll`, `churn`, `restyle`, `blink`,
 `images`) in a window. Tab switches between the software driver (an SDL_Renderer streaming texture) and the ANGLE
 driver (SDL's OpenGL ES 3.0 context; the composition is a GPU surface blitted to the window). SDL loads ANGLE itself,
-so the preset uses the overlay triplet in `cmake/triplets` (arm64-osx for now: static, except ANGLE as a shared library) and the
-executable finds it through its rpath; with a static ANGLE the example is software only. `SHIROKO_ANGLE_BACKEND` picks
-the backend as for `shr_angle_offscreen_create()`.
+so the preset uses the overlay triplet in `cmake/triplets` (arm64-osx for now: static, except ANGLE as a shared
+library) and the executable finds it through its rpath; with a static ANGLE the example is software only.
+`SHIROKO_ANGLE_BACKEND` picks the backend as for `shr_angle_offscreen_create()`.
 
 Each frame reports its render time (the scene's changes, submit and pump until presented, plus `glFinish` with ANGLE)
 and its present time (texture upload or blit, and the swap) separately: the first frame alone, and p50/p95/p99/max over

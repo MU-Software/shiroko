@@ -7,9 +7,10 @@
 extern "C" {
 #endif
 
-/* OpenGL ES 3.0 driver on ANGLE. Every call below except the offscreen ones needs the EGL context the driver
- * was created with current on the calling thread (SHR_E_STATE otherwise, before any GL work); they change GL
- * state (program, buffers, textures, framebuffer, blend, scissor, viewport, pixel store). */
+/* OpenGL ES 3.0 driver on ANGLE. Every call below except the offscreen ones and shr_angle_driver_stats() needs the
+ * EGL context the driver was created with current on the calling thread (SHR_E_STATE otherwise, before any GL work);
+ * they change GL state (program, vertex array, buffers, textures and samplers of units 0..8, active texture,
+ * framebuffer, blend, scissor test, viewport, pixel store). */
 
 typedef struct shr_angle_offscreen shr_angle_offscreen;
 
@@ -23,14 +24,27 @@ const char *shr_angle_offscreen_backend(const shr_angle_offscreen *offscreen);
 shr_status shr_angle_offscreen_destroy(shr_angle_offscreen *offscreen);
 
 /* Synchronous driver (execute() returns SHR_OK once the GL commands are issued, without glFlush) for CPU and
- * DEVICE destinations and sources, bound to the EGL context current now (SHR_E_STATE without one).
- * `texture_cache_bytes` bounds the textures kept for glyph and image sources (0 = upload them each time).
- * caps.max_width / max_height are GL_MAX_TEXTURE_SIZE, at most 16384. execute() rejects a batch before any GL
- * work, except SHR_E_DEVICE: a GL error after drawing, which may leave the destination partly written. */
-shr_status shr_angle_driver_create(const shr_allocator *allocator, uint64_t texture_cache_bytes,
+ * DEVICE destinations and sources, bound to the EGL context current now (SHR_E_STATE without one). Buffer ids are
+ * 1..max_buffers. The driver draws from texture copies of the buffers (SHR_BUFFER_COPIES); a REGISTER that would
+ * take the byte_length of all registered buffers beyond `texture_cache_bytes` (caps.buffer_bytes, 0 = unlimited)
+ * fails with SHR_E_UNSUPPORTED. Buffers of one texture shape (A4/A8 or RGBA8888, texel width, height) share array
+ * textures, which hold up to 15 unused layers per shape. caps.max_width / max_height and max_buffer_width / max_buffer_height are GL_MAX_TEXTURE_SIZE, at most
+ * 16384. execute() checks each leading buffer command, applies it, then checks the rest of the batch before
+ * drawing; SHR_E_DEVICE is a GL error, which may leave the destination partly written and unregisters every
+ * buffer. */
+shr_status shr_angle_driver_create(const shr_allocator *allocator, uint64_t texture_cache_bytes, uint32_t max_buffers,
                                    shr_framebuffer_driver *out);
 /* Also destroys the surfaces still alive. */
 shr_status shr_angle_driver_destroy(shr_framebuffer_driver *driver);
+
+/* Counters since the driver was created: draw calls and the quads they drew, buffer textures alive and their
+ * bytes. Needs no EGL context. */
+typedef struct shr_angle_stats {
+    uint64_t draws, instances;
+    uint32_t textures;
+    uint64_t texture_bytes;
+} shr_angle_stats;
+shr_status shr_angle_driver_stats(const shr_framebuffer_driver *driver, shr_angle_stats *out);
 
 /* A GPU surface (SHR_MEMORY_DEVICE) of RGB565 or RGBX8888, cleared to black. `pixels` holds a handle of the
  * driver (not CPU-accessible) so commands can name the surface as a COPY/ROTATE source; `resource_id` is

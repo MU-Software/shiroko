@@ -60,10 +60,28 @@ def fill(rect, color=(255, 0, 0), dim=0):
     return bytes([1, dim]) + i8(*rect) + bytes(color) + bytes([0, 0, 0, 0]) + u16(0) + i8(0, 0)
 
 
-# GLYPH (kind 2) ends with an axis byte: as i8, or 40 times that beyond +-100.
-def src_cmd(kind, rect, fmt, sw, sh, stride, length, origin=(0, 0), flags=0, axis=0):
-    return (bytes([kind, flags]) + i8(*rect) + bytes([200, 100, 50, fmt]) + i8(sw, sh) + bytes([stride]) + u16(length)
-            + i8(*origin) + (i8(axis) if kind == 2 else b""))
+def src_cmd(kind, rect, fmt, sw, sh, stride, length, origin=(0, 0)):
+    return bytes([kind, 0]) + i8(*rect) + bytes([200, 100, 50, fmt]) + i8(sw, sh) + bytes([stride]) + u16(length) + i8(*origin)
+
+
+# GLYPH (kind 2) or IMAGE (3) from `src` of buffer `buf`; GLYPH ends with an axis byte: as i8, or 40 times that
+# beyond +-100.
+def region(kind, rect, buf, src, origin=(0, 0), flags=0, axis=0):
+    return (bytes([kind, flags]) + i8(*rect) + bytes([200, 100, 50, buf]) + i8(*src) + i8(*origin)
+            + (i8(axis) if kind == 2 else b""))
+
+
+# Buffer `buf` = w x h pixels at byte `off` of the source bytes; fmt as for src_cmd, | 0x40 DMA, | 0x80 DEVICE.
+def register(buf, fmt, w, h, stride, off, length):
+    return bytes([8, buf, fmt]) + i8(w, h) + bytes([stride, off // 8]) + u16(length)
+
+
+def update(buf, rect):
+    return bytes([9, buf]) + i8(*rect)
+
+
+def release(buf):
+    return bytes([10, buf])
 
 
 def rotate(rot):
@@ -104,7 +122,16 @@ def limage(slot, k, src, at):
     return bytes([5, slot, 7, slot, k]) + i8(*src, *at) + bytes([8, slot])
 
 
+def limages(slot, *items):
+    return bytes([5, slot]) + b"".join(bytes([7, slot, k]) + i8(*src, *at) for k, src, at in items) + bytes([8, slot])
+
+
+def update_image(k, rect):
+    return bytes([10, k]) + i8(*rect)
+
+
 SUBMIT, PUMP = bytes([12, 0]), bytes([13, 0])
+ASYNC, SYNC, COMPLETE = bytes([23, 2]), bytes([23, 0]), bytes([23, 1])
 
 
 def check(arg=0):
@@ -139,28 +166,43 @@ SEEDS = {
     ],
     "fuzz_driver": [
         bytes([0, 23, 19, 0, 1]) + batch(fill((0, 0, 24, 20)), fill((2, 2, 10, 10), dim=1)),
-        bytes([1, 15, 15, 1, 2]) + batch(src_cmd(2, (1, 1, 9, 9), 0, 8, 8, 4, 64)),
-        bytes([0, 10, 10, 2, 3]) + batch(src_cmd(3, (0, 0, 4, 4), 2, 4, 4, 16, 64), src_cmd(4, (1, 1, 3, 3), 3, 4, 4, 8, 32)),
+        bytes([1, 15, 15, 1, 2]) + batch(register(1, 0, 8, 8, 4, 0, 64), region(2, (1, 1, 9, 9), 1, (0, 0, 8, 8))),
+        bytes([0, 10, 10, 2, 3]) + batch(register(2, 2, 4, 4, 16, 8, 64), region(3, (0, 0, 4, 4), 2, (0, 0, 4, 4)),
+                                         src_cmd(4, (1, 1, 3, 3), 3, 4, 4, 8, 32)),
         bytes([1, 7, 11, 0, 4]) + batch(rotate(1)) + batch(rotate(2)),
-        bytes([0, 5, 5, 0, 5]) + batch(fill((-3, -3, 30, 30))) + batch(src_cmd(2, (0, 0, 3, 3), 1, 2, 2, 2, 4)),
+        bytes([0, 5, 5, 0, 5]) + batch(fill((-3, -3, 30, 30)))
+        + batch(register(1, 1, 2, 2, 2, 0, 4), region(2, (0, 0, 3, 3), 1, (0, 0, 2, 2))),
         bytes([2 | 4, 16, 12, 0, 6]) + batch(group((0, 0, 16, 6), (0, 0, 16, 6)), fill((1, 1, 5, 5)), END)
-        + batch(group((0, 6, 16, 12), (4, 0, 12, 6)), src_cmd(2, (1, 7, 9, 11), 1, 8, 8, 8, 64), END)
+        + batch(register(3, 1, 8, 8, 8, 16, 64), group((0, 6, 16, 12), (4, 0, 12, 6)),
+                region(2, (1, 7, 9, 11), 3, (0, 0, 8, 8)), END)
         + batch(group((0, 0, 16, 6), (2, 2, 6, 4)), fill((1, 1, 5, 5)), END),
         bytes([4, 16, 12, 0, 7]) + batch(group((0, 0, 16, 6), (0, 0, 16, 6)), END) + batch(END) + batch(group((0, 0, 8, 8), (0, 0, 9, 9))),
-        # BOLD, ITALIC and both (with DIM) over their whole footprints, in A8 and A4 with a padding nibble
-        bytes([0, 23, 19, 0, 8]) + batch(fill((0, 0, 24, 20), (0, 0, 0)), src_cmd(2, (0, 0, 6, 4), 1, 5, 4, 5, 20, flags=2),
-                                         src_cmd(2, (1, 5, 8, 9), 1, 5, 4, 5, 20, (-1, 0), flags=4, axis=4),
-                                         src_cmd(2, (2, 10, 12, 16), 0, 7, 6, 4, 24, (-4, 0), flags=7, axis=-20)),
+        # BOLD, ITALIC and both (with DIM) over their whole footprints, from rects inside larger A8 and A4 buffers
+        bytes([0, 23, 19, 0, 8]) + batch(register(1, 1, 9, 6, 9, 0, 54), register(2, 0, 11, 8, 6, 64, 48),
+                                         fill((0, 0, 24, 20), (0, 0, 0)),
+                                         region(2, (0, 0, 6, 4), 1, (2, 1, 7, 5), flags=2),
+                                         region(2, (1, 5, 8, 9), 1, (2, 1, 7, 5), (-1, 0), flags=4, axis=4),
+                                         region(2, (2, 10, 12, 16), 2, (2, 1, 9, 7), (-4, 0), flags=7, axis=-20)),
         # the same in a cached group under a smaller clip, drawn twice; then outside the footprint, and a bad axis
-        bytes([1 | 6, 15, 11, 1, 9]) + batch(group((0, 0, 16, 8), (2, 1, 10, 6)), src_cmd(2, (1, 1, 11, 7), 0, 7, 6, 4, 24, (-4, 0), flags=6, axis=-20), END) * 2
-        + batch(src_cmd(2, (0, 0, 10, 6), 0, 7, 6, 4, 24, (-5, 0), flags=6, axis=-20))
-        + batch(src_cmd(2, (0, 0, 2, 2), 1, 5, 4, 5, 20, flags=4, axis=110)),
+        bytes([1 | 6, 15, 11, 1, 9]) + batch(register(2, 0, 11, 8, 6, 64, 48))
+        + batch(group((0, 0, 16, 8), (2, 1, 10, 6)), region(2, (1, 1, 11, 7), 2, (2, 1, 9, 7), (-4, 0), flags=6, axis=-20), END) * 2
+        + batch(region(2, (0, 0, 10, 6), 2, (2, 1, 9, 7), (-5, 0), flags=6, axis=-20))
+        + batch(register(1, 1, 9, 6, 9, 0, 54), region(2, (0, 0, 2, 2), 1, (2, 1, 7, 5), flags=4, axis=110)),
+        # registrations: replace, update, release (also of ids naming nothing), commands after a draw, an odd A4
+        # column, DMA and DEVICE memory, ids 0 and 7
+        bytes([2, 12, 8, 0, 10]) + batch(register(1, 2, 2, 2, 8, 0, 16), region(3, (0, 0, 2, 2), 1, (0, 0, 2, 2)))
+        + batch(register(1, 2 | 0x40, 3, 1, 12, 32, 12), update(1, (0, 0, 3, 1)), region(3, (0, 0, 3, 1), 1, (0, 0, 3, 1)))
+        + batch(update(1, (0, 0, 4, 1)), fill((0, 0, 1, 1)))
+        + batch(release(1), release(5), release(0), release(7), region(3, (0, 0, 1, 1), 1, (0, 0, 1, 1)))
+        + batch(fill((0, 0, 1, 1)), register(2, 1, 4, 4, 4, 0, 16))
+        + batch(register(2, 0, 6, 2, 3, 0, 6), region(2, (0, 0, 2, 2), 2, (1, 0, 3, 2)), region(2, (2, 0, 4, 2), 2, (2, 0, 4, 2)))
+        + batch(register(3, 1 | 0x80, 4, 4, 4, 0, 16)) + batch(register(0, 1, 1, 1, 1, 0, 1)) + batch(register(7, 1, 1, 1, 1, 0, 1)),
     ],
     "fuzz_package": [
         b"\x00",
         b"\x00SHRFPKG1" + bytes(120),
-        b"\x08" + header(3, 200) + bytes(72),
-        b"\x00" + header(2, 200) + bytes(72),
+        b"\x08" + header(4, 200) + bytes(72),
+        b"\x00" + header(3, 200) + bytes(72),
     ],
     "fuzz_compositor": [
         bytes([1]) + layer(0, 0, (0, 0, 64, 48)) + lfill(0, (4, 4, 40, 30)) + SUBMIT + PUMP + check(),
@@ -177,6 +219,28 @@ SEEDS = {
         bytes([1 | 8]) + image(0, 4, 4) + image(1, 8, 8) + image(2, 8, 8) + layer(0, 0, (0, 0, 64, 48))
         + limage(0, 1, (0, 0, 8, 8), (0, 0)) + bytes([11, 1]) + SUBMIT + PUMP + bytes([10, 0]) + i8(0, 0, 2, 2)
         + bytes([1, 0]) + PUMP + bytes([9, 1, 3, 3]),
+        # three ids and a driver keeping copies in 3 images' bytes: an update while a frame reads the image makes a
+        # second buffer, whose registration evicts the first; then updates in place
+        bytes([1 | 32 | 64 | 128]) + image(0, 8, 8) + image(1, 8, 8) + image(2, 4, 4) + layer(0, 0, (0, 0, 64, 48))
+        + limages(0, (0, (0, 0, 8, 8), (0, 0)), (1, (0, 0, 8, 8), (10, 0)), (2, (0, 0, 4, 4), (20, 0))) + SUBMIT + PUMP
+        + ASYNC + SUBMIT + PUMP + update_image(0, (0, 0, 4, 4)) + update_image(0, (2, 2, 8, 8)) + COMPLETE + PUMP
+        + SYNC + SUBMIT + PUMP + check() + update_image(1, (1, 1, 3, 7)) + SUBMIT + PUMP + check()
+        + ASYNC + SUBMIT + PUMP + update_image(0, (0, 0, 1, 1)) + COMPLETE + PUMP + SYNC + check(),
+        # the same with ids only, drawn in place
+        bytes([1 | 32 | 64]) + image(0, 8, 8) + image(1, 8, 8) + image(2, 4, 4) + layer(0, 0, (0, 0, 64, 48))
+        + limages(0, (0, (0, 0, 8, 8), (0, 0)), (1, (0, 0, 8, 8), (10, 0)), (2, (0, 0, 4, 4), (20, 0))) + ASYNC
+        + SUBMIT + PUMP + update_image(2, (0, 0, 4, 4)) + COMPLETE + PUMP + SUBMIT + PUMP + update_image(2, (0, 0, 2, 2))
+        + COMPLETE + PUMP + SYNC + check(),
+        # a failed batch and a reset after a timeout make the driver forget its ids
+        bytes([1 | 2 | 4 | 32 | 128]) + image(0, 8, 8) + layer(0, 0, (0, 0, 64, 48)) + limage(0, 0, (0, 0, 8, 8), (4, 4))
+        + SUBMIT + PUMP + bytes([17, 1]) + bytes([20, 0]) + PUMP + check() + ASYNC + bytes([20, 0]) + PUMP
+        + bytes([19, 200]) + PUMP + SYNC + check(),
+        # the frame registering a second buffer (evicting the first) fails after running its buffer commands; the
+        # next one releases the ids it named before registering again
+        bytes([1 | 32 | 64 | 128]) + image(0, 8, 8) + image(1, 8, 8) + image(2, 8, 8) + layer(0, 0, (0, 0, 64, 48))
+        + limages(0, (0, (0, 0, 8, 8), (0, 0)), (1, (0, 0, 8, 8), (10, 0)), (2, (0, 0, 8, 8), (20, 0))) + SUBMIT + PUMP
+        + ASYNC + SUBMIT + PUMP + update_image(0, (0, 0, 4, 4)) + COMPLETE + PUMP + SYNC + bytes([17, 0x41])
+        + SUBMIT + PUMP + SUBMIT + PUMP + check(),
     ],
 }
 

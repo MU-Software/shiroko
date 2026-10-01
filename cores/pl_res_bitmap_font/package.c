@@ -126,8 +126,9 @@ static const char *parse_index(shr__pkg *pkg, shr_status *st) {
     if (baseline < 0 || baseline > lh || under < 0 || under >= lh || strike < 0 || strike >= lh)
         return "instance line metrics";
     if (shr__rd16(in + 18) & ~1u) return "instance raster flags";
-    for (int k = 36; k < 48; k++)
-        if (in[k]) return "instance reserved bytes";
+    uint16_t aw = shr__rd16(in + 36), ah = shr__rd16(in + 38);
+    if (shr__rd64(in + 40)) return "instance reserved bytes";
+    if (!aw || !ah || (format == 1 && aw % 2)) return "instance page atlas";
     if (lh != SHR_CELL_HEIGHT || cw != SHR_CELL_WIDTH) return *st = SHR_E_UNSUPPORTED, "no instance for the cell size";
     if (sec[6].length != 8ull * sec[6].count) return "CMAP size";
     for (uint32_t i = 0; i < sec[6].count; i++) {
@@ -157,20 +158,26 @@ static const char *parse_index(shr__pkg *pkg, shr_status *st) {
     uint32_t npages = sec[9].count;
     if (!npages || npages > SHR_PKG_MAX_PAGES || sec[9].length != (uint64_t)SHR_PKG_ENTRY * npages)
         return "PAGES size";
+    uint32_t stride = format == 1 ? aw / 2u : aw, tail = 0;
     uint64_t glyph = 0, prev = index_end;
     for (uint32_t i = 0; i < npages; i++) {
         const uint8_t *r = sec[9].data + (uint64_t)SHR_PKG_ENTRY * i;
         uint64_t off = shr__rd64(r);
         uint32_t length = shr__rd32(r + 16), count = shr__rd32(r + 24);
-        if (shr__rd32(r + 20) != glyph || !count || length < 4 + 16ull * count || length > SHR_PKG_MAX_PAGE_BYTES ||
-            shr__rd32(r + 28) || off < prev || off > pkg->file_size || pkg->file_size - off < length)
+        if (shr__rd32(r + 20) != glyph || !count || length > SHR_PKG_MAX_PAGE_BYTES ||
+            length != (uint64_t)ah * stride + 4 + 16ull * count || shr__rd32(r + 28) || off % SHR_PKG_PAGE_ALIGN ||
+            off < prev || off > pkg->file_size || pkg->file_size - off < length)
             return "page record";
+        if (4 + 16 * count > tail) tail = 4 + 16 * count;
         glyph += count;
         prev = off + length;
     }
     if (glyph != nglyphs) return "pages do not cover every glyph";
     pkg->format = format;
     pkg->baseline = baseline;
+    pkg->atlas_w = aw, pkg->atlas_h = ah, pkg->stride = stride;
+    pkg->slot_rows = ah + (tail + stride - 1) / stride;
+    pkg->slot_shape = (uint64_t)format << 56 | (uint64_t)aw << 40 | (uint64_t)ah << 24 | pkg->slot_rows;
     pkg->npages = npages;
     pkg->nglyphs = nglyphs;
     pkg->cmap = sec[6].data, pkg->ncmap = sec[6].count;
@@ -180,26 +187,24 @@ static const char *parse_index(shr__pkg *pkg, shr_status *st) {
     return NULL;
 }
 
-bool shr__page_valid(const shr__page *p) {
-    const uint8_t *d = p->data, *rec = shr__page_rec(p);
-    uint32_t length = shr__rd32(rec + 16), count = shr__rd32(rec + 24);
-    if (XXH3_64bits(d, length) != shr__rd64(rec + 8) || shr__rd32(d) != count) return false;
-    uint64_t table = 4 + 16ull * count;
+bool shr__page_valid(const shr__page *p, const uint8_t *d) {
+    const shr__pkg *pkg = p->pkg;
+    const uint8_t *rec = shr__page_rec(p), *recs = d + (size_t)pkg->atlas_h * pkg->stride;
+    uint32_t count = shr__rd32(rec + 24);
+    if (XXH3_64bits(d, shr__rd32(rec + 16)) != shr__rd64(rec + 8) || shr__rd32(recs) != count) return false;
     for (uint32_t g = 0; g < count; g++) {
-        const uint8_t *e = d + 4 + 16ull * g;
-        uint32_t off = shr__rd32(e), len = shr__rd16(e + 4);
-        uint8_t w = e[6], h = e[7], stride = e[10], flags = e[11], fmt = flags & 3, cells = (flags >> 2) & 3;
-        if (cells < 1 || cells > 2 || (flags & 0xF0) || shr__rd16(e + 14)) return false;
-        if (fmt) {
-            uint64_t row = fmt == 1 ? (uint64_t)w / 2 + w % 2 : w;
-            if (fmt != p->pkg->format || !w || !h || stride < row ||
-                (uint64_t)(h - 1) * stride + row > len || off < table || (uint64_t)off + len > length)
-                return false;
-            for (uint32_t y = 0; fmt == 1 && w % 2 && y < h; y++)
-                if (d[off + y * stride + w / 2] & 0x0F) return false; /* A4 padding nibble */
-        } else if (len || w || h) {
-            return false;
+        const uint8_t *e = recs + 4 + 16ull * g;
+        uint32_t x = shr__rd16(e), y = shr__rd16(e + 2), w = e[4], h = e[5], fmt = e[8] & 3u, cells = (e[8] >> 2) & 3u;
+        if ((e[8] & 0xF0) | e[9] | shr__rd32(e + 12) || !cells || cells > 2) return false;
+        if (!fmt) {
+            if (x | y | w | h) return false;
+            continue;
         }
+        bool a4 = fmt == 1;
+        if (fmt != pkg->format || !w || !h || (a4 && x % 2) || x + w > pkg->atlas_w || y + h > pkg->atlas_h)
+            return false; /* an even A4 x in an atlas of even width leaves room for the padding nibble */
+        for (uint32_t r = 0; a4 && w % 2 && r < h; r++)
+            if (d[(size_t)(y + r) * pkg->stride + (x + w) / 2] & 0x0F) return false; /* A4 padding nibble */
     }
     return true;
 }

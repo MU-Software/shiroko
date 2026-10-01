@@ -64,24 +64,30 @@ typedef struct batch {
     size_t n;
 } batch;
 
+static uint8_t a8[CW * CH], a4[(CW + 1) / 2 * CH], sparse[CW * CH], rgba[64 * 64 * 4];
+/* Buffer ids of the sources, and the table shr_software_execute draws them from. */
+enum { A8_SRC = 1, A4_SRC, SPARSE_SRC, RGBA_SRC, NSRC = RGBA_SRC };
+static const shr_image srcs[NSRC] = {
+    {a8, CW, CH, CW, sizeof(a8), SHR_FORMAT_A8, SHR_MEMORY_CPU},
+    {a4, CW, CH, (CW + 1) / 2, sizeof(a4), SHR_FORMAT_A4, SHR_MEMORY_CPU},
+    {sparse, CW, CH, CW, sizeof(sparse), SHR_FORMAT_A8, SHR_MEMORY_CPU},
+    {rgba, 64, 64, 256, sizeof(rgba), SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU},
+};
+
 static void op_batch(void *arg) {
     batch *b = arg;
     check("execute", b->drv ? b->drv->execute(b->drv->user, &b->dst, b->cmds, b->n, 1)
-                            : shr_software_execute(&b->dst, b->cmds, b->n));
+                            : shr_software_execute(&b->dst, b->cmds, b->n, srcs, NSRC));
 }
 
-static uint8_t a8[CW * CH], a4[(CW + 1) / 2 * CH], sparse[CW * CH], rgba[64 * 64 * 4];
-static const shr_image a8_src = {a8, CW, CH, CW, sizeof(a8), SHR_FORMAT_A8, SHR_MEMORY_CPU},
-                       a4_src = {a4, CW, CH, (CW + 1) / 2, sizeof(a4), SHR_FORMAT_A4, SHR_MEMORY_CPU},
-                       sparse_src = {sparse, CW, CH, CW, sizeof(sparse), SHR_FORMAT_A8, SHR_MEMORY_CPU};
-
 /* `flags`: BOLD and ITALIC turning about the cell's middle, which the cell-sized source fits. */
-static shr_draw_cmd *cell_cmds(shr_cmd_kind kind, const shr_image *g, uint32_t flags, size_t *n) {
+static shr_draw_cmd *cell_cmds(shr_cmd_kind kind, uint32_t id, uint32_t flags, size_t *n) {
     shr_draw_cmd *c = calloc((size_t)ROWS * COLS, sizeof(*c));
     for (int r = 0, i = 0; r < ROWS; r++)
         for (int k = 0; k < COLS; k++, i++)
             c[i] = (shr_draw_cmd){.kind = kind, .dst = {k * CW, r * CH, (k + 1) * CW, (r + 1) * CH},
-                                  .color = SHR_RGB(200, 180 + r, k), .src = *g, .flags = flags, .slant_axis = CH};
+                                  .color = SHR_RGB(200, 180 + r, k), .buffer = id, .src_rect = {0, 0, CW, CH},
+                                  .flags = flags, .slant_axis = CH};
     *n = (size_t)ROWS * COLS;
     return c;
 }
@@ -101,21 +107,20 @@ static void bench_software(void) {
     full.flags = SHR_GLYPH_DIM;
     run("software/fill-screen-dim", op_batch, &(batch){NULL, dst, &full, 1}, screen_px, "px");
     size_t n;
-    shr_draw_cmd *cells = cell_cmds(SHR_CMD_FILL, &a8_src, 0, &n);
+    shr_draw_cmd *cells = cell_cmds(SHR_CMD_FILL, 0, 0, &n);
     run("software/fill-cells", op_batch, &(batch){NULL, dst, cells, n}, screen_px, "px");
     free(cells);
     static const struct {
         const char *name;
-        const shr_image *src;
-        uint32_t flags;
+        uint32_t src, flags;
     } glyphs[] = {
-        {"software/glyph-a8-cells", &a8_src, 0},
-        {"software/glyph-a4-cells", &a4_src, 0},
-        {"software/glyph-a8-cells-bold", &a8_src, SHR_GLYPH_BOLD},
-        {"software/glyph-a8-cells-italic", &a8_src, SHR_GLYPH_ITALIC},
-        {"software/glyph-a8-cells-bold-italic", &a8_src, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC},
-        {"software/glyph-a4-cells-bold-italic", &a4_src, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC},
-        {"software/glyph-a8-sparse-bold-italic", &sparse_src, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC},
+        {"software/glyph-a8-cells", A8_SRC, 0},
+        {"software/glyph-a4-cells", A4_SRC, 0},
+        {"software/glyph-a8-cells-bold", A8_SRC, SHR_GLYPH_BOLD},
+        {"software/glyph-a8-cells-italic", A8_SRC, SHR_GLYPH_ITALIC},
+        {"software/glyph-a8-cells-bold-italic", A8_SRC, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC},
+        {"software/glyph-a4-cells-bold-italic", A4_SRC, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC},
+        {"software/glyph-a8-sparse-bold-italic", SPARSE_SRC, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC},
     };
     for (size_t i = 0; i < sizeof(glyphs) / sizeof(glyphs[0]); i++) {
         cells = cell_cmds(SHR_CMD_GLYPH, glyphs[i].src, glyphs[i].flags, &n);
@@ -127,8 +132,8 @@ static void bench_software(void) {
     size_t nt = 0;
     for (int y = 0; y + 64 <= H; y += 64)
         for (int x = 0; x + 64 <= W; x += 64)
-            tiles[nt++] = (shr_draw_cmd){.kind = SHR_CMD_IMAGE, .dst = {x, y, x + 64, y + 64},
-                                         .src = {rgba, 64, 64, 256, sizeof(rgba), SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU}};
+            tiles[nt++] = (shr_draw_cmd){.kind = SHR_CMD_IMAGE, .dst = {x, y, x + 64, y + 64}, .buffer = RGBA_SRC,
+                                         .src_rect = {0, 0, 64, 64}};
     run("software/image-tiles-mixed-alpha", op_batch, &(batch){NULL, dst, tiles, nt}, (double)nt * 64 * 64, "px");
 
     shr_pixel_format of = SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? SHR_FORMAT_RGBX8888 : SHR_FORMAT_RGB565;
@@ -139,21 +144,23 @@ static void bench_software(void) {
     shr_draw_cmd turn = {.kind = SHR_CMD_ROTATE, .dst = {0, 0, H, W}, .src = logical, .rotation = SHR_ROTATE_90_CW};
     run("software/rotate-90-screen", op_batch, &(batch){NULL, rot, &turn, 1}, screen_px, "px");
 
-    /* One cached group per row (background + glyph per cell); every operation is a hit. */
-    shr_draw_cmd *rows = calloc((size_t)ROWS * (COLS * 2 + 2), sizeof(*rows));
+    /* One cached group per row (background + glyph per cell) after the glyph's REGISTER; every operation is a hit. */
+    shr_draw_cmd *rows = calloc((size_t)ROWS * (COLS * 2 + 2) + 1, sizeof(*rows));
     size_t m = 0;
+    rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_BUFFER_REGISTER, .buffer = A8_SRC, .src = srcs[A8_SRC - 1]};
     for (int r = 0; r < ROWS; r++) {
         shr_rect row = {0, r * CH, W, (r + 1) * CH};
         rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_CACHE_BEGIN, .dst = row, .key = {(uint64_t)r + 1, 7}, .cache_clip = row};
         for (int k = 0; k < COLS; k++) {
             shr_rect cell = {k * CW, r * CH, (k + 1) * CW, (r + 1) * CH};
             rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_FILL, .dst = cell, .color = SHR_RGB(20, 20, r)};
-            rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_GLYPH, .dst = cell, .color = SHR_RGB(220, 220, 220), .src = a8_src};
+            rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_GLYPH, .dst = cell, .color = SHR_RGB(220, 220, 220),
+                                       .buffer = A8_SRC, .src_rect = {0, 0, CW, CH}};
         }
         rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_CACHE_END};
     }
     shr_framebuffer_driver drv;
-    check("driver", shr_software_driver_create(NULL, 8u << 20, &drv));
+    check("driver", shr_software_driver_create(NULL, 8u << 20, NSRC, &drv));
     run("software/cache-rows-hit", op_batch, &(batch){&drv, dst, rows, m}, screen_px, "px");
     shr_software_driver_destroy(&drv);
     free(rows);
@@ -189,11 +196,16 @@ typedef struct env {
     shr_context *ctx;
 } env;
 
+/* Buffer ids of the drivers below: font pages within page_cache_bytes, builtin pages and images. */
+#define MAX_BUFFERS 1024
+
 /* cache_bytes < 0: a driver that draws nothing. */
 static void env_open(env *e, long cache_bytes) {
     memset(e, 0, sizeof(*e));
-    if (cache_bytes >= 0) check("driver", shr_software_driver_create(NULL, (uint64_t)cache_bytes, &e->drv.inner));
-    else e->drv.inner.execute = draw_nothing;
+    if (cache_bytes >= 0)
+        check("driver", shr_software_driver_create(NULL, (uint64_t)cache_bytes, MAX_BUFFERS, &e->drv.inner));
+    else
+        e->drv.inner.execute = draw_nothing, e->drv.inner.caps.max_buffers = MAX_BUFFERS;
     e->wrap = e->drv.inner;
     e->wrap.user = &e->drv, e->wrap.execute = count_execute;
     shr_output_init(&e->out);

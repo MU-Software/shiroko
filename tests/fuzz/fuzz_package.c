@@ -1,6 +1,7 @@
 /* Font packages with arbitrary bytes, opened by the font plugin as memory-mapped sources (in place) and
  * through read() (header, table, index and pages read and cached), then read again next to a second package
- * whose reads always fail (two packages cool down). Byte 0 selects the package role (bits 0-2), asynchronous
+ * whose reads always fail (two packages cool down). Byte 0 selects the package role (bits 0-2; 5-7 also give a
+ * driver that wants 16-byte strides, so pages are copied into slots), asynchronous
  * reads completed later (0x08), bold italic text (0x10), a tiny page cache (0x20), every fourth read failing (0x40)
  * and (0x80) with 0x08 reads that never complete (the watchdog cancels them), else reads returning different
  * bytes each time. Invariants: no out-of-bounds access, every frame rasters (bad packages or pages fall back),
@@ -108,7 +109,8 @@ static uint8_t mapped_pixels[sizeof(out.pixels)];
 static void render(pkg_source *src, uint8_t mode) {
     memset(&out, 0, sizeof(out));
     shr_framebuffer_driver drv;
-    FUZZ_CHECK(shr_software_driver_create(NULL, 0, &drv) == SHR_OK);
+    FUZZ_CHECK(shr_software_driver_create(NULL, 0, 64, &drv) == SHR_OK);
+    if ((mode & 7) >= 5) drv.caps.stride_align = 16;
     shr_output o;
     fuzz_output_init(&out, &o, 0);
     shr_context_desc cd;

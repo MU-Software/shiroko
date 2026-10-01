@@ -5,6 +5,7 @@
 
 #include "shr_alloc.h"
 #include "shr_err.h"
+#include "shr_lru.h"
 #include "shr_rect.h"
 #include "shr_vec.h"
 
@@ -39,17 +40,40 @@ void shr__ctx_host_leave(shr_context *ctx, bool saved);
         shr__ctx_host_leave((ctx), shr_saved_); \
     } while (0)
 
+/* ===== Buffers ===== */
+
+/* Pixels plugins draw from, embedded in plugin state; the driver knows them by `id`. The plugin writes `mem`
+ * pixels only while no frame resolved to the buffer is pinned. */
+typedef struct shr__buf {
+    shr_image mem;
+    uint32_t id;        /* driver id, 0 = not registered; compositor-owned like the fields below */
+    shr_rect dirty;     /* written since the driver last saw it */
+    uint64_t used;      /* last frame that drew from it */
+    bool owned;         /* `mem` came from shr__buf_alloc */
+    shr__lru_node lru;
+} shr__buf;
+
+/* Memory the driver reaches (caps.domains, alignments); SHR_E_UNSUPPORTED beyond caps.max_buffer_width/height. */
+shr_status shr__buf_alloc(shr_context *ctx, shr_pixel_format format, int32_t width, int32_t height, shr__buf *out);
+/* Memory the caller keeps (a mapped or builtin page); SHR_E_UNSUPPORTED when the driver cannot reach it. */
+shr_status shr__buf_wrap(shr_context *ctx, const shr_image *mem, shr__buf *out);
+/* The plugin wrote `area` (buffer pixels); the driver sees it before the next frame draws from the buffer. */
+void shr__buf_changed(shr__buf *buf, shr_rect area);
+/* Frees owned memory and gives the id back; only while no frame resolved to the buffer is pinned. */
+void shr__buf_free(shr_context *ctx, shr__buf *buf);
+
 /* ===== Resources ===== */
 
 typedef struct shr__res shr__res;
 
-/* Pixels a GLYPH or IMAGE command draws, placed relative to the command's anchor. */
+/* Pixels a GLYPH or IMAGE command draws: region `rect` of `buf`, placed relative to the command's anchor. */
 typedef struct shr__resolved {
-    shr_image image;
-    shr_point offset;  /* top-left of `image` relative to shr__lcmd.anchor */
+    shr__buf *buf;
+    shr_rect rect;
+    shr_point offset;  /* top-left of `rect` relative to shr__lcmd.anchor */
     bool provisional;  /* temporary fallback: redrawn after pump() reports a change */
     uint32_t synth;    /* SHR_GLYPH_BOLD / SHR_GLYPH_ITALIC the glyph may be drawn with */
-    int32_t slant_axis;
+    int32_t slant_axis; /* twice the rect y the italic shear turns about */
 } shr__resolved;
 
 typedef struct shr__res_ops {

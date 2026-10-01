@@ -104,13 +104,20 @@ shr_status shr_framebuffer_driver_init(shr_framebuffer_driver *d) {
     return SHR_OK;
 }
 
-static shr_alloc_kind dma_kind(const shr_surface *s) {
-    return s->domain == SHR_MEMORY_DMA ? SHR_ALLOC_DMA : SHR_ALLOC_PAYLOAD;
+static shr_alloc_kind alloc_kind(shr_memory_domain dom) {
+    return dom == SHR_MEMORY_DMA ? SHR_ALLOC_DMA : SHR_ALLOC_PAYLOAD;
+}
+
+/* Memory the compositor allocates for the driver: DMA when only that reaches it and the application serves it. */
+static shr_memory_domain driver_domain(const shr_context *ctx) {
+    uint32_t dom = ctx->driver.caps.domains;
+    return (dom & SHR_MEMORY_DMA) && !(dom & SHR_MEMORY_CPU) && ctx->dma_alloc ? SHR_MEMORY_DMA : SHR_MEMORY_CPU;
 }
 
 static void composition_free(shr_context *ctx) {
     if (ctx->composition_owned)
-        shr__free(&ctx->al, ctx->composition.pixels, ctx->composition.byte_length, 64, dma_kind(&ctx->composition));
+        shr__free(&ctx->al, ctx->composition.pixels, ctx->composition.byte_length, 64,
+                  alloc_kind(ctx->composition.domain));
     ctx->composition_owned = false;
 }
 
@@ -126,7 +133,12 @@ static void context_free(shr_context *ctx) {
     shr__vec_free(&f->damage, &al);
     shr__vec_free(&f->provisional, &al);
     shr__vec_free(&f->resolved, &al);
+    shr__vec_free(&f->prologue, &al);
+    shr__vec_free(&f->planned, &al);
     composition_free(ctx);
+    uint32_t nb = ctx->driver.caps.max_buffers;
+    SHR_FREE_ARRAY(&al, ctx->slots, shr__slot, nb);
+    SHR_FREE_ARRAY(&al, ctx->released, uint32_t, nb);
     shr__free(&al, ctx->io, ctx->nio * sizeof(shr__io), SHR_ALIGNOF(shr__io), SHR_ALLOC_DESCRIPTOR);
     shr__free(&al, ctx->events, ctx->event_cap * sizeof(shr_event), SHR_ALIGNOF(shr_event), SHR_ALLOC_DESCRIPTOR);
     shr__free(&al, ctx->unreleased, ctx->desc.max_unreleased_frames * sizeof(uint64_t), 8, SHR_ALLOC_DESCRIPTOR);
@@ -172,10 +184,14 @@ shr_status shr_create(const shr_context_desc *d, shr_context **out) {
     SHR_VEC_INIT(&ctx->frame.damage, shr_rect);
     SHR_VEC_INIT(&ctx->frame.provisional, shr_rect);
     SHR_VEC_INIT(&ctx->frame.resolved, shr__res *);
+    SHR_VEC_INIT(&ctx->frame.prologue, shr_draw_cmd);
+    SHR_VEC_INIT(&ctx->frame.planned, shr__planned);
     ctx->io = shr__calloc(&al, ctx->nio, sizeof(shr__io), SHR_ALIGNOF(shr__io), SHR_ALLOC_DESCRIPTOR);
     ctx->events = shr__calloc(&al, ctx->event_cap, sizeof(shr_event), SHR_ALIGNOF(shr_event), SHR_ALLOC_DESCRIPTOR);
     ctx->unreleased = shr__calloc(&al, d->max_unreleased_frames, sizeof(uint64_t), 8, SHR_ALLOC_DESCRIPTOR);
-    if (!ctx->io || !ctx->events || !ctx->unreleased) {
+    ctx->slots = SHR_NEW_ARRAY(&al, shr__slot, drv->caps.max_buffers);
+    ctx->released = SHR_NEW_ARRAY(&al, uint32_t, drv->caps.max_buffers);
+    if (!ctx->io || !ctx->events || !ctx->unreleased || !ctx->slots || !ctx->released) {
         context_free(ctx);
         return SHR_E_NO_MEMORY;
     }
@@ -274,15 +290,14 @@ shr_status shr_screen_configure(shr_context *ctx, const shr_screen_desc *d) {
         size_t row, len;
         shr_format_row_bytes(fmt, d->width, &row);
         len = row * (size_t)d->height;
-        uint32_t dom = ctx->driver.caps.domains;
-        bool dma = (dom & SHR_MEMORY_DMA) && !(dom & SHR_MEMORY_CPU) && ctx->dma_alloc;
-        void *px = shr__malloc(&ctx->al, len, 64, dma ? SHR_ALLOC_DMA : SHR_ALLOC_PAYLOAD);
+        shr_memory_domain dom = driver_domain(ctx);
+        void *px = shr__malloc(&ctx->al, len, 64, alloc_kind(dom));
         if (!px) return SHR_E_NO_MEMORY;
-        comp = (shr_surface){px, d->width, d->height, row, len, fmt, 1, dma ? SHR_MEMORY_DMA : SHR_MEMORY_CPU, 0};
+        comp = (shr_surface){px, d->width, d->height, row, len, fmt, 1, dom, 0};
         owned = true;
     }
     if (composing && !shr__driver_reaches(&ctx->driver.caps, &comp)) { /* every frame would fail */
-        if (owned) shr__free(&ctx->al, comp.pixels, comp.byte_length, 64, dma_kind(&comp));
+        if (owned) shr__free(&ctx->al, comp.pixels, comp.byte_length, 64, alloc_kind(comp.domain));
         return SHR_E_UNSUPPORTED;
     }
     shr__frame_abandon(ctx);
@@ -485,6 +500,62 @@ shr_status shr_surface_validate(const shr_surface *s) SHR_NONBLOCKING {
 shr_status shr_image_validate(const shr_image *m) SHR_NONBLOCKING {
     return m ? buffer_check(m->pixels, m->width, m->height, m->stride, m->byte_length, m->format, m->domain)
              : SHR_E_INVALID_ARG;
+}
+
+static bool buf_format(shr_pixel_format f) {
+    return f == SHR_FORMAT_A4 || f == SHR_FORMAT_A8 || f == SHR_FORMAT_RGBA8888;
+}
+
+static bool buf_fits(const shr_driver_caps *k, int32_t w, int32_t h) {
+    return !(k->max_buffer_width && w > k->max_buffer_width) && !(k->max_buffer_height && h > k->max_buffer_height);
+}
+
+static size_t buf_align(const shr_driver_caps *k) { return k->address_align > 64 ? k->address_align : 64; }
+
+shr_status shr__buf_alloc(shr_context *ctx, shr_pixel_format f, int32_t w, int32_t h, shr__buf *out) {
+    const shr_driver_caps *k = &ctx->driver.caps;
+    if (!buf_format(f) || w <= 0 || h <= 0) return SHR_E_INVALID_ARG;
+    if (!buf_fits(k, w, h)) return SHR_E_UNSUPPORTED;
+    uint64_t a = k->stride_align ? k->stride_align : 1, stride = (row_bytes(f, w) + a - 1) / a * a, len;
+    if (__builtin_mul_overflow(stride, (uint64_t)h, &len)) return SHR_E_NO_MEMORY;
+#if SIZE_MAX < UINT64_MAX
+    if (len > SIZE_MAX) return SHR_E_NO_MEMORY;
+#endif
+    shr_memory_domain dom = driver_domain(ctx);
+    void *px = shr__malloc(&ctx->al, (size_t)len, buf_align(k), alloc_kind(dom));
+    if (!px) return SHR_E_NO_MEMORY;
+    if (!shr__mem_reaches(k, dom, px, (size_t)stride)) {
+        shr__free(&ctx->al, px, (size_t)len, buf_align(k), alloc_kind(dom));
+        return SHR_E_UNSUPPORTED;
+    }
+    *out = (shr__buf){.mem = {px, w, h, (size_t)stride, (size_t)len, f, dom}, .owned = true};
+    return SHR_OK;
+}
+
+shr_status shr__buf_wrap(shr_context *ctx, const shr_image *mem, shr__buf *out) {
+    if (shr_image_validate(mem) != SHR_OK || !buf_format(mem->format)) return SHR_E_INVALID_ARG;
+    const shr_driver_caps *k = &ctx->driver.caps;
+    if (!buf_fits(k, mem->width, mem->height) || !shr__mem_reaches(k, mem->domain, mem->pixels, mem->stride))
+        return SHR_E_UNSUPPORTED;
+    *out = (shr__buf){.mem = *mem};
+    return SHR_OK;
+}
+
+void shr__buf_changed(shr__buf *b, shr_rect area) {
+    b->dirty = shr__rect_union(b->dirty, shr__rect_intersect(area, (shr_rect){0, 0, b->mem.width, b->mem.height}));
+}
+
+void shr__buf_free(shr_context *ctx, shr__buf *b) {
+    if (b->id) {
+        shr__slot *s = &ctx->slots[b->id - 1];
+        s->buf = NULL, s->releasing = true;
+        ctx->released[ctx->nreleased++] = b->id;
+        shr__lru_remove(&ctx->lru, &b->lru);
+    }
+    if (b->owned)
+        shr__free(&ctx->al, (void *)b->mem.pixels, b->mem.byte_length, buf_align(&ctx->driver.caps),
+                  alloc_kind(b->mem.domain));
+    *b = (shr__buf){0};
 }
 
 shr_status shr_rotation_map_point(shr_rotation r, int32_t w, int32_t h, shr_point p, bool inverse, shr_point *out) {

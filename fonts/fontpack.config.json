@@ -1,6 +1,10 @@
 {
   "format": 1,
   "page_bytes": 102400,
+  "page_atlas": {
+    "a4": [512, 256],
+    "a8": [256, 256]
+  },
   "raster": {
     "load": "target_light",
     "render": "normal"

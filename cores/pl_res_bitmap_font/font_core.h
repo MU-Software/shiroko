@@ -5,12 +5,13 @@
 #include "shr_hash.h"
 #include "shr_lru.h"
 
-#define SHR_PKG_VERSION 3
+#define SHR_PKG_VERSION 4
 #define SHR_PKG_ENTRY 32 /* section table entries and page records */
 #define SHR_PKG_MAX_SECTIONS 16
 #define SHR_PKG_MAX_RECORDS (1u << 22)
 #define SHR_PKG_MAX_PAGES (1u << 16)
 #define SHR_PKG_MAX_PAGE_BYTES (1u << 20)
+#define SHR_PKG_PAGE_ALIGN 256 /* page file offsets */
 #define SHR_PKG_MAX_INDEX_BYTES ((uint64_t)128 << 20)
 #define SHR_MAX_CELL_SIZE 1024
 #define SHR_FONT_MAX_CLUSTERS (1u << 16)
@@ -35,11 +36,22 @@ typedef struct shr__retry {
 
 typedef struct shr__pkg shr__pkg;
 
+/* A buffer pages are drawn from: a page atlas in place (mapped), or memory of `rows` rows whose first
+ * mem.height rows hold an atlas and the rest the page's glyph count and records. A slot of the page cache
+ * moves on to the next page of its shape when its page is evicted, keeping the buffer id. */
+typedef struct shr__page_slot {
+    shr__buf buf;
+    int32_t rows;
+    uint64_t shape; /* shr__pkg.slot_shape of the packages whose pages it takes */
+    uint64_t bytes; /* charged to the page cache; 0 outside it */
+} shr__page_slot;
+
 /* Exists while a page is wanted, loading, resident, cooling down or failed: one no frame wants any more
  * forgets its failed reads. */
 typedef struct shr__page {
     shr__pkg *pkg;
-    const uint8_t *data; /* owned, or inside a mapped package */
+    shr__page_slot *slot; /* while loading or resident */
+    const uint8_t *recs;  /* resident: u32 glyph count, then the glyph records */
     uint32_t index;
     uint8_t state;
     bool queued;       /* in the font's wants */
@@ -65,6 +77,9 @@ struct shr__pkg {
     const uint8_t *cmap, *seqs, *pool, *page_recs;
     uint8_t format;
     int16_t baseline;
+    uint16_t atlas_w, atlas_h;
+    uint32_t stride, slot_rows; /* atlas bytes per row; rows of a slot for every page of the package */
+    uint64_t slot_shape;        /* format, atlas size and slot rows */
     shr__page **pages; /* npages entries, NULL until wanted */
 };
 
@@ -133,9 +148,11 @@ shr_status shr__pkg_map(shr__pkg *pkg, const void *data, uint64_t size, const ch
 void shr__pkg_advance(shr__pkg *pkg);
 bool shr__pkg_due(const shr__pkg *pkg, uint64_t now);
 void shr__pkg_load_done(shr__pkg *pkg, shr_status result);
-bool shr__page_valid(const shr__page *p);
+/* The page payload at `d` (checksum, records, rects inside the atlas). */
+bool shr__page_valid(const shr__page *p, const uint8_t *d);
 
 /* page_cache.c */
+shr_status shr__pages_builtin(shr__pkg *pkg);
 void shr__pages_free(shr__pkg *pkg);
 void shr__pages_schedule(shr_pl_res_bitmap_font *f);
 void shr__page_done(shr__page *p, shr_status result);

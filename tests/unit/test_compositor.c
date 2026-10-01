@@ -13,13 +13,16 @@
 /* ---- recording host callbacks ---- */
 
 static struct {
-    shr_draw_cmd cmds[512];
+    shr_draw_cmd cmds[512]; /* the draws, after the buffer prologue */
     size_t n;
+    shr_draw_cmd pro[64];
+    size_t npro;
     int frames, logs, kinds[16];
     uint64_t damaged, commands; /* of the last RASTER_BEGIN */
     uint64_t submit_id;         /* of the last SUBMIT */
     int syncs;
     const void *sync_addr[8];
+    size_t sync_len[8];
     shr_fence fence; /* of the last execute() */
 } rec;
 
@@ -36,15 +39,19 @@ static void rec_log(void *user, shr_status st, const char *msg) {
 }
 
 static shr_status rec_execute(void *user, const shr_surface *dst, const shr_draw_cmd *c, size_t n, shr_fence f) {
-    rec.n = n < 512 ? n : 512;
-    memcpy(rec.cmds, c, rec.n * sizeof(*c));
+    size_t p = 0;
+    while (p < n && c[p].kind >= SHR_CMD_BUFFER_REGISTER) p++;
+    rec.npro = p < 64 ? p : 64;
+    memcpy(rec.pro, c, rec.npro * sizeof(*c));
+    rec.n = n - p < 512 ? n - p : 512;
+    memcpy(rec.cmds, c + p, rec.n * sizeof(*c));
     rec.fence = f;
     return md_execute(user, dst, c, n, f);
 }
 
 static void rec_sync(void *user, const void *addr, size_t bytes) {
-    (void)user, (void)bytes;
-    if (rec.syncs < 8) rec.sync_addr[rec.syncs] = addr;
+    (void)user;
+    if (rec.syncs < 8) rec.sync_addr[rec.syncs] = addr, rec.sync_len[rec.syncs] = bytes;
     rec.syncs++;
 }
 
@@ -83,6 +90,7 @@ static void tweak_one_frame(shr_context_desc *d, shr_framebuffer_driver *drv) {
 typedef struct fake {
     shr__res res;
     uint8_t cov[8 * 16 * 4];
+    shr__buf buf;
     shr__resolved px;
     shr_status st;
     bool changed, work;
@@ -115,17 +123,28 @@ static void fk_io(shr__res *r, uint64_t tag, shr_status st) {
     f->io_n++, f->io_tag = tag, f->io_st = st;
 }
 static void fk_shutdown(shr__res *r) { ((fake *)r)->shutdowns++; }
-static void fk_free(shr__res *r) { ((fake *)r)->frees++; }
+static void fk_free(shr__res *r) {
+    ((fake *)r)->frees++;
+    shr__buf_free(r->ctx, &((fake *)r)->buf);
+}
 
 static const shr__res_ops fk_ops = {fk_resolve, fk_end, fk_pump, fk_work, fk_deadline, fk_io, fk_shutdown, fk_free};
 static const shr__res_ops bare_ops = {.resolve = fk_resolve, .free = fk_free};
+
+static void fake_wrap(fake *f, shr_pixel_format format, shr_memory_domain domain) {
+    size_t stride = format == SHR_FORMAT_A8 ? 8 : 32;
+    shr_image m = {f->cov, 8, 16, stride, stride * 16, format, domain};
+    ASSERT_EQ_LL(shr__buf_wrap(f->res.ctx, &m, &f->buf), SHR_OK);
+}
 
 /* An 8x16 opaque glyph. */
 static void fake_attach(fake *f, shr_context *ctx, const shr__res_ops *ops) {
     memset(f, 0, sizeof(*f));
     memset(f->cov, 255, sizeof(f->cov));
-    f->px.image = (shr_image){f->cov, 8, 16, 8, 8 * 16, SHR_FORMAT_A8, SHR_MEMORY_CPU};
     ASSERT_EQ_LL(shr__res_attach(ctx, &f->res, ops), SHR_OK);
+    fake_wrap(f, SHR_FORMAT_A8, SHR_MEMORY_CPU);
+    f->px.buf = &f->buf;
+    f->px.rect = (shr_rect){0, 0, 8, 16};
 }
 
 static shr__lcmd glyph(fake *f, int32_t x, int32_t y, shr_color color) {
@@ -138,6 +157,13 @@ static shr__lcmd fill(shr_rect r, shr_color color) {
 }
 
 /* ---- helpers ---- */
+
+static bool rect_eq(shr_rect a, shr_rect b) { return a.x0 == b.x0 && a.y0 == b.y0 && a.x1 == b.x1 && a.y1 == b.y1; }
+
+/* Prologue command i of the last batch. */
+static bool pro_is(int i, shr_cmd_kind kind, uint32_t id) {
+    return (size_t)i < rec.npro && rec.pro[i].kind == kind && rec.pro[i].buffer == id;
+}
 
 static void paint(shr_lyr *l, size_t n, const shr__lcmd *cmds) {
     ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
@@ -1801,42 +1827,136 @@ static void tweak_caps(shr_context_desc *d, shr_framebuffer_driver *drv) {
     drv->caps = caps_case;
 }
 
-/* Destinations and sources outside the driver's limits fail the frame with SHR_E_UNSUPPORTED. */
+/* Destinations outside the driver's limits fail the frame with SHR_E_UNSUPPORTED. */
 TEST test_driver_caps_checked(void) {
     const struct {
         shr_driver_caps caps;
-        bool odd_src, dma_src, ok;
+        bool ok;
     } cases[] = {
-        {{0, 0, 0, 0, 0, 0}, false, false, true}, /* no domains: CPU */
-        {{SHR_MEMORY_CPU, 1, 1, HW, HH, 0}, false, false, true},
-        {{SHR_MEMORY_DMA, 0, 0, 0, 0, 0}, false, false, false},
-        {{SHR_MEMORY_CPU, 0, 1000, 0, 0, 0}, false, false, false},
-        {{SHR_MEMORY_CPU, 0, 0, 10, 0, 0}, false, false, false},
-        {{SHR_MEMORY_CPU, 0, 0, 0, 10, 0}, false, false, false},
-        {{SHR_MEMORY_CPU, 2, 0, 0, 0, 0}, true, false, false},
-        {{SHR_MEMORY_CPU, 0, 0, 0, 0, 0}, false, true, false},
+        {{.max_buffers = HBUFS}, true}, /* no domains: CPU */
+        {{.domains = SHR_MEMORY_CPU, .address_align = 1, .stride_align = 1, .max_width = HW, .max_height = HH}, true},
+        {{.domains = SHR_MEMORY_DMA}, false},
+        {{.domains = SHR_MEMORY_CPU, .stride_align = 1000}, false},
+        {{.domains = SHR_MEMORY_CPU, .max_width = 10}, false},
+        {{.domains = SHR_MEMORY_CPU, .max_height = 10}, false},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         caps_case = cases[i].caps;
         harness h;
         shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_caps);
-        fake r;
-        fake_attach(&r, ctx, &fk_ops);
-        if (cases[i].odd_src) r.px.image.pixels = r.cov + 1;
-        if (cases[i].dma_src) r.px.image.domain = SHR_MEMORY_DMA;
-        shr_lyr *l;
-        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
-        shr__lcmd g = glyph(&r, 0, 0, WHITE);
-        paint(l, 1, &g);
+        shr_lyr *l = solid(ctx, 0, FULL, GREEN);
         frame(ctx);
         if (cases[i].ok)
             expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
         else
             ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_UNSUPPORTED);
         destroy_layers(&l, 1);
-        r.res.dead = true;
         harness_close(&h);
     }
+    PASS();
+}
+
+/* Buffers are checked against the caps when made: wrapped memory the driver cannot reach is refused. */
+TEST test_buffer_wrap(void) {
+    caps_case = (shr_driver_caps){.domains = SHR_MEMORY_CPU, .address_align = 4, .stride_align = 4,
+                                  .max_buffers = HBUFS, .max_buffer_width = 16, .max_buffer_height = 8};
+    harness h;
+    shr_context *ctx = harness_open(&h, 0, tweak_caps);
+    static _Alignas(16) uint8_t px[16 * 9 * 4];
+    shr__buf b = {0};
+    const shr_image good = {px, 16, 8, 16, 16 * 8, SHR_FORMAT_A8, 0};
+    struct {
+        shr_image m;
+        shr_status st;
+    } cases[] = {
+        {good, SHR_OK},
+        {{px, 16, 8, 64, 16 * 8 * 4, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU}, SHR_OK},
+        {{px, 16, 8, 8, 64, SHR_FORMAT_A4, SHR_MEMORY_CPU}, SHR_OK},
+        {{px, 16, 8, 32, 32 * 8, SHR_FORMAT_RGB565, 0}, SHR_E_INVALID_ARG},
+        {{px, 16, 8, 15, 16 * 8, SHR_FORMAT_A8, 0}, SHR_E_INVALID_ARG},
+        {{px, 17, 8, 20, 20 * 8, SHR_FORMAT_A8, 0}, SHR_E_UNSUPPORTED},
+        {{px, 16, 9, 16, 16 * 9, SHR_FORMAT_A8, 0}, SHR_E_UNSUPPORTED},
+        {{px + 2, 8, 8, 16, 16 * 8, SHR_FORMAT_A8, 0}, SHR_E_UNSUPPORTED},
+        {{px, 14, 8, 14, 14 * 8, SHR_FORMAT_A8, 0}, SHR_E_UNSUPPORTED},
+        {{px, 16, 8, 16, 16 * 8, SHR_FORMAT_A8, SHR_MEMORY_DMA}, SHR_E_UNSUPPORTED},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        memset(&b, 0x5A, sizeof(b));
+        ASSERT_EQ_LL(shr__buf_wrap(ctx, &cases[i].m, &b), cases[i].st);
+        if (cases[i].st == SHR_OK) ASSERT(!memcmp(&b.mem, &cases[i].m, sizeof(b.mem)) && !b.id && !b.owned);
+    }
+    ASSERT_EQ_LL(shr__buf_wrap(ctx, NULL, &b), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__buf_wrap(ctx, &good, &b), SHR_OK);
+    shr__buf_free(ctx, &b); /* not owned: the memory stays */
+    ASSERT(b.mem.pixels == NULL && px[0] == 0);
+    harness_close(&h);
+    PASS();
+}
+
+static fail_alloc buf_oom;
+static shr_allocator buf_oom_allocator;
+static void tweak_buf_alloc(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_caps(d, drv);
+    buf_oom = (fail_alloc){-1, 0};
+    buf_oom_allocator = fail_allocator(&buf_oom);
+    dma_alloc.f = (fail_alloc){-1, 0}, dma_alloc.dma = 0;
+    d->allocator = caps_case.domains == SHR_MEMORY_DMA ? &dma_allocator : &buf_oom_allocator;
+}
+
+/* Allocated buffers follow the driver: alignment, stride, size limits and memory domain. */
+TEST test_buffer_alloc(void) {
+    caps_case = (shr_driver_caps){.domains = SHR_MEMORY_CPU, .address_align = 128, .stride_align = 12,
+                                  .max_buffers = HBUFS, .max_buffer_width = 64, .max_buffer_height = 32};
+    harness h;
+    shr_context *ctx = harness_open(&h, 0, tweak_buf_alloc);
+    shr__buf b = {0};
+    ASSERT_EQ_LL(shr__buf_alloc(ctx, SHR_FORMAT_A4, 7, 3, &b), SHR_OK);
+    ASSERT(b.owned && b.mem.stride == 12 && b.mem.byte_length == 36 && (uintptr_t)b.mem.pixels % 128 == 0);
+    ASSERT(b.mem.domain == SHR_MEMORY_CPU && b.mem.format == SHR_FORMAT_A4 && b.mem.width == 7 && b.mem.height == 3);
+    shr__buf_free(ctx, &b);
+    ASSERT_EQ_LL(shr__buf_alloc(ctx, SHR_FORMAT_RGBA8888, 64, 32, &b), SHR_OK);
+    ASSERT_EQ_LL(b.mem.stride, 264);
+    long live = buf_oom.live;
+    shr__buf_free(ctx, &b);
+    ASSERT_EQ_LL(buf_oom.live, live - 1);
+    const struct {
+        shr_pixel_format f;
+        int32_t w, h;
+        shr_status st;
+    } bad[] = {{SHR_FORMAT_RGB565, 1, 1, SHR_E_INVALID_ARG}, {SHR_FORMAT_A8, 0, 1, SHR_E_INVALID_ARG},
+               {SHR_FORMAT_A8, 1, 0, SHR_E_INVALID_ARG},     {SHR_FORMAT_A8, 65, 1, SHR_E_UNSUPPORTED},
+               {SHR_FORMAT_A8, 1, 33, SHR_E_UNSUPPORTED}};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        ASSERT_EQ_LL(shr__buf_alloc(ctx, bad[i].f, bad[i].w, bad[i].h, &b), bad[i].st);
+    buf_oom.budget = 0;
+    ASSERT_EQ_LL(shr__buf_alloc(ctx, SHR_FORMAT_A8, 4, 4, &b), SHR_E_NO_MEMORY);
+    buf_oom.budget = -1;
+    harness_close(&h);
+    ASSERT_EQ_LL(buf_oom.live, 0);
+
+    /* A row padded to 3 * 2863311533 = 2^33 + 7 bytes: INT32_MAX rows take more than 2^64. */
+    caps_case = (shr_driver_caps){.stride_align = 2863311533u, .max_buffers = HBUFS};
+    ctx = harness_open(&h, 0, tweak_caps);
+    ASSERT_EQ_LL(shr__buf_alloc(ctx, SHR_FORMAT_RGBA8888, INT32_MAX, INT32_MAX, &b), SHR_E_NO_MEMORY);
+    harness_close(&h);
+    caps_case = (shr_driver_caps){.max_buffers = HBUFS}; /* no alignment asked: 64 bytes, rows unpadded */
+    ctx = harness_open(&h, 0, tweak_caps);
+    ASSERT_EQ_LL(shr__buf_alloc(ctx, SHR_FORMAT_A8, 3, 2, &b), SHR_OK);
+    ASSERT(b.mem.stride == 3 && (uintptr_t)b.mem.pixels % 64 == 0);
+    shr__buf_free(ctx, &b);
+    harness_close(&h);
+
+    caps_case = (shr_driver_caps){.domains = SHR_MEMORY_DMA, .max_buffers = HBUFS}; /* DMA memory from the app */
+    ctx = harness_open(&h, 0, tweak_buf_alloc);
+    ASSERT_EQ_LL(shr__buf_alloc(ctx, SHR_FORMAT_A8, 3, 2, &b), SHR_OK);
+    ASSERT(b.mem.domain == SHR_MEMORY_DMA && dma_alloc.dma == 1);
+    shr__buf_free(ctx, &b);
+    harness_close(&h);
+    ASSERT_EQ_LL(dma_alloc.f.live, 0);
+
+    ctx = harness_open(&h, 0, tweak_caps); /* without it, nothing the driver reaches */
+    ASSERT_EQ_LL(shr__buf_alloc(ctx, SHR_FORMAT_A8, 3, 2, &b), SHR_E_UNSUPPORTED);
+    harness_close(&h);
     PASS();
 }
 
@@ -1847,29 +1967,321 @@ static void tweak_sync(shr_context_desc *d, shr_framebuffer_driver *drv) {
     ((mock_output *)d->output->user)->domain = SHR_MEMORY_DMA;
 }
 
-/* sync() hands the destination and each DMA source to the device before execute(). */
+/* sync() hands the device the destination, each REGISTERed DMA buffer whole and only the rows of an UPDATE. */
 TEST test_dma_sync(void) {
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_sync);
     fake a, b;
     fake_attach(&a, ctx, &fk_ops);
     fake_attach(&b, ctx, &fk_ops);
-    a.px.image.domain = SHR_MEMORY_DMA;
+    fake_wrap(&a, SHR_FORMAT_A8, SHR_MEMORY_DMA);
     shr_lyr *l;
     ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
     const shr__lcmd c[5] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, 16, 16}, .key = {1}}, glyph(&a, 0, 0, WHITE),
                             glyph(&a, 8, 0, WHITE), {.kind = SHR__LCMD_CACHE_END}, glyph(&b, 16, 0, WHITE)};
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, c, 5), SHR_OK);
     frame(ctx);
+    ASSERT_EQ_LL(rec.npro, 2);
     ASSERT_EQ_LL(rec.syncs, 2);
-    ASSERT(rec.sync_addr[0] == h.out.bufs[h.out.last_buf] && rec.sync_addr[1] == a.cov);
+    ASSERT(rec.sync_addr[0] == h.out.bufs[h.out.last_buf] && rec.sync_addr[1] == a.cov && rec.sync_len[1] == 128);
     h.out.domain = SHR_MEMORY_CPU;
+    shr__buf_changed(&a.buf, (shr_rect){2, 3, 4, 5});
+    shr__buf_changed(&b.buf, (shr_rect){0, 0, 8, 16}); /* CPU memory: no sync */
     shr_request_redraw(ctx);
     frame(ctx);
-    ASSERT(rec.syncs == 3 && rec.sync_addr[2] == a.cov);
-    ASSERT_EQ_LL(configure(ctx, SHR_ROTATE_NONE, 0, SHR_SCREEN_COMPOSITION, NULL), SHR_OK); /* CPU memory will do */
+    ASSERT(rec.npro == 2 && pro_is(0, SHR_CMD_BUFFER_UPDATE, 1) && rect_eq(rec.pro[0].src_rect, (shr_rect){2, 3, 4, 5}));
+    ASSERT(rec.syncs == 3 && rec.sync_addr[2] == a.cov + 3 * 8 && rec.sync_len[2] == 16);
+    shr_request_redraw(ctx);
+    frame(ctx);
+    ASSERT(rec.npro == 0 && rec.syncs == 3);
+    ASSERT_EQ_LL(configure(ctx, SHR_ROTATE_180, 0, 0, NULL), SHR_OK); /* CPU memory will do */
+    frame(ctx);
+    ASSERT(h.out.presents == 4 && rec.syncs == 3);
     destroy_layers(&l, 1);
     a.res.dead = b.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* ---- buffer registry ---- */
+
+/* Paints one glyph per fake, 8 pixels apart. */
+static void draw_fakes(shr_lyr *l, int n, fake *const *f) {
+    shr__lcmd c[8];
+    for (int i = 0; i < n; i++) c[i] = glyph(f[i], i * 8, 0, WHITE);
+    paint(l, (size_t)n, c);
+}
+
+/* Ids are given on first draw, dense from 1, and come back with a RELEASE once a buffer is freed. */
+TEST test_buffer_ids(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    fake a, b, c, d;
+    fake_attach(&a, ctx, &fk_ops), fake_attach(&b, ctx, &fk_ops), fake_attach(&c, ctx, &fk_ops);
+    fake_attach(&d, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    draw_fakes(l, 3, (fake *[]){&a, &b, &a});
+    frame(ctx);
+    ASSERT(rec.npro == 2 && pro_is(0, SHR_CMD_BUFFER_REGISTER, 1) && pro_is(1, SHR_CMD_BUFFER_REGISTER, 2));
+    ASSERT(rec.pro[0].src.pixels == a.cov && rec.pro[1].src.pixels == b.cov && a.buf.id == 1 && b.buf.id == 2);
+    ASSERT(rec.cmds[1].buffer == 1 && rec.cmds[2].buffer == 2 && rec.cmds[3].buffer == 1);
+    ASSERT(rect_eq(rec.cmds[1].src_rect, (shr_rect){0, 0, 8, 16}) && h.drv.buffers[1].pixels == b.cov);
+    shr_request_redraw(ctx);
+    frame(ctx);
+    ASSERT_EQ_LL(rec.npro, 0); /* the driver has them */
+    draw_fakes(l, 3, (fake *[]){&a, &c, &a});
+    b.res.dead = true;
+    frame(ctx); /* b is freed after this frame */
+    ASSERT(pro_is(0, SHR_CMD_BUFFER_REGISTER, 3) && c.buf.id == 3 && b.frees == 1 && ctx->nreleased == 1);
+    draw_fakes(l, 3, (fake *[]){&a, &d, &c});
+    frame(ctx); /* the released id is taken again after its RELEASE */
+    ASSERT(rec.npro == 2 && pro_is(0, SHR_CMD_BUFFER_RELEASE, 2) && pro_is(1, SHR_CMD_BUFFER_REGISTER, 2));
+    ASSERT(d.buf.id == 2 && h.drv.buffers[1].pixels == d.cov && ctx->nreleased == 0);
+    ASSERT_EQ_LL(px(h.out.shown, 9, 3), WHITE);
+    draw_fakes(l, 2, (fake *[]){&a, &c}); /* d is freed while the frame waits: its RELEASE is for the next one */
+    h.drv.block_next = 1;
+    frame(ctx);
+    d.res.dead = true;
+    shr_pump(ctx);
+    shr_driver_ready(ctx);
+    shr_pump(ctx);
+    ASSERT(ctx->nreleased == 1 && ctx->released[0] == 2 && h.out.presents == 5);
+    draw_fakes(l, 1, (fake *[]){&a});
+    frame(ctx);
+    ASSERT(rec.npro == 1 && pro_is(0, SHR_CMD_BUFFER_RELEASE, 2) && ctx->nreleased == 0);
+    destroy_layers(&l, 1);
+    a.res.dead = c.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* A refused frame keeps its plan for the retry; a superseded one drops it: no id is lost, no change forgotten. */
+TEST test_buffer_plan_dropped(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    fake a, b;
+    fake_attach(&a, ctx, &fk_ops), fake_attach(&b, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    draw_fakes(l, 1, (fake *[]){&a});
+    frame(ctx);
+    shr__buf_changed(&a.buf, (shr_rect){0, 0, 2, 2});
+    shr__res_changed(&a.res, (shr_rect){0, 0, 2, 2});
+    draw_fakes(l, 2, (fake *[]){&a, &b});
+    h.drv.block_next = 1;
+    frame(ctx);
+    ASSERT(b.buf.id == 2 && !ctx->slots[1].buf && rec.npro == 2); /* planned, not taken */
+    draw_fakes(l, 2, (fake *[]){&b, &a});
+    frame(ctx); /* supersedes the refused frame, the next one runs */
+    ASSERT_EQ_LL(count_events(ctx, SHR_EVENT_FRAME_SUPERSEDED, NULL), 1);
+    ASSERT(rec.npro == 2 && pro_is(0, SHR_CMD_BUFFER_REGISTER, 2) && pro_is(1, SHR_CMD_BUFFER_UPDATE, 1));
+    ASSERT_EQ_LL(ctx->nreleased, 0); /* a dropped plan the driver never saw releases nothing */
+    ASSERT(rect_eq(rec.pro[1].src_rect, (shr_rect){0, 0, 2, 2}) && b.buf.id == 2 && shr__rect_empty(a.buf.dirty));
+
+    shr__buf_changed(&b.buf, (shr_rect){0, 1, 8, 2});
+    shr__buf_changed(&b.buf, (shr_rect){-4, 14, 3, 99}); /* clipped to the buffer */
+    shr_request_redraw(ctx);
+    h.drv.block_next = 1;
+    int updates = h.drv.updates;
+    frame(ctx);
+    ASSERT_EQ_LL(h.drv.updates, updates);
+    shr_driver_ready(ctx);
+    shr_pump(ctx); /* the retry runs the same prologue once */
+    ASSERT(h.drv.updates == updates + 1 && rec.npro == 1 && rect_eq(rec.pro[0].src_rect, (shr_rect){0, 1, 8, 16}));
+    ASSERT(shr__rect_empty(b.buf.dirty) && ctx->slots[1].buf == &b.buf);
+
+    shr__buf_changed(&a.buf, (shr_rect){1, 1, 2, 2}); /* a configure drops a planned frame too */
+    shr_request_redraw(ctx);
+    h.drv.block_next = 1;
+    frame(ctx);
+    ASSERT_EQ_LL(configure(ctx, SHR_ROTATE_NONE, 0, 0, NULL), SHR_OK);
+    ASSERT(rect_eq(a.buf.dirty, (shr_rect){1, 1, 2, 2}) && a.buf.id == 1 && b.buf.id == 2);
+    destroy_layers(&l, 1);
+    a.res.dead = b.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* After a failed batch or a timeout the driver's registrations are unknown: buffers register again. */
+TEST test_buffer_registered_again(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_timeout);
+    h.drv.reset_ok = true;
+    fake a;
+    fake_attach(&a, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    draw_fakes(l, 1, (fake *[]){&a});
+    frame(ctx);
+    h.drv.fail_next = 1; /* the mock forgets every id */
+    shr_request_redraw(ctx);
+    frame(ctx);
+    ASSERT_EQ_LL(count_events(ctx, SHR_EVENT_PRESENT_FAILED, NULL), 1);
+    shr_request_redraw(ctx);
+    frame(ctx);
+    ASSERT(pro_is(0, SHR_CMD_BUFFER_REGISTER, 1) && rec.npro == 1 && px(h.out.shown, 1, 1) == WHITE);
+
+    h.drv.async = true;
+    shr_request_redraw(ctx);
+    frame(ctx);
+    fake_now += 20 * MS;
+    shr_pump(ctx); /* the watchdog resets the driver */
+    ASSERT_EQ_LL(count_events(ctx, SHR_EVENT_DRIVER_TIMEOUT, NULL), 1);
+    h.drv.async = false;
+    shr_request_redraw(ctx);
+    frame(ctx);
+    ASSERT(pro_is(0, SHR_CMD_BUFFER_REGISTER, 1) && rec.npro == 1);
+    shr_request_redraw(ctx);
+    frame(ctx);
+    ASSERT_EQ_LL(rec.npro, 0);
+    destroy_layers(&l, 1);
+    a.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+static uint32_t limit_ids, limit_flags;
+static uint64_t limit_bytes;
+static void tweak_limits(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_rec(d, drv);
+    drv->caps.max_buffers = limit_ids, drv->caps.buffer_flags = limit_flags, drv->caps.buffer_bytes = limit_bytes;
+}
+
+/* A driver keeping copies holds at most buffer_bytes: least recently used buffers the frame does not draw from
+ * are released first, also one the frame draws later (it registers again). In-place drivers ignore the bytes. */
+TEST test_buffer_eviction_by_bytes(void) {
+    for (int copies = 0; copies < 2; copies++) {
+        limit_ids = HBUFS, limit_flags = copies ? SHR_BUFFER_COPIES : 0, limit_bytes = 256; /* two fakes */
+        harness h;
+        shr_context *ctx = harness_open(&h, PRESERVED, tweak_limits);
+        fake a, b, c;
+        fake_attach(&a, ctx, &fk_ops), fake_attach(&b, ctx, &fk_ops), fake_attach(&c, ctx, &fk_ops);
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+        draw_fakes(l, 2, (fake *[]){&a, &b});
+        frame(ctx);
+        ASSERT_EQ_LL(ctx->resident, 256);
+        draw_fakes(l, 2, (fake *[]){&c, &a});
+        frame(ctx);
+        if (copies) {
+            ASSERT(rec.npro == 4 && pro_is(0, SHR_CMD_BUFFER_RELEASE, 1) && pro_is(1, SHR_CMD_BUFFER_REGISTER, 3));
+            ASSERT(pro_is(2, SHR_CMD_BUFFER_RELEASE, 2) && pro_is(3, SHR_CMD_BUFFER_REGISTER, 1));
+            ASSERT(c.buf.id == 3 && a.buf.id == 1 && b.buf.id == 0 && ctx->resident == 256 && !ctx->slots[1].buf);
+        } else {
+            ASSERT(rec.npro == 1 && pro_is(0, SHR_CMD_BUFFER_REGISTER, 3) && ctx->resident == 384 && b.buf.id == 2);
+        }
+        ASSERT(px(h.out.shown, 1, 1) == WHITE && px(h.out.shown, 9, 1) == WHITE && h.drv.completed == SHR_OK);
+        limit_bytes = 100; /* one fake is too large */
+        destroy_layers(&l, 1);
+        a.res.dead = b.res.dead = c.res.dead = true;
+        harness_close(&h);
+    }
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_limits);
+    fake a;
+    fake_attach(&a, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    draw_fakes(l, 1, (fake *[]){&a});
+    frame(ctx);
+    ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_LIMIT);
+    destroy_layers(&l, 1);
+    a.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+static void tweak_copies_timeout(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_rec(d, drv);
+    drv->caps.buffer_flags = SHR_BUFFER_COPIES, drv->caps.buffer_bytes = 256, drv->caps.timeout_ns = 10 * MS;
+}
+
+/* A failed or timed-out batch may have run its buffer commands: the ids it registered or released are released
+ * first in the next prologue, so a driver keeping copies within buffer_bytes takes the next REGISTERs. */
+TEST test_buffer_lost_batch_released(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_copies_timeout);
+    h.drv.budget = 256, h.drv.fail_late = true, h.drv.reset_ok = true;
+    fake a, b, c;
+    fake_attach(&a, ctx, &fk_ops), fake_attach(&b, ctx, &fk_ops), fake_attach(&c, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    draw_fakes(l, 2, (fake *[]){&a, &b});
+    frame(ctx);
+    shr__buf_changed(&b.buf, (shr_rect){0, 0, 1, 1});
+    draw_fakes(l, 2, (fake *[]){&b, &c});
+    h.drv.fail_next = 1; /* runs UPDATE 2, RELEASE 1, REGISTER 3 (c), then fails */
+    frame(ctx);
+    ASSERT(rec.npro == 3 && pro_is(1, SHR_CMD_BUFFER_RELEASE, 1) && pro_is(2, SHR_CMD_BUFFER_REGISTER, 3));
+    ASSERT_EQ_LL(count_events(ctx, SHR_EVENT_PRESENT_FAILED, NULL), 1);
+    ASSERT(a.buf.id == 0 && c.buf.id == 0 && b.buf.id == 2 && ctx->nreleased == 2);
+    draw_fakes(l, 2, (fake *[]){&a, &b});
+    frame(ctx); /* without the RELEASE of 3 the driver would hold a, b and c */
+    ASSERT(rec.npro == 4 && pro_is(0, SHR_CMD_BUFFER_RELEASE, 1) && pro_is(1, SHR_CMD_BUFFER_RELEASE, 3));
+    ASSERT(pro_is(2, SHR_CMD_BUFFER_REGISTER, 1) && pro_is(3, SHR_CMD_BUFFER_REGISTER, 2));
+    ASSERT(h.out.presents == 2 && md_held(&h.drv) == 256 && ctx->resident == 256 && ctx->nreleased == 0);
+
+    draw_fakes(l, 1, (fake *[]){&a});
+    b.res.dead = true;
+    frame(ctx); /* b is freed: RELEASE 2 opens the next prologue */
+    h.drv.async = true;
+    draw_fakes(l, 2, (fake *[]){&a, &c});
+    frame(ctx); /* accepted with RELEASE 2, REGISTER 2 (c), then times out */
+    ASSERT(rec.npro == 2 && pro_is(0, SHR_CMD_BUFFER_RELEASE, 2) && pro_is(1, SHR_CMD_BUFFER_REGISTER, 2));
+    fake_now += 20 * MS;
+    shr_pump(ctx);
+    ASSERT(count_events(ctx, SHR_EVENT_DRIVER_TIMEOUT, NULL) == 1 && c.buf.id == 0 && ctx->nreleased == 1);
+    h.drv.async = false;
+    shr_request_redraw(ctx);
+    frame(ctx);
+    ASSERT(rec.npro == 3 && pro_is(0, SHR_CMD_BUFFER_RELEASE, 2) && pro_is(1, SHR_CMD_BUFFER_REGISTER, 1));
+    ASSERT(pro_is(2, SHR_CMD_BUFFER_REGISTER, 2) && c.buf.id == 2 && md_held(&h.drv) == ctx->resident);
+    ASSERT_EQ_LL(px(h.out.shown, 9, 1), WHITE);
+    destroy_layers(&l, 1);
+    a.res.dead = c.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* Every driver has max_buffers ids; a frame drawing from more buffers fails with SHR_E_LIMIT. */
+TEST test_buffer_eviction_by_ids(void) {
+    limit_ids = 2, limit_flags = SHR_BUFFER_COPIES, limit_bytes = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_limits);
+    fake a, b, c;
+    fake_attach(&a, ctx, &fk_ops), fake_attach(&b, ctx, &fk_ops), fake_attach(&c, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    draw_fakes(l, 2, (fake *[]){&a, &b});
+    frame(ctx);
+    draw_fakes(l, 2, (fake *[]){&b, &c});
+    frame(ctx);
+    ASSERT(rec.npro == 2 && pro_is(0, SHR_CMD_BUFFER_RELEASE, 1) && pro_is(1, SHR_CMD_BUFFER_REGISTER, 1));
+    ASSERT(a.buf.id == 0 && b.buf.id == 2 && c.buf.id == 1);
+    draw_fakes(l, 3, (fake *[]){&a, &b, &c});
+    frame(ctx);
+    shr_event ev;
+    ASSERT(count_events(ctx, SHR_EVENT_PRESENT_FAILED, &ev) == 1 && ev.status == SHR_E_LIMIT);
+    ASSERT(a.buf.id == 0 && b.buf.id == 2 && c.buf.id == 1 && ctx->slots[0].buf == &c.buf);
+    draw_fakes(l, 1, (fake *[]){&a}); /* frees an id while a frame waits: the freed buffer was its victim */
+    h.drv.block_next = 1;
+    frame(ctx);
+    ASSERT(pro_is(0, SHR_CMD_BUFFER_RELEASE, 2) && pro_is(1, SHR_CMD_BUFFER_REGISTER, 2) && rec.npro == 2);
+    destroy_layers(&l, 1);
+    b.res.dead = true;
+    shr_pump(ctx);
+    ASSERT(b.frees == 1 && ctx->nreleased == 1);
+    shr_driver_ready(ctx);
+    shr_pump(ctx);
+    ASSERT(a.buf.id == 2 && ctx->slots[1].buf == &a.buf && ctx->nreleased == 0 && h.out.presents == 3);
+    ASSERT_EQ_LL(ctx->slots[1].releasing, false);
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    draw_fakes(l, 1, (fake *[]){&a});
+    frame(ctx);
+    ASSERT_EQ_LL(rec.npro, 0); /* no stale RELEASE of the id a holds */
+    destroy_layers(&l, 1);
+    a.res.dead = c.res.dead = true;
     harness_close(&h);
     PASS();
 }
@@ -1879,6 +2291,52 @@ static void limited(long *budget, shr_status (*call)(shr_context *), shr_context
     call(ctx);
     *budget = oom.budget;
     oom.budget = -1;
+}
+
+static void tweak_limits_oom(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_oom(d, drv);
+    drv->caps.max_buffers = limit_ids;
+}
+
+/* Every allocation of the buffer plan may fail (also while the plan grows past its earlier size, evicting or
+ * releasing): the frame fails and the registry stays consistent. */
+TEST test_buffer_plan_out_of_memory(void) {
+    static fake fk[25];
+    limit_ids = 20;
+    for (long budget = 0;; budget++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, PRESERVED, tweak_limits_oom);
+        for (int i = 0; i < 25; i++) fake_attach(&fk[i], ctx, &fk_ops);
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+        long left = budget;
+        /* 20 ids taken 4 at a time, 5 more evict as many, then all are freed and released at once */
+        for (int step = 0; step < 8; step++) {
+            shr__lcmd c[5] = {fill((shr_rect){0, 0, 4, 4}, (shr_color)step)};
+            int n = step < 6 ? 4 + (step == 5) : 0;
+            for (int i = 0; i < n; i++) c[i] = glyph(&fk[step * 4 + i], i * 8, 0, WHITE);
+            ASSERT_EQ_LL(shr__lyr_group_set(l, 0, c, n ? (size_t)n : 1), SHR_OK);
+            for (int i = 0; step == 6 && i < 25; i++) fk[i].res.dead = true;
+            limited(&left, shr_submit, ctx);
+            limited(&left, shr_pump, ctx);
+        }
+        uint32_t releasing = 0;
+        uint64_t bytes = 0;
+        for (uint32_t k = 0; k < limit_ids; k++) {
+            const shr__slot *s = &ctx->slots[k];
+            releasing += s->releasing, bytes += s->bytes;
+            ASSERT(!s->buf || s->buf->id == k + 1);
+        }
+        ASSERT(releasing == ctx->nreleased && bytes == ctx->resident);
+        destroy_layers(&l, 1);
+        harness_close(&h);
+        ASSERT_EQ_LL(oom.live, 0);
+        if (left) {
+            ASSERT_EQ_LL(h.drv.releases, 25);
+            break;
+        }
+    }
+    PASS();
 }
 
 /* Every allocation a frame makes may fail: the frame then fails with SHR_E_NO_MEMORY and nothing leaks. */
@@ -2097,7 +2555,8 @@ TEST test_timers_saturate(void) {
 
 /* A composition the driver cannot draw into or read from is refused; the old configuration stays. */
 TEST test_configure_rejects_unreachable_composition(void) {
-    const shr_driver_caps caps[2] = {{SHR_MEMORY_CPU, 0, 1000, 0, 0, 0}, {SHR_MEMORY_CPU, 0, 0, HW - 1, 0, 0}};
+    const shr_driver_caps caps[2] = {{.domains = SHR_MEMORY_CPU, .stride_align = 1000},
+                                     {.domains = SHR_MEMORY_CPU, .max_width = HW - 1}};
     for (int i = 0; i < 2; i++) {
         caps_case = caps[i];
         harness h;
@@ -2495,7 +2954,6 @@ static bool cache_hint_sent(void) {
     return false;
 }
 
-static bool rect_eq(shr_rect a, shr_rect b) { return a.x0 == b.x0 && a.y0 == b.y0 && a.x1 == b.x1 && a.y1 == b.y1; }
 
 static bool fill_sent(shr_color color, int32_t x, int32_t y) {
     for (size_t i = 0; i < rec.n; i++) {
@@ -2670,7 +3128,7 @@ TEST test_resource_resolution(void) {
     fake_attach(&r, ctx, &fk_ops);
     fake_attach(&im, ctx, &fk_ops);
     fake_attach(&off, ctx, &bare_ops);
-    im.px.image = (shr_image){im.cov, 8, 16, 32, sizeof(im.cov), SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU};
+    fake_wrap(&im, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU);
     r.px.offset = (shr_point){-2, -1};
     off.px.offset = (shr_point){100, 0}; /* its pixels miss its cell */
     shr_lyr *l;
@@ -2716,7 +3174,7 @@ TEST test_glyph_styles(void) {
     r.px.synth = im.px.synth = up.px.synth = SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC;
     r.px.slant_axis = up.px.slant_axis = 16; /* rows 0 and 15 shift by 1 + 149/256 and -2 + 107/256: columns -2 to 11 */
     plain.px.slant_axis = 7;
-    im.px.image = (shr_image){im.cov, 8, 16, 32, sizeof(im.cov), SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU};
+    fake_wrap(&im, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU);
     shr_lyr *l;
     ASSERT_EQ_LL(shr_lyr_create(ctx, 0, (shr_rect){4, 4, 60, 40}, &l), SHR_OK);
     const uint32_t bi = SHR__LCMD_BOLD | SHR__LCMD_ITALIC;
@@ -3286,6 +3744,15 @@ int main(int argc, char **argv) {
     RUN_TEST(test_driver_ready_retries);
     RUN_TEST(test_driver_caps_checked);
     RUN_TEST(test_dma_sync);
+    RUN_TEST(test_buffer_wrap);
+    RUN_TEST(test_buffer_alloc);
+    RUN_TEST(test_buffer_ids);
+    RUN_TEST(test_buffer_plan_dropped);
+    RUN_TEST(test_buffer_registered_again);
+    RUN_TEST(test_buffer_eviction_by_bytes);
+    RUN_TEST(test_buffer_eviction_by_ids);
+    RUN_TEST(test_buffer_lost_batch_released);
+    RUN_TEST(test_buffer_plan_out_of_memory);
     RUN_TEST(test_frame_out_of_memory);
     RUN_TEST(test_scattered_damage);
     RUN_TEST(test_damage_out_of_memory_redraws_all);

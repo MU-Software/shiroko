@@ -76,6 +76,8 @@ static void check_layout(const char *utf8, size_t len, int32_t cols, uint32_t fl
 static fuzz_output out;
 static uint8_t shown[sizeof(out.pixels)], before[sizeof(out.pixels)], direct[sizeof(out.pixels)];
 
+static shr_image buffers[64]; /* the stateless path's registrations */
+
 /* `user` is the caching driver; each batch is also drawn by shr_software_execute() into a copy. */
 static shr_status checked_execute(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t count,
                                   shr_fence fence) {
@@ -84,7 +86,10 @@ static shr_status checked_execute(void *user, const shr_surface *dst, const shr_
     memcpy(direct, dst->pixels, dst->byte_length);
     shr_surface copy = *dst;
     copy.pixels = direct;
-    shr_status want = shr_software_execute(&copy, cmds, count);
+    for (size_t i = 0; i < count && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER; i++)
+        if (cmds[i].kind != SHR_CMD_BUFFER_UPDATE && cmds[i].buffer && cmds[i].buffer <= 64)
+            buffers[cmds[i].buffer - 1] = cmds[i].kind == SHR_CMD_BUFFER_REGISTER ? cmds[i].src : (shr_image){0};
+    shr_status want = shr_software_execute(&copy, cmds, count, buffers, 64);
     shr_status st = d->execute(d->user, dst, cmds, count, fence);
     FUZZ_CHECK(st == want);
     if (st == SHR_OK) FUZZ_CHECK(memcmp(direct, dst->pixels, dst->byte_length) == 0);
@@ -112,8 +117,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     uint8_t cfg = fr_u8(&r);
     now = 0;
     memset(&out, 0, sizeof(out));
+    memset(buffers, 0, sizeof(buffers));
     shr_framebuffer_driver drv, checked;
-    FUZZ_CHECK(shr_software_driver_create(NULL, (cfg & 1) ? 1024u << (cfg >> 4) : 0, &drv) == SHR_OK);
+    FUZZ_CHECK(shr_software_driver_create(NULL, (cfg & 1) ? 1024u << (cfg >> 4) : 0, 64, &drv) == SHR_OK);
     checked = drv;
     checked.user = &drv, checked.execute = checked_execute, checked.reset = checked_reset;
     shr_output o;

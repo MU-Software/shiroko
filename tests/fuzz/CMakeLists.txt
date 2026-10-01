@@ -1,9 +1,12 @@
 set(SHIROKO_FUZZ_TARGETS fuzz_tilemap fuzz_package fuzz_driver fuzz_compositor)
 set(SHIROKO_FUZZ_CORPUS ${CMAKE_CURRENT_SOURCE_DIR}/corpus)
 
-# fuzz_package also starts from reduced real packages for this build's cell size; byte 0 picks the role and mode.
+# fuzz_package also starts from reduced real packages for this build's cell size, with page atlases small enough
+# for libFuzzer's input limit; byte 0 picks the role and mode.
 set(_pkgs ${CMAKE_CURRENT_BINARY_DIR}/seed-packages)
 set(_seeds ${CMAKE_CURRENT_BINARY_DIR}/seeds/fuzz_package)
+math(EXPR _atlas_w "8 * ${SHIROKO_CELL_WIDTH}")
+math(EXPR _atlas_h "2 * ${SHIROKO_CELL_HEIGHT}")
 set(_scalars 0020-007E,AC00-AC0F,1100-1112,1161-1175,11A8-11C2,1F600-1F60F,2764,FE0F,1F469,200D,1F4BB,E0B0-E0B3,00E9,0301,2588,6F22,FFFD)
 file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/seed_packages.py @ONLY CONTENT [[
 import pathlib, sys
@@ -17,7 +20,7 @@ for role, name in enumerate(["latin", "cjk-ko", "symbols", "emoji", "nerd"]):
 ]])
 add_custom_command(OUTPUT ${_seeds}/.stamp
   COMMAND ${SHIROKO_FONTPACK} build latin cjk-ko symbols emoji nerd --scalars ${_scalars}
-    --cell ${SHIROKO_CELL_WIDTH}x${SHIROKO_CELL_HEIGHT} --out ${_pkgs}
+    --cell ${SHIROKO_CELL_WIDTH}x${SHIROKO_CELL_HEIGHT} --page-atlas ${_atlas_w}x${_atlas_h} --out ${_pkgs}
   COMMAND ${SHIROKO_PYTHON} ${CMAKE_CURRENT_BINARY_DIR}/seed_packages.py ${_pkgs} ${_seeds}
   DEPENDS ${SHIROKO_FONT_DEPS} ${CMAKE_CURRENT_BINARY_DIR}/seed_packages.py WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
   VERBATIM COMMENT "Baking fuzz_package seeds")

@@ -10,7 +10,7 @@ static inline void shr__slant(int32_t axis, int32_t y, int32_t *k, int32_t *f) {
     *f = t & 255;
 }
 
-/* Source columns [*x0, *x1) a BOLD or ITALIC GLYPH of w x h src pixels draws; w, h and an ITALIC axis within the
+/* Rect columns [*x0, *x1) a BOLD or ITALIC GLYPH with a w x h src_rect draws; w, h and an ITALIC axis within the
  * bounds shr_draw_cmd sets. */
 static inline void shr__glyph_footprint(int32_t w, int32_t h, uint32_t flags, int32_t axis, int32_t *x0,
                                         int32_t *x1) {

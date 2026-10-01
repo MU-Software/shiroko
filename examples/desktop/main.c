@@ -347,7 +347,7 @@ static shr_status open_driver(app *a, int driver, int w, int h) {
     shr_status st = SHR_E_DEVICE;
     if (driver == SOFTWARE) {
         a->ren = SDL_CreateRenderer(a->win, NULL);
-        st = a->ren ? shr_software_driver_create(NULL, 1u << 20, &a->drv) : SHR_E_DEVICE;
+        st = a->ren ? shr_software_driver_create(NULL, 1u << 20, 256, &a->drv) : SHR_E_DEVICE;
         if (st == SHR_OK) {
             int pw, ph, rw, rh;
             SDL_GetWindowSizeInPixels(a->win, &pw, &ph);
@@ -360,7 +360,7 @@ static shr_status open_driver(app *a, int driver, int w, int h) {
 #ifdef SHR_DESKTOP_ANGLE
     else {
         a->gl = SDL_GL_CreateContext(a->win);
-        st = a->gl && SDL_GL_MakeCurrent(a->win, a->gl) ? shr_angle_driver_create(NULL, 64u << 20, &a->drv) : SHR_E_DEVICE;
+        st = a->gl && SDL_GL_MakeCurrent(a->win, a->gl) ? shr_angle_driver_create(NULL, 0, 256, &a->drv) : SHR_E_DEVICE;
         if (st == SHR_OK) {
             const char *r = (const char *)glGetString(GL_RENDERER);
             snprintf(a->label, sizeof(a->label), "angle/%s",

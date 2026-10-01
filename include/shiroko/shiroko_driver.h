@@ -115,7 +115,7 @@ typedef struct shr_surface {
 
 shr_status shr_surface_validate(const shr_surface *surface) SHR_NONBLOCKING;
 
-/* Read-only pixels a command draws from: a glyph (A4/A8), an image (RGBA8888) or a surface (COPY/ROTATE). */
+/* Read-only pixels: the memory of a buffer (A4, A8, RGBA8888) or a COPY/ROTATE source surface. */
 typedef struct shr_image {
     const void *pixels;
     int32_t width;
@@ -129,19 +129,22 @@ typedef struct shr_image {
 shr_status shr_image_validate(const shr_image *image) SHR_NONBLOCKING;
 
 typedef enum shr_cmd_kind {
-    SHR_CMD_FILL = 1,     /* dst <- color */
-    SHR_CMD_GLYPH,        /* dst <- color through A4/A8 coverage of src */
-    SHR_CMD_IMAGE,        /* dst <- RGBA8888 src, source-over */
-    SHR_CMD_COPY,         /* dst <- src surface, format converted */
-    SHR_CMD_ROTATE,       /* dst <- rotated src surface */
-    SHR_CMD_CACHE_BEGIN,  /* hint: commands up to CACHE_END draw exactly `dst`, identified by `key` */
-    SHR_CMD_CACHE_END
+    SHR_CMD_FILL = 1,        /* dst <- color */
+    SHR_CMD_GLYPH,           /* dst <- color through the A4/A8 coverage of `src_rect` of `buffer` */
+    SHR_CMD_IMAGE,           /* dst <- RGBA8888 `src_rect` of `buffer`, source-over */
+    SHR_CMD_COPY,            /* dst <- src surface, format converted */
+    SHR_CMD_ROTATE,          /* dst <- rotated src surface */
+    SHR_CMD_CACHE_BEGIN,     /* hint: commands up to CACHE_END draw exactly `dst`, identified by `key` */
+    SHR_CMD_CACHE_END,
+    SHR_CMD_BUFFER_REGISTER, /* id `buffer` names memory `src` from now on, replacing what it named */
+    SHR_CMD_BUFFER_UPDATE,   /* the pixels of `buffer` inside `src_rect` changed */
+    SHR_CMD_BUFFER_RELEASE   /* id `buffer` names nothing; no effect when it named nothing */
 } shr_cmd_kind;
 
 /* DIM: GLYPH coverage, or a FILL, at half strength. BOLD, ITALIC: GLYPH style synthesized from the coverage. */
 enum { SHR_GLYPH_DIM = 1u << 0, SHR_GLYPH_BOLD = 1u << 1, SHR_GLYPH_ITALIC = 1u << 2 };
 #define SHR_GLYPH_SLANT 54       /* italic slope in 1/256 (about 12 degrees) */
-#define SHR_GLYPH_SYNTH_MAX 1024 /* largest src width or height of a BOLD or ITALIC GLYPH */
+#define SHR_GLYPH_SYNTH_MAX 1024 /* largest src_rect width or height of a BOLD or ITALIC GLYPH */
 
 typedef enum shr_rotation {
     SHR_ROTATE_NONE = 0,
@@ -163,30 +166,46 @@ shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t 
  * reads no destination pixels and holds no ROTATE.
  * ROTATE: `src` is the whole logical surface and `dst` a rect of the output whose size is `src` rotated;
  * `src_origin` is unused.
- * GLYPH coverage of src pixel (x, y), exactly: in(x, y) is the coverage widened to 8 bits (A4 n -> 17n), 0 outside
- * `src` (W x H). BOLD: b(x) = in(x + 1) > in(x) ? in(x) : max(in(x), in(x - 1)), else b = in. ITALIC, with
- * t = SHR_GLYPH_SLANT / 2 * (slant_axis - 2y - 1) + 2^23, k = (t >> 8) - 2^15, f = t & 255:
- * c(x) = (b(x - k) * (256 - f) + b(x - k - 1) * f + 128) >> 8, else c = b. DIM: (c + 1) >> 1. `dst` pixel (x, y)
- * takes the coverage of src (src_origin.x + x - dst.x0, src_origin.y + y - dst.y0). A BOLD or ITALIC GLYPH may
- * name source columns outside `src` within its footprint [x0, x1): x0 = ITALIC ? k(H - 1) : 0,
- * x1 = W + BOLD + (ITALIC ? k(0) + (f(0) != 0) : 0); its rows stay inside `src`.
+ * Buffers: GLYPH and IMAGE draw from buffers, memory the driver knows by an id in 1..caps.max_buffers. An id keeps
+ * its memory across batches, from BUFFER_REGISTER until RELEASE or the next REGISTER of the id. Buffer commands come
+ * only at the start of a batch, before any other command, and take effect in order before its draws. Pixels
+ * written after a REGISTER reach the driver only through an UPDATE covering them (or a new REGISTER) at the start
+ * of the batch that next draws from them. A driver accesses buffer memory only while it executes a batch naming
+ * the buffer in a draw, REGISTER or UPDATE; with SHR_BUFFER_COPIES it reads the memory only for REGISTER and
+ * UPDATE and draws from its own copy. Buffer memory never overlaps a destination.
+ * GLYPH, IMAGE: `src_rect` (W x H) is a rect of the registered buffer `buffer` and `src_origin` is relative to its
+ * top-left: `dst` pixel (x, y) takes rect pixel (src_origin.x + x - dst.x0, src_origin.y + y - dst.y0). For A4,
+ * src_rect.x0 is even.
+ * GLYPH coverage of rect pixel (x, y), exactly: in(x, y) is the coverage of buffer pixel
+ * (src_rect.x0 + x, src_rect.y0 + y) widened to 8 bits (A4 n -> 17n) for 0 <= x < W and 0 <= y < H, and 0
+ * elsewhere, also where the buffer has pixels. BOLD: b(x) = in(x + 1) > in(x) ? in(x) : max(in(x), in(x - 1)),
+ * else b = in. ITALIC, with t = SHR_GLYPH_SLANT / 2 * (slant_axis - 2y - 1) + 2^23, k = (t >> 8) - 2^15,
+ * f = t & 255: c(x) = (b(x - k) * (256 - f) + b(x - k - 1) * f + 128) >> 8, else c = b. DIM: (c + 1) >> 1.
+ * A BOLD or ITALIC GLYPH may take rect columns outside the rect, and outside the buffer, within its footprint
+ * [x0, x1): x0 = ITALIC ? k(H - 1) : 0, x1 = W + BOLD + (ITALIC ? k(0) + (f(0) != 0) : 0); its rows stay inside
+ * the rect.
  * A batch is checked before anything is drawn. SHR_E_INVALID_ARG: a rect outside the destination or its group,
- * a nested or unbalanced group, a group command reading the destination, ROTATE in a group, a source rect
- * outside `src` (or a styled GLYPH's footprint), a BOLD or ITALIC GLYPH with `src` larger than
- * SHR_GLYPH_SYNTH_MAX, an ITALIC GLYPH with |slant_axis| > 4 * SHR_GLYPH_SYNTH_MAX, a bad rotation or ROTATE
- * size. SHR_E_UNSUPPORTED: a source format the kind does not take, a COPY whose source overlaps `dst` with
- * another format or stride, a ROTATE whose source overlaps `dst`. */
+ * a nested or unbalanced group, a COPY in a group reading the destination, ROTATE in a group, a buffer command
+ * after another command, REGISTER of id 0, of an id above caps.max_buffers or of invalid memory, UPDATE or a draw
+ * naming an id that is not registered, an UPDATE or draw `src_rect` outside its buffer, an A4 draw `src_rect` with
+ * odd x0, a draw reading outside its `src_rect` (a styled GLYPH outside its footprint) or a COPY outside `src`, a
+ * BOLD or ITALIC GLYPH with a `src_rect` larger than SHR_GLYPH_SYNTH_MAX, an ITALIC GLYPH with |slant_axis| >
+ * 4 * SHR_GLYPH_SYNTH_MAX, a bad rotation or ROTATE size. SHR_E_UNSUPPORTED: REGISTER of a format other than A4,
+ * A8 and RGBA8888 or of memory outside the caps, a buffer or source format the kind does not take, a COPY whose
+ * source overlaps `dst` with another format or stride, a ROTATE whose source overlaps `dst`. */
 typedef struct shr_draw_cmd {
     shr_cmd_kind kind;
     uint32_t flags;
     shr_rect dst;
     shr_color color;          /* FILL, GLYPH */
-    shr_image src;            /* GLYPH, IMAGE, COPY, ROTATE */
-    shr_point src_origin;     /* src pixel drawn at dst.x0, dst.y0 */
+    uint32_t buffer;          /* GLYPH, IMAGE, BUFFER_*: buffer id */
+    shr_rect src_rect;        /* GLYPH, IMAGE: buffer region drawn from; UPDATE: region changed */
+    shr_image src;            /* COPY, ROTATE: source surface; REGISTER: the buffer's memory */
+    shr_point src_origin;     /* GLYPH, IMAGE: rect pixel drawn at dst.x0, dst.y0; COPY: src pixel */
     shr_rotation rotation;    /* ROTATE */
     uint64_t key[2];          /* CACHE_BEGIN: 128-bit content hash */
     shr_rect cache_clip;      /* CACHE_BEGIN: part of dst drawn this time */
-    int32_t slant_axis;       /* ITALIC GLYPH: twice the src y the shear turns about */
+    int32_t slant_axis;       /* ITALIC GLYPH: twice the rect y the shear turns about */
 } shr_draw_cmd;
 
 typedef enum shr_fence_state {
@@ -199,31 +218,41 @@ typedef enum shr_fence_state {
 /* Assigned by the renderer: slot and generation of one submission. */
 typedef uint64_t shr_fence;
 
-/* Destinations and sources outside these limits make the submission fail with SHR_E_UNSUPPORTED:
+enum { SHR_BUFFER_COPIES = 1u << 0 }; /* buffer_flags: the driver draws from its own copies of buffers */
+
+/* Destinations, sources and buffers outside these limits make the submission fail with SHR_E_UNSUPPORTED:
  * a driver implements every command kind (a device driver may run some on the software port). */
 typedef struct shr_driver_caps {
-    uint32_t domains;         /* shr_memory_domain bits of destinations and sources */
-    uint32_t address_align;   /* bytes, 0 = any; buffer start of destinations and sources */
+    uint32_t domains;          /* shr_memory_domain bits of destinations, sources and buffers */
+    uint32_t address_align;    /* bytes, 0 = any; start of destinations, sources and buffers */
     uint32_t stride_align;
-    int32_t max_width;        /* destination, 0 = unlimited */
+    int32_t max_width;         /* destination, 0 = unlimited */
     int32_t max_height;
-    uint64_t timeout_ns;      /* watchdog per submission, 0 = none; needs a clock */
+    uint64_t timeout_ns;       /* watchdog per submission, 0 = none; needs a clock */
+    uint32_t max_buffers;      /* buffer ids are 1..max_buffers */
+    int32_t max_buffer_width;  /* 0 = unlimited */
+    int32_t max_buffer_height;
+    uint64_t buffer_bytes;     /* SHR_BUFFER_COPIES: byte_length sum of registered buffers, 0 = unlimited */
+    uint32_t buffer_flags;
 } shr_driver_caps;
 
 /* execute(): SHR_OK = finished before returning; SHR_IN_PROGRESS = the device
  * accesses the buffers until the fence resolves (shr_fence_signal);
  * SHR_E_WOULD_BLOCK = nothing accepted, retried io_retry_ns later or after shr_driver_ready(), or
  * replaced at once by a newer submission;
- * other errors = nothing executed. After SHR_IN_PROGRESS, `dst`, `cmds` and every buffer they refer to
- * stay valid and unchanged until the fence resolves (or reset() returned SHR_OK), so a driver thread may
- * read them in place without copying; after SHR_OK or an error they may change at once.
+ * other errors = nothing drawn. After such an error or a timeout, which buffer ids are registered is unspecified
+ * (buffer commands of the batch may have taken effect): the compositor registers buffers again before drawing
+ * from them. After SHR_IN_PROGRESS, `dst`, `cmds`, the COPY and ROTATE sources and the memory of every buffer the
+ * batch names (with SHR_BUFFER_COPIES: in a REGISTER or UPDATE) stay valid and unchanged until the fence resolves
+ * (or reset() returned SHR_OK), so a driver thread may read them in place without copying; after SHR_OK or an
+ * error they may change at once.
  * A fence resolves only after the device stopped accessing every buffer.
  * cancel() only requests cancellation. reset() stops the device and returns
  * SHR_OK once no submission can access memory any more.
- * sync() (optional) runs before execute() for each SHR_MEMORY_DMA buffer of it
- * (destination and sources): the CPU may have written them last, the device
- * reads or writes them next. The driver makes what it writes coherent for the CPU and
- * the display itself before the submission completes. */
+ * sync() (optional) runs before execute() for the SHR_MEMORY_DMA memory the batch hands the device: the whole
+ * destination, each whole COPY or ROTATE source, the whole memory of each REGISTER and, for each UPDATE, the rows
+ * src_rect.y0 .. y1 - 1 of its buffer. The CPU may have written them last, the device reads or writes them next.
+ * The driver makes what it writes coherent for the CPU and the display itself before the submission completes. */
 typedef struct shr_framebuffer_driver {
     void *user;
     shr_driver_caps caps;

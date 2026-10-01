@@ -22,6 +22,153 @@ static void frame_reset(shr_context *ctx) {
     f->target_rec = -1;
 }
 
+/* ===== Buffer plan: built with the frame, taken by the registry once the driver accepted it ===== */
+
+/* Ids with `releasing` set were stamped by plan_begin(). */
+static bool slot_free(const shr__slot *s, uint64_t frame) { return s->stamp == frame ? !s->taken : !s->buf; }
+
+static shr_status prologue_push(shr_context *ctx, shr__frame *f, shr_draw_cmd c) {
+    shr_draw_cmd *p = shr__vec_push(&f->prologue, &ctx->al);
+    if (!p) return SHR_E_NO_MEMORY;
+    *p = c;
+    return SHR_OK;
+}
+
+static void lru_touch(shr_context *ctx, shr__buf *b) {
+    shr__lru_remove(&ctx->lru, &b->lru);
+    shr__lru_push(&ctx->lru, &b->lru);
+}
+
+/* Pending RELEASEs open the plan, so their ids are free for it. */
+static shr_status plan_begin(shr_context *ctx, shr__frame *f) {
+    shr_status st = SHR_OK;
+    f->resident = ctx->resident;
+    for (uint32_t i = 0; st == SHR_OK && i < ctx->nreleased; i++) {
+        shr__slot *s = &ctx->slots[ctx->released[i] - 1];
+        s->stamp = f->frame_id, s->taken = false;
+        f->resident -= s->bytes;
+        st = prologue_push(ctx, f, (shr_draw_cmd){.kind = SHR_CMD_BUFFER_RELEASE, .buffer = ctx->released[i]});
+    }
+    return st;
+}
+
+/* A free id for `b`, evicting registered buffers the frame does not draw from, least recently used first.
+ * Touched buffers move to the front of the LRU, so the oldest one is untouched unless none is. */
+static shr_status plan_take(shr_context *ctx, shr__frame *f, shr__buf *b) {
+    const shr_driver_caps *k = &ctx->driver.caps;
+    uint64_t budget = (k->buffer_flags & SHR_BUFFER_COPIES) && k->buffer_bytes ? k->buffer_bytes : UINT64_MAX;
+    uint32_t id = 0;
+    for (uint32_t i = 0; i < k->max_buffers && !id; i++)
+        if (slot_free(&ctx->slots[i], f->frame_id)) id = i + 1;
+    while (!id || f->resident + b->mem.byte_length > budget) {
+        shr__lru_node *n = shr__lru_oldest(ctx->lru);
+        shr__buf *v = n ? SHR_CONTAINER(n, shr__buf, lru) : NULL;
+        shr__slot *s = v ? &ctx->slots[v->id - 1] : NULL;
+        if (!s || s->stamp == f->frame_id) return SHR_E_LIMIT;
+        shr_status st = prologue_push(ctx, f, (shr_draw_cmd){.kind = SHR_CMD_BUFFER_RELEASE, .buffer = v->id});
+        if (st != SHR_OK) return st;
+        s->stamp = f->frame_id, s->taken = false;
+        f->resident -= s->bytes;
+        lru_touch(ctx, v);
+        if (!id) id = v->id;
+    }
+    ctx->slots[id - 1].stamp = f->frame_id, ctx->slots[id - 1].taken = true;
+    f->resident += b->mem.byte_length;
+    b->id = id;
+    return prologue_push(ctx, f, (shr_draw_cmd){.kind = SHR_CMD_BUFFER_REGISTER, .buffer = id, .src = b->mem});
+}
+
+/* From the first use in a frame on, b->id is the buffer's id in the frame's plan. */
+static shr_status frame_use(shr_context *ctx, shr__frame *f, shr__buf *b) {
+    if (b->used == f->frame_id) return SHR_OK;
+    shr__planned *p = shr__vec_push(&f->planned, &ctx->al);
+    if (!p) return SHR_E_NO_MEMORY;
+    *p = (shr__planned){b, b->id};
+    b->used = f->frame_id;
+    shr__slot *s = b->id ? &ctx->slots[b->id - 1] : NULL;
+    if (!s || s->stamp == f->frame_id) return plan_take(ctx, f, b); /* new, or evicted earlier in this plan */
+    s->stamp = f->frame_id, s->taken = true;
+    lru_touch(ctx, b);
+    if (!s->known)
+        return prologue_push(ctx, f, (shr_draw_cmd){.kind = SHR_CMD_BUFFER_REGISTER, .buffer = b->id, .src = b->mem});
+    if (shr__rect_empty(b->dirty)) return SHR_OK;
+    return prologue_push(ctx, f, (shr_draw_cmd){.kind = SHR_CMD_BUFFER_UPDATE, .buffer = b->id, .src_rect = b->dirty});
+}
+
+static shr_status plan_place(shr_context *ctx, shr__frame *f) {
+    size_t n = f->prologue.len;
+    if (!n) return SHR_OK;
+    if (!shr__vec_reserve(&f->cmds, &ctx->al, n)) return SHR_E_NO_MEMORY;
+    shr_draw_cmd *c = f->cmds.data;
+    memmove(c + n, c, f->cmds.len * sizeof(*c));
+    memcpy(c, f->prologue.data, n * sizeof(*c));
+    f->cmds.len += n;
+    return SHR_OK;
+}
+
+/* Releases first: a buffer may take an id the plan released. */
+static void plan_commit(shr_context *ctx, shr__frame *f) {
+    for (size_t i = 0; i < f->prologue.len; i++) {
+        const shr_draw_cmd *c = SHR_VEC_AT(&f->prologue, shr_draw_cmd, i);
+        if (c->kind != SHR_CMD_BUFFER_RELEASE) continue;
+        shr__slot *s = &ctx->slots[c->buffer - 1];
+        if (s->buf && s->buf->used != f->frame_id) { /* not freed meanwhile, nor drawn after its eviction */
+            s->buf->id = 0;
+            shr__lru_remove(&ctx->lru, &s->buf->lru);
+        }
+        ctx->resident -= s->bytes;
+        *s = (shr__slot){0};
+    }
+    for (size_t i = 0; i < f->planned.len; i++) {
+        shr__buf *b = SHR_VEC_AT(&f->planned, shr__planned, i)->buf;
+        shr__slot *s = &ctx->slots[b->id - 1];
+        ctx->resident += b->mem.byte_length - s->bytes;
+        s->buf = b, s->bytes = b->mem.byte_length, s->known = true;
+        b->dirty = (shr_rect){0, 0, 0, 0};
+        if (!b->lru.prev) shr__lru_push(&ctx->lru, &b->lru);
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ctx->nreleased; i++)
+        if (ctx->slots[ctx->released[i] - 1].releasing) ctx->released[n++] = ctx->released[i];
+    ctx->nreleased = n;
+    f->planned.len = 0; /* the prologue stays until the raster ends, for batch_lost() */
+}
+
+/* Before frame_end: the planned buffers are pinned until then. */
+static void plan_restore(shr__frame *f) {
+    for (size_t i = 0; i < f->planned.len; i++) {
+        const shr__planned *p = SHR_VEC_AT(&f->planned, shr__planned, i);
+        p->buf->id = p->old_id;
+    }
+    f->planned.len = 0;
+}
+
+static void plan_drop(shr__frame *f) {
+    plan_restore(f);
+    f->prologue.len = 0;
+}
+
+/* The raster batch failed or timed out: which ids the driver holds is unspecified. Every buffer registers again
+ * before it is drawn, and each id the batch registered or released is given up and released first in the next
+ * prologue, so a driver keeping copies drops what it may still hold there. */
+static void batch_lost(shr_context *ctx, shr__frame *f) {
+    plan_restore(f);
+    for (uint32_t i = 0; i < ctx->driver.caps.max_buffers; i++) ctx->slots[i].known = false;
+    for (size_t i = 0; i < f->prologue.len; i++) {
+        const shr_draw_cmd *c = SHR_VEC_AT(&f->prologue, shr_draw_cmd, i);
+        shr__slot *s = &ctx->slots[c->buffer - 1];
+        if (c->kind == SHR_CMD_BUFFER_UPDATE || s->releasing) continue;
+        if (s->buf) {
+            s->buf->id = 0;
+            shr__lru_remove(&ctx->lru, &s->buf->lru);
+            s->buf = NULL;
+        }
+        s->releasing = true;
+        ctx->released[ctx->nreleased++] = c->buffer;
+    }
+    f->prologue.len = 0;
+}
+
 /* The raster writes only inside the damage, so returning it restores what the target shows. */
 static void frame_drop(shr_context *ctx) {
     shr__frame *f = &ctx->frame;
@@ -30,6 +177,7 @@ static void frame_drop(shr_context *ctx) {
         for (size_t i = 0; t->used && i < f->damage.len; i++)
             shr__damage_add(ctx, &t->damage, *SHR_VEC_AT(&f->damage, shr_rect, i));
     }
+    plan_drop(f);
     resolved_end(&f->resolved, f->frame_id);
     if (f->has_output) discard(ctx, &f->output);
     ctx->stale = true;
@@ -145,20 +293,22 @@ static shr_status emit_resolved(shr_context *ctx, shr__frame *f, const shr_lyr *
     if (slot) *slot = lc->res;
     bool glyph = lc->kind == SHR__LCMD_GLYPH;
     uint32_t syn = glyph ? lc->flags & r.synth & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC) : 0;
-    int32_t x0 = 0, x1 = r.image.width;
-    if (syn) shr__glyph_footprint(r.image.width, r.image.height, syn, r.slant_axis, &x0, &x1);
+    int32_t w = r.rect.x1 - r.rect.x0, h = r.rect.y1 - r.rect.y0, x0 = 0, x1 = w;
+    if (syn) shr__glyph_footprint(w, h, syn, r.slant_axis, &x0, &x1);
     int64_t x = (int64_t)l->rect.x0 + lc->anchor.x + r.offset.x, y = (int64_t)l->rect.y0 + lc->anchor.y + r.offset.y;
-    shr_rect full = {shr__clamp32(x + x0), shr__clamp32(y), shr__clamp32(x + x1), shr__clamp32(y + r.image.height)};
+    shr_rect full = {shr__clamp32(x + x0), shr__clamp32(y), shr__clamp32(x + x1), shr__clamp32(y + h)};
     shr_rect d = shr__rect_intersect(full, clip);
     if (shr__rect_empty(d)) return SHR_OK;
     *provisional = r.provisional;
+    if ((st = frame_use(ctx, f, r.buf)) != SHR_OK) return st;
     shr_draw_cmd *c = push_cmd(ctx, f, &st);
     if (!c) return st;
     *c = (shr_draw_cmd){.kind = glyph ? SHR_CMD_GLYPH : SHR_CMD_IMAGE,
                         .flags = glyph ? (lc->flags & SHR_GLYPH_DIM) | syn : 0,
                         .dst = d,
                         .color = lc->color,
-                        .src = r.image,
+                        .buffer = r.buf->id,
+                        .src_rect = r.rect,
                         .src_origin = {(int32_t)(d.x0 - x), (int32_t)(d.y0 - y)},
                         .slant_axis = syn & SHR_GLYPH_ITALIC ? r.slant_axis : 0};
     return SHR_OK;
@@ -255,39 +405,40 @@ static shr_status emit_rect(shr_context *ctx, shr__frame *f, shr_rect rect) {
     return SHR_OK;
 }
 
-static bool reachable(const shr_driver_caps *k, shr_memory_domain dom, const void *px, size_t stride) {
+bool shr__mem_reaches(const shr_driver_caps *k, shr_memory_domain dom, const void *px, size_t stride) {
     uint32_t domains = k->domains ? k->domains : SHR_MEMORY_CPU;
     return (domains & (dom ? dom : SHR_MEMORY_CPU)) && !(k->address_align && (uintptr_t)px % k->address_align) &&
            !(k->stride_align && stride % k->stride_align);
 }
 
 bool shr__driver_reaches(const shr_driver_caps *k, const shr_surface *s) {
-    return reachable(k, s->domain, s->pixels, s->stride) && !(k->max_width && s->width > k->max_width) &&
+    return shr__mem_reaches(k, s->domain, s->pixels, s->stride) && !(k->max_width && s->width > k->max_width) &&
            !(k->max_height && s->height > k->max_height);
 }
 
-static bool driver_accepts(const shr_context *ctx, const shr_surface *dst, const shr_draw_cmd *c, size_t n) {
-    const shr_driver_caps *k = &ctx->driver.caps;
-    if (!shr__driver_reaches(k, dst)) return false;
-    for (size_t i = 0; i < n; i++)
-        if (c[i].kind >= SHR_CMD_GLYPH && c[i].kind <= SHR_CMD_ROTATE &&
-            !reachable(k, c[i].src.domain, c[i].src.pixels, c[i].src.stride))
-            return false;
-    return true;
-}
-
-/* Whole buffers: the destination and every DMA source. */
+/* The DMA memory the batch hands the device: the destination, COPY and ROTATE sources and registered buffers
+ * whole, the rows of each UPDATE (only committed buffers get one, so their slot names them). */
 static void sync_buffers(shr_context *ctx, const shr_surface *dst, const shr_draw_cmd *c, size_t n) {
     if (!ctx->driver.sync) return;
     if (dst->domain == SHR_MEMORY_DMA)
         SHR_HOST(ctx, ctx->driver.sync(ctx->driver.user, dst->pixels, dst->byte_length));
-    const void *last = NULL;
     for (size_t i = 0; i < n; i++) {
-        const shr_image *s = &c[i].src;
-        if (c[i].kind < SHR_CMD_GLYPH || c[i].kind > SHR_CMD_ROTATE || s->domain != SHR_MEMORY_DMA || s->pixels == last)
-            continue;
-        last = s->pixels;
-        SHR_HOST(ctx, ctx->driver.sync(ctx->driver.user, s->pixels, s->byte_length));
+        const shr_image *m = &c[i].src;
+        size_t off = 0, len = m->byte_length, row;
+        switch (c[i].kind) {
+        case SHR_CMD_BUFFER_UPDATE:
+            m = &ctx->slots[c[i].buffer - 1].buf->mem;
+            shr_format_row_bytes(m->format, m->width, &row);
+            off = (size_t)c[i].src_rect.y0 * m->stride;
+            len = (size_t)(c[i].src_rect.y1 - c[i].src_rect.y0 - 1) * m->stride + row;
+            break;
+        case SHR_CMD_COPY:
+        case SHR_CMD_ROTATE:
+        case SHR_CMD_BUFFER_REGISTER: break;
+        default: continue;
+        }
+        if (m->domain == SHR_MEMORY_DMA)
+            SHR_HOST(ctx, ctx->driver.sync(ctx->driver.user, (const uint8_t *)m->pixels + off, len));
     }
 }
 
@@ -321,23 +472,23 @@ static int run(shr_context *ctx, shr__frame *f, shr_status *st) {
     if (f->running) {
         shr_fence_state fs = fence_state(ctx);
         uint64_t now = shr__ctx_now(ctx);
-        if (fs == SHR_FENCE_PENDING) {
-            if (!ctx->driver.caps.timeout_ns || now < f->deadline) return 0;
-            f->running = false;
-            *st = handle_timeout(ctx, f);
-            return -1;
-        }
+        if (fs == SHR_FENCE_PENDING && (!ctx->driver.caps.timeout_ns || now < f->deadline)) return 0;
         f->running = false;
-        shr__ctx_trace(ctx, SHR_TRACE_FENCE_WAIT, f->frame_id, now - f->started, 0);
-        if (fs == SHR_FENCE_SUCCEEDED) return 1;
-        *st = SHR_E_DEVICE;
+        if (fs == SHR_FENCE_PENDING) {
+            *st = handle_timeout(ctx, f);
+        } else {
+            shr__ctx_trace(ctx, SHR_TRACE_FENCE_WAIT, f->frame_id, now - f->started, 0);
+            if (fs == SHR_FENCE_SUCCEEDED) return 1;
+            *st = SHR_E_DEVICE;
+        }
+        batch_lost(ctx, f);
         return -1;
     }
     if (f->refused && !refusal_over(ctx, f)) return 0;
     const shr_draw_cmd *cmds = f->built ? &f->convert : f->cmds.data; /* the conversion, or the raster */
     size_t n = f->built ? 1 : f->cmds.len;
     if (!n) return 1;
-    if (!driver_accepts(ctx, &f->target, cmds, n)) return *st = SHR_E_UNSUPPORTED, -1;
+    if (!shr__driver_reaches(&ctx->driver.caps, &f->target)) return *st = SHR_E_UNSUPPORTED, -1;
     sync_buffers(ctx, &f->target, cmds, n);
     f->ready_seen = atomic_load(&ctx->driver_ready); /* before execute(): a ready signal during it counts */
     f->fence = ++ctx->fence_gen;
@@ -350,8 +501,9 @@ static int run(shr_context *ctx, shr__frame *f, shr_status *st) {
         return 0;
     }
     f->refused = false;
+    if (*st != SHR_OK && *st != SHR_IN_PROGRESS) return batch_lost(ctx, f), -1;
+    plan_commit(ctx, f);
     if (*st == SHR_OK) return 1;
-    if (*st != SHR_IN_PROGRESS) return -1;
     f->running = true;
     f->started = shr__ctx_now(ctx);
     f->deadline = shr__sat_add(f->started, ctx->driver.caps.timeout_ns);
@@ -415,16 +567,20 @@ static void start_frame(shr_context *ctx) {
         frame_reset(ctx);
         return;
     }
-    for (size_t i = 0; i < f->damage.len; i++)
-        if ((st = emit_rect(ctx, f, *SHR_VEC_AT(&f->damage, shr_rect, i))) != SHR_OK) {
-            frame_fail(ctx, st);
-            return;
-        }
+    st = plan_begin(ctx, f);
+    for (size_t i = 0; st == SHR_OK && i < f->damage.len; i++)
+        st = emit_rect(ctx, f, *SHR_VEC_AT(&f->damage, shr_rect, i));
+    if (st == SHR_OK) st = plan_place(ctx, f);
+    if (st != SHR_OK) {
+        frame_fail(ctx, st);
+        return;
+    }
     shr__ctx_trace(ctx, SHR_TRACE_RASTER_BEGIN, f->frame_id, f->cmds.len, (uint64_t)f->damaged_pixels);
 }
 
 static void raster_complete(shr_context *ctx, shr__frame *f) {
     shr__ctx_trace(ctx, SHR_TRACE_RASTER_END, f->frame_id, 0, 0);
+    f->prologue.len = 0;
     resolved_end(&f->resolved, f->frame_id);
     f->took_damage = false;
     shr__target *t = f->target_rec >= 0 && ctx->targets[f->target_rec].used ? &ctx->targets[f->target_rec] : NULL;

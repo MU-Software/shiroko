@@ -42,10 +42,29 @@ typedef struct shr__frame {
     shr_surface output, target;
     int target_rec; /* index in targets, -1 = not preserved */
     shr__vec cmds, damage, provisional, resolved; /* shr_draw_cmd, shr_rect, shr_rect, shr__res * */
+    /* The buffer plan: commands put ahead of `cmds`, and the buffers drawn from with their ids before it. The
+     * registry takes the plan once the driver accepted the raster. */
+    shr__vec prologue, planned; /* shr_draw_cmd, shr__planned */
+    uint64_t resident;          /* driver-held bytes once the prologue ran */
     shr_draw_cmd convert; /* the ROTATE or COPY into the output once `built` */
     uint64_t fence, deadline, started;
     int64_t damaged_pixels;
 } shr__frame;
+
+typedef struct shr__planned {
+    shr__buf *buf;
+    uint32_t old_id;
+} shr__planned;
+
+/* Buffer id k is slots[k - 1]. A plan marks an id with `stamp` = its frame: `taken` by a buffer or freed. */
+typedef struct shr__slot {
+    shr__buf *buf;   /* registered under the id */
+    uint64_t bytes;  /* what the driver holds under the id */
+    uint64_t stamp;
+    bool taken;
+    bool known;      /* the driver holds `buf`: false once a batch failed or timed out */
+    bool releasing;  /* `buf` was freed: a RELEASE is due */
+} shr__slot;
 
 typedef struct shr__io {
     _Atomic uint64_t state; /* generation << 8 | shr_status << 2 | IO_* */
@@ -124,6 +143,12 @@ struct shr_context {
     uint64_t next_frame_id;
     shr__frame frame;
 
+    shr__slot *slots;     /* caps.max_buffers */
+    uint32_t *released;   /* ids with `releasing` set, at most once each */
+    uint32_t nreleased;
+    uint64_t resident;    /* sum of slot bytes */
+    shr__lru_node *lru;   /* registered buffers */
+
     _Atomic uint64_t fence_state; /* fence << 2 | shr_fence_state; 0 = nothing pending */
     _Atomic uint32_t driver_ready, asset_ready; /* bumped by shr_driver_ready() and shr_asset_ready() */
     uint64_t fence_gen;
@@ -165,5 +190,7 @@ void shr__blink_damage(shr_context *ctx);
 void shr__frame_abandon(shr_context *ctx);
 /* The driver can draw into and read from `s` (domain, alignment, size). */
 bool shr__driver_reaches(const shr_driver_caps *caps, const shr_surface *s);
+/* The driver reaches memory in `domain` at `pixels` with `stride` (sizes aside). */
+bool shr__mem_reaches(const shr_driver_caps *caps, shr_memory_domain domain, const void *pixels, size_t stride);
 
 #endif

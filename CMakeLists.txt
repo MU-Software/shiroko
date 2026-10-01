@@ -186,7 +186,8 @@ if(SHIROKO_PORT_ANGLE)
   add_library(shiroko::shiroko_angle ALIAS shiroko_angle)
   target_include_directories(shiroko_angle PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/ports/angle/include>
     PRIVATE ports/angle ports/software cores/shared)
-  target_include_directories(shiroko_angle SYSTEM PRIVATE ${UTHASH_INCLUDE_DIR})
+  find_path(ANGLE_INCLUDE_DIR EGL/egl.h REQUIRED)
+  target_include_directories(shiroko_angle SYSTEM PUBLIC ${ANGLE_INCLUDE_DIR})
   target_link_libraries(shiroko_angle PUBLIC shiroko unofficial::angle::libEGL unofficial::angle::libGLESv2)
   target_compile_options(shiroko_angle PRIVATE ${SHIROKO_WARNINGS})
   # Not exported: shirokoConfig.cmake does not find ANGLE for its consumers.

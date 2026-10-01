@@ -97,7 +97,7 @@ typedef struct shr_context_desc {
     uint32_t max_commands;        /* per frame; beyond it the frame fails with SHR_E_LIMIT */
     uint32_t max_reads;           /* outstanding asset reads, at most 65535 */
     uint64_t page_cache_bytes;    /* font pages */
-    uint64_t image_bytes;         /* image resource copies; SHR_E_LIMIT beyond */
+    uint64_t image_bytes;         /* image buffers (padded rows, second buffers while updated); SHR_E_LIMIT beyond */
     /* Failed opens and reads of a package (until it is ready) or page before it cools down, and cool-downs in
      * a row after which only shr_asset_ready() retries it; clamped to 65535. */
     uint32_t io_retry_limit;
@@ -236,12 +236,13 @@ shr_status shr_lyr_cmd_image(shr_lyr *layer, shr_pl_res_image *image, shr_rect s
 shr_status shr_lyr_cmd_commit(shr_lyr *layer);
 
 /* ===== Image resource =====
- * Pixels are copied into the resource (RGBA8888, straight alpha) within desc.image_bytes. */
+ * Pixels are copied into a buffer the driver draws from (RGBA8888, straight alpha) within desc.image_bytes;
+ * SHR_E_UNSUPPORTED beyond the driver's buffer limits. */
 
 shr_status shr_pl_res_image_create(shr_context *ctx, int32_t width, int32_t height, const void *rgba,
                                    size_t stride, shr_pl_res_image **out);
-/* SHR_E_WOULD_BLOCK while a frame reads the image; pump and retry. While consecutive frames keep reading
- * it (e.g. a new frame is submitted before the previous one ended) this may repeat. */
+/* While a frame reads the image, the update goes to a second buffer that later frames draw from;
+ * SHR_E_LIMIT when desc.image_bytes has no room for it. */
 shr_status shr_pl_res_image_update(shr_pl_res_image *image, shr_rect rect, const void *rgba, size_t stride);
 /* Freed once no layer command refers to it and no frame reads it. */
 shr_status shr_pl_res_image_release(shr_pl_res_image *image);

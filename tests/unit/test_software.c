@@ -95,10 +95,46 @@ static shr_draw_cmd fill(shr_rect r, shr_color color) {
     return c;
 }
 
+/* The stateless path's buffer table: GLYPH and IMAGE sources go into the next slot, ids rotating through 1..NBUF. */
+#define NBUF 8
+static shr_image bufs[NBUF];
+static uint32_t last_id;
+
+static uint32_t use(shr_image m) {
+    last_id = last_id % NBUF + 1;
+    bufs[last_id - 1] = m;
+    return last_id;
+}
+
+static shr_status exec(const shr_surface *dst, const shr_draw_cmd *c, size_t n) {
+    return shr_software_execute(dst, c, n, bufs, NBUF);
+}
+
+/* Buffer command `kind` naming `id`; REGISTER hands the driver what the stateless table holds for it. */
+static shr_draw_cmd buf_cmd(shr_cmd_kind kind, uint32_t id) {
+    shr_draw_cmd c = cmd(kind, (shr_rect){0, 0, 0, 0});
+    c.buffer = id;
+    if (kind == SHR_CMD_BUFFER_REGISTER) c.src = bufs[id - 1];
+    return c;
+}
+
+static shr_draw_cmd reg(uint32_t id) { return buf_cmd(SHR_CMD_BUFFER_REGISTER, id); }
+
+/* GLYPH and IMAGE draw all of `src` as a buffer of its own; COPY and ROTATE take it as their surface. */
 static shr_draw_cmd with_src(shr_cmd_kind kind, shr_rect r, shr_image src, shr_point origin) {
     shr_draw_cmd c = cmd(kind, r);
-    c.src = src;
+    if (kind == SHR_CMD_GLYPH || kind == SHR_CMD_IMAGE)
+        c.buffer = use(src), c.src_rect = (shr_rect){0, 0, src.width, src.height};
+    else
+        c.src = src;
     c.src_origin = origin;
+    return c;
+}
+
+/* `rect` of buffer `buf`. */
+static shr_draw_cmd region(shr_cmd_kind kind, shr_rect r, shr_image buf, shr_rect rect, shr_point origin) {
+    shr_draw_cmd c = with_src(kind, r, buf, origin);
+    c.src_rect = rect, c.color = SHR_RGB(255, 255, 255);
     return c;
 }
 
@@ -137,7 +173,7 @@ TEST fill_is_opaque_and_respects_stride(void) {
         memset(buf, 0xAB, sizeof(buf));
         shr_surface s = surf(buf, FMTS[i], 2, 3, 16); /* rows padded */
         shr_draw_cmd c = fill((shr_rect){0, 0, 2, 3}, 0x00FF8040); /* alpha byte ignored */
-        ASSERT_EQ_LL(shr_software_execute(&s, &c, 1), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, &c, 1), SHR_OK);
         for (int y = 0; y < 3; y++)
             for (int x = 0; x < 2; x++) ASSERT_EQ_LL(raw(&s, x, y), enc(FMTS[i], 0xFF8040));
         for (int y = 0; y < 3; y++)
@@ -152,7 +188,7 @@ TEST fill_dim_blends_at_half_strength(void) {
         shr_surface s = packed(buf, FMTS[i], 4, 1);
         shr_draw_cmd c[2] = {fill((shr_rect){0, 0, 4, 1}, SHR_RGB(20, 200, 90)), fill((shr_rect){1, 0, 3, 1}, SHR_RGB(255, 0, 255))};
         c[1].flags = SHR_GLYPH_DIM;
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, c, 2), SHR_OK);
         uint32_t bg = enc(FMTS[i], 0x14C85A);
         ASSERT_EQ_LL(raw(&s, 0, 0), bg);
         ASSERT_EQ_LL(raw(&s, 1, 0), mix(FMTS[i], 0xFF00FF, bg, 128));
@@ -163,7 +199,7 @@ TEST fill_dim_blends_at_half_strength(void) {
     shr_surface s = packed(px, SHR_FORMAT_RGBX8888, 1, 1);
     shr_draw_cmd c = fill((shr_rect){0, 0, 1, 1}, SHR_RGB(255, 255, 255));
     c.flags = SHR_GLYPH_DIM;
-    ASSERT_EQ_LL(shr_software_execute(&s, &c, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&s, &c, 1), SHR_OK);
     ASSERT_EQ_LL(raw(&s, 0, 0), 0x808080FF);
     PASS();
 }
@@ -177,7 +213,7 @@ TEST glyph_a8_blends_every_coverage(void) {
         shr_surface s = packed(buf, FMTS[i], 256, 1);
         shr_draw_cmd c[2] = {fill((shr_rect){0, 0, 256, 1}, SHR_RGB(10, 60, 250)),
                              glyph((shr_rect){0, 0, 256, 1}, SHR_RGB(255, 128, 7), m, (shr_point){0, 0})};
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, c, 2), SHR_OK);
         uint32_t bg = enc(FMTS[i], 0x0A3CFA);
         ASSERT_EQ_LL(raw(&s, 0, 0), bg); /* zero coverage leaves the pixel */
         for (uint32_t a = 1; a < 256; a++) ASSERT_EQ_LL(raw(&s, (int32_t)a, 0), mix(FMTS[i], 0xFF8007, bg, a));
@@ -191,34 +227,35 @@ TEST rgb565_blends_round_once_for_every_input(void) {
     for (int a = 0; a < 255; a++) cov[a] = (uint8_t)(a + 1);
     uint16_t px[255];
     shr_surface s = packed(px, SHR_FORMAT_RGB565, 255, 1);
-    shr_draw_cmd c = cmd(SHR_CMD_GLYPH, (shr_rect){0, 0, 255, 1});
-    c.src = (shr_image){cov, 255, 1, 255, 255, SHR_FORMAT_A8, SHR_MEMORY_CPU};
+    shr_draw_cmd c = with_src(SHR_CMD_GLYPH, (shr_rect){0, 0, 255, 1},
+                              (shr_image){cov, 255, 1, 255, 255, SHR_FORMAT_A8, SHR_MEMORY_CPU}, (shr_point){0, 0});
     for (uint32_t d = 0; d < 64; d++)
         for (uint32_t fg = 0; fg < 256; fg++) {
             uint32_t bg = (d & 31) << 11 | d << 5 | (31 - (d & 31));
             for (int x = 0; x < 255; x++) px[x] = (uint16_t)bg;
             c.color = SHR_RGB(fg, 255 - fg, fg);
-            ASSERT_EQ_LL(shr_software_execute(&s, &c, 1), SHR_OK);
+            ASSERT_EQ_LL(exec(&s, &c, 1), SHR_OK);
             for (uint32_t a = 1; a < 256; a++) ASSERT_EQ_LL(px[a - 1], mix(SHR_FORMAT_RGB565, c.color, bg, a));
         }
     PASS();
 }
 
 TEST glyph_a4_nibbles_origin_and_dim(void) {
-    /* Two rows of 3 pixels, stride 3: high nibble = left pixel; the source is read from (1, 1). */
-    const uint8_t a4[6] = {0x00, 0x00, 0x00, 0x0F, 0x81, 0x00};
-    shr_image m = {a4, 3, 2, 3, 6, SHR_FORMAT_A4, SHR_MEMORY_CPU};
+    /* Two rows of 6 pixels, stride 3: high nibble = left pixel. The rect starts at column 2 and is read from its
+     * (1, 1): buffer columns 3 (a low nibble) and 4 (a high one) of row 1. */
+    const uint8_t a4[6] = {0xEE, 0xEE, 0xEE, 0xEE, 0xEF, 0x8E};
+    shr_image m = {a4, 6, 2, 3, 6, SHR_FORMAT_A4, SHR_MEMORY_CPU};
     for (int i = 0; i < 2; i++) {
         uint8_t buf[3 * 4];
         shr_surface s = packed(buf, FMTS[i], 3, 1);
         shr_draw_cmd c[2] = {fill((shr_rect){0, 0, 3, 1}, SHR_RGB(0, 0, 0)),
-                             glyph((shr_rect){1, 0, 3, 1}, SHR_RGB(255, 255, 255), m, (shr_point){1, 1})};
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+                             region(SHR_CMD_GLYPH, (shr_rect){1, 0, 3, 1}, m, (shr_rect){2, 0, 5, 2}, (shr_point){1, 1})};
+        ASSERT_EQ_LL(exec(&s, c, 2), SHR_OK);
         ASSERT_EQ_LL(raw(&s, 0, 0), enc(FMTS[i], 0));
         ASSERT_EQ_LL(raw(&s, 1, 0), enc(FMTS[i], 0xFFFFFF));             /* 15 -> 255 */
         ASSERT_EQ_LL(raw(&s, 2, 0), mix(FMTS[i], 0xFFFFFF, enc(FMTS[i], 0), 8 * 17));
         c[1].flags = SHR_GLYPH_DIM; /* coverage (a + 1) / 2 after expansion, not nibble halving */
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, c, 2), SHR_OK);
         ASSERT_EQ_LL(raw(&s, 1, 0), mix(FMTS[i], 0xFFFFFF, enc(FMTS[i], 0), 128));
         ASSERT_EQ_LL(raw(&s, 2, 0), mix(FMTS[i], 0xFFFFFF, enc(FMTS[i], 0), (136 + 1) / 2));
     }
@@ -234,7 +271,7 @@ TEST glyph_a8_dim_keeps_faint_coverage(void) {
         shr_draw_cmd c[2] = {fill((shr_rect){0, 0, 3, 1}, SHR_RGB(0, 0, 0)),
                              glyph((shr_rect){0, 0, 3, 1}, SHR_RGB(255, 255, 255), m, (shr_point){0, 0})};
         c[1].flags = SHR_GLYPH_DIM;
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, c, 2), SHR_OK);
         uint32_t black = enc(FMTS[i], 0);
         ASSERT_EQ_LL(raw(&s, 0, 0), black);
         ASSERT_EQ_LL(raw(&s, 1, 0), mix(FMTS[i], 0xFFFFFF, black, 1));
@@ -283,6 +320,20 @@ static void ref_row(const shr_image *m, uint32_t flags, int32_t axis, int32_t y,
     }
 }
 
+/* Copies the w x h coverage `m` to column 2, row 1 of a buffer two columns and a row larger on every side whose
+ * other pixels are fully covered (for A4 also the column after an odd `m`, from its padding nibble); *rect is where
+ * `m` landed. `out` holds (w + 4) x (h + 2) pixels. */
+static shr_image embed(const shr_image *m, uint8_t *out, shr_rect *rect) {
+    int32_t bw = m->width + 4, bh = m->height + 2;
+    bool a4 = m->format == SHR_FORMAT_A4;
+    size_t stride = a4 ? (size_t)(bw + 1) / 2 : (size_t)bw, row = a4 ? (size_t)(m->width + 1) / 2 : (size_t)m->width;
+    memset(out, 0xFF, stride * (size_t)bh);
+    for (int32_t y = 0; y < m->height; y++)
+        memcpy(out + (size_t)(y + 1) * stride + (a4 ? 1 : 2), (const uint8_t *)m->pixels + (size_t)y * m->stride, row);
+    *rect = (shr_rect){2, 1, 2 + m->width, 1 + m->height};
+    return (shr_image){out, bw, bh, stride, stride * (size_t)bh, m->format, 0};
+}
+
 TEST synth_hand_vectors(void) {
     int32_t k, f;
     shr__slant(11, 0, &k, &f);
@@ -310,12 +361,14 @@ TEST synth_hand_vectors(void) {
         shr__glyph_footprint(v[i].src.width, h, v[i].flags, v[i].axis, &x0, &x1);
         ASSERT_EQ_LL(x0, v[i].x0);
         ASSERT_EQ_LL(x1, v[i].x0 + v[i].n);
-        uint8_t buf[2 * 6 * 4];
+        uint8_t buf[2 * 6 * 4], eb[64];
         shr_surface s = packed(buf, SHR_FORMAT_RGBX8888, v[i].n, h);
+        shr_rect rect;
+        shr_image b = embed(&v[i].src, eb, &rect);
         shr_draw_cmd c[2] = {fill((shr_rect){0, 0, v[i].n, h}, 0),
-                             glyph((shr_rect){0, 0, v[i].n, h}, SHR_RGB(255, 255, 255), v[i].src, (shr_point){x0, 0})};
+                             region(SHR_CMD_GLYPH, (shr_rect){0, 0, v[i].n, h}, b, rect, (shr_point){x0, 0})};
         c[1].flags = v[i].flags, c[1].slant_axis = v[i].axis;
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, c, 2), SHR_OK);
         for (int32_t y = 0; y < h; y++)
             for (int32_t x = 0; x < v[i].n; x++) ASSERT_EQ_LL(buf[4 * (y * v[i].n + x)], v[i].want[y][x]);
     }
@@ -325,7 +378,7 @@ TEST synth_hand_vectors(void) {
 TEST synth_matches_the_spec_reference(void) {
     static const int32_t widths[] = {1, 2, 5, 7, 8}, heights[] = {1, 4, 9};
     static const shr_pixel_format srcs[2] = {SHR_FORMAT_A8, SHR_FORMAT_A4};
-    uint8_t px[9 * 10], ink[sizeof(px)], buf[67 * 9 * 4];
+    uint8_t px[9 * 10], ink[sizeof(px)], buf[67 * 9 * 4], eb[12 * 11];
     uint32_t want[64];
     memset(ink, 255, sizeof(ink));
     for (int sf = 0; sf < 2; sf++)
@@ -336,6 +389,8 @@ TEST synth_matches_the_spec_reference(void) {
                 coverage_noise(px, sizeof(px)); /* the A4 padding nibble too */
                 shr_image m = {px, w, h, stride, stride * (size_t)h, srcs[sf], 0}, solid = m;
                 solid.pixels = ink;
+                shr_rect rect; /* the driver reads `m` inside a fully covered buffer */
+                shr_image b = embed(&m, eb, &rect);
                 const int32_t axes[] = {-40, -1, 0, 1, h, 2 * h - 1, 2 * h, 2 * h + 1, 3 * h + 37};
                 for (uint32_t flags = 0; flags < 8; flags++)
                     for (int ai = 0; ai < 9; ai++) {
@@ -358,10 +413,10 @@ TEST synth_matches_the_spec_reference(void) {
                         for (int fi = 0; fi < 2; fi++) {
                             shr_surface s = packed(buf, FMTS[fi], fw + 3, h);
                             shr_draw_cmd c[2] = {fill((shr_rect){0, 0, fw + 3, h}, 0),
-                                                 glyph((shr_rect){3, 0, fw + 3, h}, SHR_RGB(255, 255, 255), m,
-                                                       (shr_point){x0, 0})};
+                                                 region(SHR_CMD_GLYPH, (shr_rect){3, 0, fw + 3, h}, b, rect,
+                                                        (shr_point){x0, 0})};
                             c[1].flags = flags, c[1].slant_axis = axis;
-                            ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+                            ASSERT_EQ_LL(exec(&s, c, 2), SHR_OK);
                             for (int32_t y = 0; y < h; y++) {
                                 ref_row(&m, flags, axis, y, x0, fw, want);
                                 for (int32_t x = 0; x < fw; x++)
@@ -375,22 +430,25 @@ TEST synth_matches_the_spec_reference(void) {
 
 TEST synth_is_clip_invariant(void) {
     enum { W = 7, H = 6, SW = 16, SH = 9 };
-    uint8_t px[5 * H];
+    uint8_t px[5 * H], eb[6 * (H + 2)];
     coverage_noise(px, sizeof(px));
     shr_image m = {px, W, H, 5, sizeof(px), SHR_FORMAT_A4, 0};
+    shr_rect rect;
+    shr_image b = embed(&m, eb, &rect);
     const uint32_t flags = SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC | SHR_GLYPH_DIM;
     int32_t x0, x1;
     shr__glyph_footprint(W, H, flags, 5, &x0, &x1);
     shr_rect d = {2, 1, 2 + x1 - x0, 1 + H};
     ASSERT(d.x1 <= SW);
-    shr_draw_cmd whole = glyph(d, SHR_RGB(250, 200, 30), m, (shr_point){x0, 0});
+    shr_draw_cmd whole = region(SHR_CMD_GLYPH, d, b, rect, (shr_point){x0, 0});
+    whole.color = SHR_RGB(250, 200, 30);
     whole.flags = flags, whole.slant_axis = 5;
     for (int fi = 0; fi < 2; fi++) {
         uint8_t init[SW * SH * 4], ref[sizeof(init)], out[sizeof(init)];
         coverage_noise(init, sizeof(init));
         memcpy(ref, init, sizeof(init)), memcpy(out, init, sizeof(init));
         shr_surface rs = packed(ref, FMTS[fi], SW, SH), os = packed(out, FMTS[fi], SW, SH);
-        ASSERT_EQ_LL(shr_software_execute(&rs, &whole, 1), SHR_OK);
+        ASSERT_EQ_LL(exec(&rs, &whole, 1), SHR_OK);
         /* The same glyph in 3 x 2 tiles, each with its own src_origin. */
         shr_draw_cmd tiles[16];
         size_t n = 0;
@@ -400,25 +458,25 @@ TEST synth_is_clip_invariant(void) {
                 tiles[n] = whole;
                 tiles[n].dst = t, tiles[n++].src_origin = (shr_point){x0 + x - d.x0, y - d.y0};
             }
-        ASSERT_EQ_LL(shr_software_execute(&os, tiles, n), SHR_OK);
+        ASSERT_EQ_LL(exec(&os, tiles, n), SHR_OK);
         ASSERT_MEM_EQ(ref, out, sizeof(ref));
         /* Moved by an origin and limited to a clip, as a cached group is drawn. */
         uint8_t win[5 * 4 * 4];
         shr_surface ws = packed(win, FMTS[fi], 5, 4);
         for (int32_t y = 0; y < 4; y++) memcpy(win + (size_t)y * ws.stride, init + (size_t)(y + 2) * rs.stride + 3 * bpp(FMTS[fi]), ws.stride);
-        shr__raster_draw(&ws, &whole, (shr_point){3, 2}, (shr_rect){0, 0, 5, 4});
+        shr__raster_draw(&ws, &whole, bufs, (shr_point){3, 2}, (shr_rect){0, 0, 5, 4});
         for (int32_t y = 0; y < 4; y++)
             for (int32_t x = 0; x < 5; x++) ASSERT_EQ_LL(raw(&ws, x, y), raw(&rs, x + 3, y + 2));
         /* Through the caching driver, missing and then hitting. */
-        shr_draw_cmd g[4] = {begin(77, (shr_rect){0, 0, SW, SH}, (shr_rect){3, 2, 9, 6}), fill((shr_rect){0, 0, SW, SH}, SHR_RGB(9, 40, 90)),
-                             whole, end()};
+        shr_draw_cmd g[5] = {reg(whole.buffer), begin(77, (shr_rect){0, 0, SW, SH}, (shr_rect){3, 2, 9, 6}),
+                             fill((shr_rect){0, 0, SW, SH}, SHR_RGB(9, 40, 90)), whole, end()};
         memcpy(ref, init, sizeof(init));
-        ASSERT_EQ_LL(shr_software_execute(&rs, g, 4), SHR_OK);
+        ASSERT_EQ_LL(exec(&rs, g, 5), SHR_OK);
         shr_framebuffer_driver drv;
-        ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, &drv), SHR_OK);
+        ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, NBUF, &drv), SHR_OK);
         for (int pass = 0; pass < 2; pass++) {
             memcpy(out, init, sizeof(init));
-            ASSERT_EQ_LL(drv.execute(drv.user, &os, g, 4, 1), SHR_OK);
+            ASSERT_EQ_LL(drv.execute(drv.user, &os, g, 5, 1), SHR_OK);
             ASSERT_MEM_EQ(ref, out, sizeof(ref));
         }
         ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
@@ -427,10 +485,12 @@ TEST synth_is_clip_invariant(void) {
 }
 
 TEST synth_sources_stay_in_the_footprint(void) {
-    uint8_t buf[8 * 2 * 4], px[4 * 2];
+    uint8_t buf[8 * 2 * 4], px[4 * 2], eb[8 * 4];
     coverage_noise(px, sizeof(px));
     shr_surface s = packed(buf, SHR_FORMAT_RGBX8888, 8, 2);
     shr_image m = {px, 4, 2, 4, sizeof(px), SHR_FORMAT_A8, 0};
+    shr_rect rect; /* the footprint bounds the origin, not the larger buffer */
+    shr_image b = embed(&m, eb, &rect);
     static const uint32_t styles[3] = {SHR_GLYPH_BOLD, SHR_GLYPH_ITALIC, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC};
     static const int32_t axes[3] = {-9, 3, 20};
     for (int i = 0; i < 3; i++)
@@ -447,16 +507,17 @@ TEST synth_sources_stay_in_the_footprint(void) {
             };
             for (size_t k = 0; k < sizeof(e) / sizeof(e[0]); k++) {
                 shr_draw_cmd c[2] = {fill((shr_rect){0, 0, 8, 2}, 0),
-                                     glyph((shr_rect){0, 0, e[k].w, e[k].h}, SHR_RGB(255, 255, 255), m,
-                                           (shr_point){e[k].ox, e[k].oy})};
+                                     region(SHR_CMD_GLYPH, (shr_rect){0, 0, e[k].w, e[k].h}, b, rect,
+                                            (shr_point){e[k].ox, e[k].oy})};
                 c[1].flags = styles[i], c[1].slant_axis = axes[a];
-                ASSERT_EQ_LL(shr_software_execute(&s, c, 2), e[k].want);
+                ASSERT_EQ_LL(exec(&s, c, 2), e[k].want);
             }
         }
     PASS();
 }
 
-/* Sizes and axis bounds, checked before the footprint is computed; BOLD alone ignores the axis. */
+/* Rect sizes and axis bounds, checked before the footprint is computed; BOLD alone ignores the axis. The buffer
+ * is larger than every rect. */
 TEST synth_size_and_axis_limits(void) {
     static uint8_t big[1025];
     uint8_t buf[8 * 2 * 4] = {0}, other[sizeof(buf)] = {0}, px[4 * 2];
@@ -486,19 +547,20 @@ TEST synth_size_and_axis_limits(void) {
         int32_t x0 = 0, x1, axis = lim[k].axis;
         if (axis >= -4097 && axis <= 4097) /* so that only the bound rejects 4097 */
             shr__glyph_footprint(lim[k].w, lim[k].h, lim[k].flags & SHR_GLYPH_ITALIC, axis, &x0, &x1);
-        shr_draw_cmd c = glyph((shr_rect){0, 0, 1, 1}, SHR_RGB(255, 255, 255),
-                               (shr_image){big, lim[k].w, lim[k].h, (size_t)lim[k].w, sizeof(big), SHR_FORMAT_A8, 0},
-                               (shr_point){x0, 0});
+        bool row = lim[k].h == 1;
+        shr_draw_cmd c = region(SHR_CMD_GLYPH, (shr_rect){0, 0, 1, 1},
+                                (shr_image){big, row ? 1025 : 1, row ? 1 : 1025, row ? 1025 : 1, sizeof(big), SHR_FORMAT_A8, 0},
+                                (shr_rect){0, 0, lim[k].w, lim[k].h}, (shr_point){x0, 0});
         c.flags = lim[k].flags, c.slant_axis = axis;
-        ASSERT_EQ_LL(shr_software_execute(&s, &c, 1), lim[k].want);
+        ASSERT_EQ_LL(exec(&s, &c, 1), lim[k].want);
     }
     shr_image m = {px, 4, 2, 4, sizeof(px), SHR_FORMAT_A8, 0};
     shr_draw_cmd b[2] = {fill((shr_rect){0, 0, 8, 2}, 0),
                          glyph((shr_rect){0, 0, 5, 2}, SHR_RGB(255, 255, 255), m, (shr_point){0, 0})};
     b[1].flags = SHR_GLYPH_BOLD;
-    ASSERT_EQ_LL(shr_software_execute(&s, b, 2), SHR_OK);
+    ASSERT_EQ_LL(exec(&s, b, 2), SHR_OK);
     b[1].slant_axis = INT32_MIN;
-    ASSERT_EQ_LL(shr_software_execute(&os, b, 2), SHR_OK);
+    ASSERT_EQ_LL(exec(&os, b, 2), SHR_OK);
     ASSERT_MEM_EQ(buf, other, sizeof(buf));
     PASS();
 }
@@ -513,33 +575,33 @@ TEST synth_edge_sources(void) {
     shr_draw_cmd img = with_src(SHR_CMD_IMAGE, (shr_rect){0, 0, 1, 1},
                                 (shr_image){rgba, 1, 1, 4, 4, SHR_FORMAT_RGBA8888, 0}, (shr_point){-1, 0});
     img.flags = SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC;
-    ASSERT_EQ_LL(shr_software_execute(&s, &img, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&s, &img, 1), SHR_E_INVALID_ARG);
     shr_image none = {NULL, 0, 2, 0, 0, SHR_FORMAT_A8, 0};
     shr_draw_cmd empty[2] = {glyph((shr_rect){0, 0, 1, 2}, SHR_RGB(255, 255, 255), none, (shr_point){0, 0}),
                              glyph((shr_rect){1, 0, 2, 2}, SHR_RGB(255, 255, 255), none, (shr_point){-1, 0})};
     empty[0].flags = SHR_GLYPH_BOLD, empty[1].flags = SHR_GLYPH_ITALIC;
-    ASSERT_EQ_LL(shr_software_execute(&s, empty, 2), SHR_OK);
+    ASSERT_EQ_LL(exec(&s, empty, 2), SHR_OK);
     ASSERT_MEM_EQ(zero, buf, sizeof(buf));
     shr_image m = {px, 4, 2, 4, sizeof(px), SHR_FORMAT_A8, 0};
     shr_draw_cmd bad[3] = {fill((shr_rect){0, 0, 8, 2}, SHR_RGB(9, 9, 9)),
                            glyph((shr_rect){0, 0, 5, 2}, SHR_RGB(255, 255, 255), m, (shr_point){0, 0})};
     bad[1].flags = SHR_GLYPH_BOLD, bad[2] = bad[1], bad[2].src_origin.x = -1;
-    ASSERT_EQ_LL(shr_software_execute(&s, bad, 3), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&s, bad, 3), SHR_E_INVALID_ARG);
     ASSERT_MEM_EQ(zero, buf, sizeof(buf));
     PASS();
 }
 
 TEST image_is_straight_alpha_source_over(void) {
-    /* Second row, read from origin (0, 1): alpha 0, 128, 255, 1. */
-    const uint8_t rgba[2 * 16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                                  255, 0, 0, 0, 0, 255, 0, 128, 12, 34, 56, 255, 255, 255, 255, 1};
-    shr_image m = {rgba, 4, 2, 16, 32, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU};
+    /* The rect {1, 1, 5, 2} of a 5 x 2 buffer: alpha 0, 128, 255, 1. */
+    const uint8_t rgba[2 * 20] = {9, 9, 9, 255, 9, 9, 9, 255, 9, 9, 9, 255, 9, 9, 9, 255, 9, 9, 9, 255,
+                                  9, 9, 9, 255, 255, 0, 0, 0, 0, 255, 0, 128, 12, 34, 56, 255, 255, 255, 255, 1};
+    shr_image m = {rgba, 5, 2, 20, 40, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU};
     for (int i = 0; i < 2; i++) {
         uint8_t buf[4 * 4];
         shr_surface s = packed(buf, FMTS[i], 4, 1);
         shr_draw_cmd c[2] = {fill((shr_rect){0, 0, 4, 1}, SHR_RGB(100, 50, 200)),
-                             with_src(SHR_CMD_IMAGE, (shr_rect){0, 0, 4, 1}, m, (shr_point){0, 1})};
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+                             region(SHR_CMD_IMAGE, (shr_rect){0, 0, 4, 1}, m, (shr_rect){1, 1, 5, 2}, (shr_point){0, 0})};
+        ASSERT_EQ_LL(exec(&s, c, 2), SHR_OK);
         uint32_t bg = enc(FMTS[i], 0x6432C8);
         ASSERT_EQ_LL(raw(&s, 0, 0), bg);
         ASSERT_EQ_LL(raw(&s, 1, 0), mix(FMTS[i], 0x00FF00, bg, 128));
@@ -558,7 +620,7 @@ TEST copy_converts_between_formats(void) {
             const uint32_t colors[3] = {0xFF00FF, 0x123456, 0xFFFFFF};
             for (int x = 0; x < 3; x++) put(&src, x, 0, enc(FMTS[i], colors[x]));
             shr_draw_cmd c = with_src(SHR_CMD_COPY, (shr_rect){1, 0, 3, 1}, as_image(&src), (shr_point){0, 0});
-            ASSERT_EQ_LL(shr_software_execute(&dst, &c, 1), SHR_OK);
+            ASSERT_EQ_LL(exec(&dst, &c, 1), SHR_OK);
             ASSERT_EQ_LL(raw(&dst, 0, 0), 0);
             for (int x = 1; x < 3; x++) ASSERT_EQ_LL(raw(&dst, x, 0), enc(FMTS[k], dec(FMTS[i], raw(&src, x - 1, 0))));
         }
@@ -568,7 +630,7 @@ TEST copy_converts_between_formats(void) {
     shr_surface d = packed(&out, SHR_FORMAT_RGB565, 1, 1);
     shr_draw_cmd c = with_src(SHR_CMD_COPY, (shr_rect){0, 0, 1, 1},
                               (shr_image){in, 1, 1, 4, 4, SHR_FORMAT_RGBX8888, SHR_MEMORY_CPU}, (shr_point){0, 0});
-    ASSERT_EQ_LL(shr_software_execute(&d, &c, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&d, &c, 1), SHR_OK);
     ASSERT_EQ_LL(out, 0xF81F);
     PASS();
 }
@@ -579,21 +641,21 @@ TEST copy_scrolls_within_one_surface(void) {
         shr_surface s = packed(buf, FMTS[i], 4, 4);
         for (int y = 0; y < 4; y++) {
             shr_draw_cmd f = fill((shr_rect){0, y, 4, y + 1}, SHR_RGB(y * 60, 0, 0));
-            shr_software_execute(&s, &f, 1);
+            exec(&s, &f, 1);
         }
         size_t row = s.stride;
         shr_draw_cmd up = with_src(SHR_CMD_COPY, (shr_rect){0, 0, 4, 3},
                                    (shr_image){buf + row, 4, 3, row, row * 3, FMTS[i], SHR_MEMORY_CPU}, (shr_point){0, 0});
-        ASSERT_EQ_LL(shr_software_execute(&s, &up, 1), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, &up, 1), SHR_OK);
         for (int y = 0; y < 3; y++) ASSERT_EQ_LL(raw(&s, 3, y), enc(FMTS[i], (uint32_t)(y + 1) * 60 << 16));
         shr_draw_cmd down = with_src(SHR_CMD_COPY, (shr_rect){0, 1, 4, 4},
                                      (shr_image){buf, 4, 3, row, row * 3, FMTS[i], SHR_MEMORY_CPU}, (shr_point){0, 0});
-        ASSERT_EQ_LL(shr_software_execute(&s, &down, 1), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, &down, 1), SHR_OK);
         for (int y = 1; y < 4; y++) ASSERT_EQ_LL(raw(&s, 0, y), enc(FMTS[i], (uint32_t)y * 60 << 16));
         /* Horizontal overlap on one row: memmove semantics. */
         shr_draw_cmd right = with_src(SHR_CMD_COPY, (shr_rect){1, 0, 4, 1}, as_image(&s), (shr_point){0, 0});
         put(&s, 0, 0, enc(FMTS[i], 0x0000FF));
-        ASSERT_EQ_LL(shr_software_execute(&s, &right, 1), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, &right, 1), SHR_OK);
         ASSERT_EQ_LL(raw(&s, 1, 0), enc(FMTS[i], 0x0000FF));
         ASSERT_EQ_LL(raw(&s, 2, 0), enc(FMTS[i], 0x3C0000));
     }
@@ -607,26 +669,26 @@ TEST copy_overlap_rules(void) {
     shr_surface d = surf(buf, SHR_FORMAT_RGB565, 4, 2, 8);
     shr_draw_cmd cp = with_src(SHR_CMD_COPY, (shr_rect){0, 0, 2, 1},
                                (shr_image){buf + 2, 2, 1, 8, 8, SHR_FORMAT_RGBX8888, SHR_MEMORY_CPU}, (shr_point){0, 0});
-    ASSERT_EQ_LL(shr_software_execute(&d, &cp, 1), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(exec(&d, &cp, 1), SHR_E_UNSUPPORTED);
     cp.src.pixels = buf + 64; /* disjoint, after the destination */
-    ASSERT_EQ_LL(shr_software_execute(&d, &cp, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&d, &cp, 1), SHR_OK);
     shr_surface high = d;
     high.pixels = buf + 64;
     cp.src.pixels = buf; /* disjoint, before it */
-    ASSERT_EQ_LL(shr_software_execute(&high, &cp, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&high, &cp, 1), SHR_OK);
     /* Empty rectangles touch nothing, so they never overlap. */
     cp.src.pixels = buf + 2;
     cp.dst = (shr_rect){1, 0, 1, 1};
-    ASSERT_EQ_LL(shr_software_execute(&d, &cp, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&d, &cp, 1), SHR_OK);
     cp.dst = (shr_rect){0, 1, 2, 1};
-    ASSERT_EQ_LL(shr_software_execute(&d, &cp, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&d, &cp, 1), SHR_OK);
     /* Same format but another stride: row order cannot avoid clobbering. */
     shr_surface x = surf(buf, SHR_FORMAT_RGBX8888, 4, 4, 16);
     cp.dst = (shr_rect){0, 0, 2, 2};
     cp.src = (shr_image){buf + 4, 2, 2, 12, 24, SHR_FORMAT_RGBX8888, SHR_MEMORY_CPU};
-    ASSERT_EQ_LL(shr_software_execute(&x, &cp, 1), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(exec(&x, &cp, 1), SHR_E_UNSUPPORTED);
     cp.src = (shr_image){buf + 64, 2, 2, 8, 16, SHR_FORMAT_RGBX8888, SHR_MEMORY_DEVICE};
-    ASSERT_EQ_LL(shr_software_execute(&x, &cp, 1), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(exec(&x, &cp, 1), SHR_E_UNSUPPORTED);
     PASS();
 }
 
@@ -638,18 +700,18 @@ TEST rotate_maps_every_rotation(void) {
             for (int p = 0; p < 6; p++) put(&s, p % 3, p / 3, enc(FMTS[i], (uint32_t)(p + 1) * 0x2A1B0C));
 #define SRC(x, y) enc(FMTS[k], dec(FMTS[i], raw(&s, x, y)))
             shr_draw_cmd r = rotate(&s, (shr_rect){0, 0, 2, 3}, SHR_ROTATE_90_CW);
-            ASSERT_EQ_LL(shr_software_execute(&d, &r, 1), SHR_OK);
+            ASSERT_EQ_LL(exec(&d, &r, 1), SHR_OK);
             /* Logical (x, y) lands on output (h - 1 - y, x). */
             for (int y = 0; y < 2; y++)
                 for (int x = 0; x < 3; x++) ASSERT_EQ_LL(raw(&d, 1 - y, x), SRC(x, y));
             r = rotate(&s, (shr_rect){0, 0, 2, 3}, SHR_ROTATE_90_CCW);
-            ASSERT_EQ_LL(shr_software_execute(&d, &r, 1), SHR_OK);
+            ASSERT_EQ_LL(exec(&d, &r, 1), SHR_OK);
             for (int y = 0; y < 2; y++)
                 for (int x = 0; x < 3; x++) ASSERT_EQ_LL(raw(&d, y, 2 - x), SRC(x, y));
             shr_surface e = packed(back, FMTS[k], 3, 2);
             memset(back, 0, sizeof(back));
             r = rotate(&s, (shr_rect){1, 0, 3, 2}, SHR_ROTATE_180); /* only part of the output */
-            ASSERT_EQ_LL(shr_software_execute(&e, &r, 1), SHR_OK);
+            ASSERT_EQ_LL(exec(&e, &r, 1), SHR_OK);
             for (int y = 0; y < 2; y++) {
                 ASSERT_EQ_LL(raw(&e, 0, y), 0);
                 for (int x = 1; x < 3; x++) ASSERT_EQ_LL(raw(&e, x, y), SRC(2 - x, 1 - y));
@@ -660,7 +722,7 @@ TEST rotate_maps_every_rotation(void) {
     uint16_t src[6] = {1, 2, 3, 4, 5, 6}, dst[6] = {0};
     shr_surface s = packed(src, SHR_FORMAT_RGB565, 3, 2), d = packed(dst, SHR_FORMAT_RGB565, 2, 3);
     shr_draw_cmd r = rotate(&s, (shr_rect){0, 0, 2, 3}, SHR_ROTATE_90_CW);
-    ASSERT_EQ_LL(shr_software_execute(&d, &r, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&d, &r, 1), SHR_OK);
     const uint16_t cw[6] = {4, 1, 5, 2, 6, 3};
     ASSERT_MEM_EQ(cw, dst, sizeof(cw));
     PASS();
@@ -672,37 +734,37 @@ TEST rotate_rejects_bad_geometry_and_sources(void) {
     shr_rect all = {0, 0, 3, 2};
     shr_draw_cmd r = rotate(&s, all, SHR_ROTATE_180);
     r.src.stride = 2;
-    ASSERT_EQ_LL(shr_software_execute(&d, &r, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&d, &r, 1), SHR_E_INVALID_ARG);
     r = rotate(&s, all, SHR_ROTATE_180);
     r.src.domain = SHR_MEMORY_DEVICE;
-    ASSERT_EQ_LL(shr_software_execute(&d, &r, 1), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(exec(&d, &r, 1), SHR_E_UNSUPPORTED);
     uint8_t a8[6];
     r.src = (shr_image){a8, 3, 2, 3, 6, SHR_FORMAT_A8, SHR_MEMORY_CPU};
-    ASSERT_EQ_LL(shr_software_execute(&d, &r, 1), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(exec(&d, &r, 1), SHR_E_UNSUPPORTED);
     const shr_rotation bad_rot[2] = {SHR_ROTATE_NONE, (shr_rotation)7};
     for (int i = 0; i < 2; i++) {
         r = rotate(&s, all, bad_rot[i]);
-        ASSERT_EQ_LL(shr_software_execute(&d, &r, 1), SHR_E_INVALID_ARG);
+        ASSERT_EQ_LL(exec(&d, &r, 1), SHR_E_INVALID_ARG);
     }
     r = rotate(&s, all, SHR_ROTATE_90_CW); /* needs a 2x3 output */
-    ASSERT_EQ_LL(shr_software_execute(&d, &r, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&d, &r, 1), SHR_E_INVALID_ARG);
     r = rotate(&s, (shr_rect){0, 0, 2, 2}, SHR_ROTATE_180);
     shr_surface narrow = packed(dst, SHR_FORMAT_RGB565, 2, 2), flat = packed(dst, SHR_FORMAT_RGB565, 3, 1);
-    ASSERT_EQ_LL(shr_software_execute(&narrow, &r, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&narrow, &r, 1), SHR_E_INVALID_ARG);
     r.dst = (shr_rect){0, 0, 3, 1};
-    ASSERT_EQ_LL(shr_software_execute(&flat, &r, 1), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr_software_execute(&s, &r, 1), SHR_E_UNSUPPORTED); /* in place */
+    ASSERT_EQ_LL(exec(&flat, &r, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&s, &r, 1), SHR_E_UNSUPPORTED); /* in place */
     ASSERT_MEM_EQ(zero, dst, sizeof(zero));
     /* An offset view of the same pixels overlaps; a disjoint one is fine, as is an empty rect. */
     uint16_t px[16] = {0};
     shr_surface a = packed(px, SHR_FORMAT_RGB565, 2, 2), b = packed(px + 2, SHR_FORMAT_RGB565, 2, 2);
     r = rotate(&a, (shr_rect){0, 0, 2, 2}, SHR_ROTATE_180);
-    ASSERT_EQ_LL(shr_software_execute(&b, &r, 1), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(exec(&b, &r, 1), SHR_E_UNSUPPORTED);
     r.dst = (shr_rect){1, 1, 1, 2};
-    ASSERT_EQ_LL(shr_software_execute(&b, &r, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&b, &r, 1), SHR_OK);
     b = packed(px + 4, SHR_FORMAT_RGB565, 2, 2);
     r.dst = (shr_rect){0, 0, 2, 2};
-    ASSERT_EQ_LL(shr_software_execute(&b, &r, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&b, &r, 1), SHR_OK);
     PASS();
 }
 
@@ -723,30 +785,202 @@ TEST check_uses_the_driver_reach(void) {
     gone.pixels = &unknown;
     shr_rect r = {0, 0, 4, 4};
     shr_draw_cmd fill = {.kind = SHR_CMD_FILL, .dst = r};
-    ASSERT_EQ_LL(shr__raster_check(&dev, &fill, 1, NULL, NULL), SHR_E_UNSUPPORTED);
-    ASSERT_EQ_LL(shr__raster_check(&dev, &fill, 1, device_reach, &handle), SHR_OK);
-    ASSERT_EQ_LL(shr__raster_check(&dev, &fill, 1, device_reach, &unknown), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_check(&dev, &fill, 1, NULL, 0, NULL, NULL), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_check(&dev, &fill, 1, NULL, 0, device_reach, &handle), SHR_OK);
+    ASSERT_EQ_LL(shr__raster_check(&dev, &fill, 1, NULL, 0, device_reach, &unknown), SHR_E_UNSUPPORTED);
     /* DEVICE buffers overlap when they are the same one, never with CPU memory. */
     shr_draw_cmd copy = {.kind = SHR_CMD_COPY, .dst = r, .src = self, .src_origin = {1, 1}};
-    ASSERT_EQ_LL(shr__raster_check(&dev, &copy, 1, device_reach, &handle), SHR_OK);
+    ASSERT_EQ_LL(shr__raster_check(&dev, &copy, 1, NULL, 0, device_reach, &handle), SHR_OK);
     copy.src = wide;
-    ASSERT_EQ_LL(shr__raster_check(&dev, &copy, 1, device_reach, &handle), SHR_E_UNSUPPORTED);
-    ASSERT_EQ_LL(shr__raster_check(&cpu, &copy, 1, device_reach, &handle), SHR_OK);
+    ASSERT_EQ_LL(shr__raster_check(&dev, &copy, 1, NULL, 0, device_reach, &handle), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_check(&cpu, &copy, 1, NULL, 0, device_reach, &handle), SHR_OK);
     copy.src = gone;
-    ASSERT_EQ_LL(shr__raster_check(&cpu, &copy, 1, device_reach, &handle), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_check(&cpu, &copy, 1, NULL, 0, device_reach, &handle), SHR_E_UNSUPPORTED);
     shr_draw_cmd rot = {.kind = SHR_CMD_ROTATE, .dst = r, .src = self, .rotation = SHR_ROTATE_180};
-    ASSERT_EQ_LL(shr__raster_check(&dev, &rot, 1, device_reach, &handle), SHR_E_UNSUPPORTED);
-    ASSERT_EQ_LL(shr__raster_check(&cpu, &rot, 1, device_reach, &handle), SHR_OK);
+    ASSERT_EQ_LL(shr__raster_check(&dev, &rot, 1, NULL, 0, device_reach, &handle), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_check(&cpu, &rot, 1, NULL, 0, device_reach, &handle), SHR_OK);
     rot.src = gone;
-    ASSERT_EQ_LL(shr__raster_check(&cpu, &rot, 1, device_reach, &handle), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_check(&cpu, &rot, 1, NULL, 0, device_reach, &handle), SHR_E_UNSUPPORTED);
     shr_draw_cmd group[] = {{.kind = SHR_CMD_CACHE_BEGIN, .dst = {0, 0, 8, 8}, .cache_clip = {0, 0, 8, 8}},
                             {.kind = SHR_CMD_COPY, .dst = r, .src = self, .src_origin = {8, 0}},
                             {.kind = SHR_CMD_CACHE_END}};
-    ASSERT_EQ_LL(shr__raster_check(&dev, group, 3, device_reach, &handle), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr__raster_check(&cpu, group, 3, device_reach, &handle), SHR_OK);
+    ASSERT_EQ_LL(shr__raster_check(&dev, group, 3, NULL, 0, device_reach, &handle), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__raster_check(&cpu, group, 3, NULL, 0, device_reach, &handle), SHR_OK);
     group[1].src = as_image(&cpu);
-    ASSERT_EQ_LL(shr__raster_check(&dev, group, 3, device_reach, &handle), SHR_OK);
+    ASSERT_EQ_LL(shr__raster_check(&dev, group, 3, NULL, 0, device_reach, &handle), SHR_OK);
     ASSERT_EQ_LL(shr__raster_reads_dst(&cpu, &self), false);
+    /* REGISTER asks the same reach. */
+    shr_image tbl[1] = {{0}};
+    shr_draw_cmd r1 = {.kind = SHR_CMD_BUFFER_REGISTER, .buffer = 1, .src = self};
+    r1.src.format = SHR_FORMAT_A8;
+    ASSERT_EQ_LL(shr__raster_buffer_check(&r1, tbl, 1, NULL, NULL), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_buffer_check(&r1, tbl, 1, device_reach, &handle), SHR_OK);
+    ASSERT_EQ_LL(shr__raster_buffer_check(&r1, tbl, 1, device_reach, &unknown), SHR_E_UNSUPPORTED);
+    PASS();
+}
+
+/* The pixels the driver drew at (x, 0) of `s`, as 0xRRGGBB of an RGBX8888 surface. */
+static uint32_t at(const shr_surface *s, int32_t x) { return raw(s, x, 0) >> 8; }
+
+TEST buffers_register_replace_and_release(void) {
+    uint8_t px[4 * 4];
+    shr_surface s = packed(px, SHR_FORMAT_RGBX8888, 4, 1);
+    uint8_t red[4] = {255, 0, 0, 255}, blue[8] = {0, 0, 255, 255, 0, 255, 0, 255};
+    shr_image r = {red, 1, 1, 4, 4, SHR_FORMAT_RGBA8888, 0}, b = {blue, 2, 1, 8, 8, SHR_FORMAT_RGBA8888, SHR_MEMORY_DMA};
+    shr_framebuffer_driver drv;
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 0, 3, &drv), SHR_OK);
+    ASSERT_EQ_LL(drv.caps.max_buffers, 3);
+    ASSERT(!drv.caps.max_buffer_width && !drv.caps.max_buffer_height && !drv.caps.buffer_bytes && !drv.caps.buffer_flags);
+    shr_draw_cmd img = cmd(SHR_CMD_IMAGE, (shr_rect){0, 0, 1, 1});
+    img.buffer = 3, img.src_rect = (shr_rect){0, 0, 1, 1};
+    shr_draw_cmd c[3] = {cmd(SHR_CMD_BUFFER_REGISTER, (shr_rect){0, 0, 0, 0}), img};
+    c[0].buffer = 3, c[0].src = r;
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 2, 1), SHR_OK);
+    ASSERT_EQ_LL(at(&s, 0), 0xFF0000);
+    /* Registrations last across batches, and the driver reads the memory in place. */
+    red[1] = 128;
+    img.dst = (shr_rect){1, 0, 2, 1};
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, &img, 1, 2), SHR_OK);
+    ASSERT_EQ_LL(at(&s, 1), 0xFF8000);
+    /* REGISTER replaces; UPDATE inside the buffer is accepted; RELEASE of ids naming nothing is no error. */
+    c[0].src = b;
+    c[1] = buf_cmd(SHR_CMD_BUFFER_UPDATE, 3), c[1].src_rect = (shr_rect){1, 0, 2, 1};
+    img.dst = (shr_rect){2, 0, 4, 1}, img.src_rect = (shr_rect){0, 0, 2, 1};
+    c[2] = img;
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 3, 3), SHR_OK);
+    ASSERT_EQ_LL(at(&s, 2), 0x0000FF);
+    ASSERT_EQ_LL(at(&s, 3), 0x00FF00);
+    const uint32_t unknown[3] = {0, 1, 4};
+    for (int i = 0; i < 3; i++) {
+        c[0] = buf_cmd(SHR_CMD_BUFFER_RELEASE, unknown[i]);
+        ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 1, 4), SHR_OK);
+    }
+    /* RELEASE forgets the id: drawing from it is rejected, also within the batch that releases it. */
+    c[0] = buf_cmd(SHR_CMD_BUFFER_RELEASE, 3), c[1] = img;
+    memset(px, 0, sizeof(px));
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 2, 5), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, &img, 1, 6), SHR_E_INVALID_ARG);
+    for (int x = 0; x < 4; x++) ASSERT_EQ_LL(at(&s, x), 0);
+    /* The stateless path draws from the table it is given and never executes buffer commands. */
+    shr_image t[3] = {{0}, {0}, b};
+    c[0] = buf_cmd(SHR_CMD_BUFFER_RELEASE, 3), c[1] = img;
+    ASSERT_EQ_LL(shr_software_execute(&s, c, 2, t, 3), SHR_OK);
+    ASSERT_EQ_LL(at(&s, 2), 0x0000FF);
+    ASSERT_EQ_LL(shr_software_execute(&s, c, 2, t, 2), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_software_execute(&s, c, 2, NULL, 0), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
+    PASS();
+}
+
+TEST buffer_commands_are_validated(void) {
+    uint8_t px[4 * 4] = {0}, zero[sizeof(px)] = {0}, a8[8] = {0}, rgba[4] = {1, 2, 3, 255};
+    shr_surface s = packed(px, SHR_FORMAT_RGBX8888, 4, 1);
+    shr_framebuffer_driver drv;
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 0, 2, &drv), SHR_OK);
+    shr_image ok = {a8, 4, 2, 4, 8, SHR_FORMAT_A8, 0};
+    const struct {
+        uint32_t id;
+        shr_image mem;
+        shr_status want;
+    } regs[] = {
+        {1, ok, SHR_OK},
+        {2, {a8, 8, 2, 4, 8, SHR_FORMAT_A4, SHR_MEMORY_DMA}, SHR_OK},
+        {2, {rgba, 1, 1, 4, 4, SHR_FORMAT_RGBA8888, 0}, SHR_OK},
+        {0, ok, SHR_E_INVALID_ARG},
+        {3, ok, SHR_E_INVALID_ARG},
+        {1, {a8, 4, 2, 3, 8, SHR_FORMAT_A8, 0}, SHR_E_INVALID_ARG},  /* stride */
+        {1, {a8, 4, 2, 4, 8, (shr_pixel_format)0, 0}, SHR_E_INVALID_ARG},
+        {1, {a8, 2, 1, 4, 8, SHR_FORMAT_RGB565, 0}, SHR_E_UNSUPPORTED},
+        {1, {a8, 1, 1, 4, 8, SHR_FORMAT_RGBX8888, 0}, SHR_E_UNSUPPORTED},
+        {1, {a8, 4, 2, 4, 8, SHR_FORMAT_A8, SHR_MEMORY_DEVICE}, SHR_E_UNSUPPORTED},
+    };
+    shr_draw_cmd fl = fill((shr_rect){0, 0, 4, 1}, SHR_RGB(9, 9, 9)), c[2] = {reg(1), fl};
+    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+        c[0].buffer = regs[i].id, c[0].src = regs[i].mem;
+        memset(px, 0, sizeof(px));
+        ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 2, 1), regs[i].want);
+        if (regs[i].want != SHR_OK) ASSERT_MEM_EQ(zero, px, sizeof(px));
+    }
+    c[0].buffer = 1, c[0].src = ok;
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 1, 1), SHR_OK);
+    /* UPDATE: a registered id and a rect inside its buffer. */
+    const struct {
+        uint32_t id;
+        shr_rect r;
+        shr_status want;
+    } ups[] = {
+        {1, {0, 0, 4, 2}, SHR_OK},           {1, {2, 1, 2, 1}, SHR_OK},           {1, {0, 0, 5, 2}, SHR_E_INVALID_ARG},
+        {1, {0, 0, 4, 3}, SHR_E_INVALID_ARG}, {1, {-1, 0, 1, 1}, SHR_E_INVALID_ARG}, {1, {0, -1, 1, 1}, SHR_E_INVALID_ARG},
+        {1, {2, 0, 1, 1}, SHR_E_INVALID_ARG}, {0, {0, 0, 1, 1}, SHR_E_INVALID_ARG}, {3, {0, 0, 1, 1}, SHR_E_INVALID_ARG},
+        {2, {0, 0, 1, 1}, SHR_OK},
+    };
+    for (size_t i = 0; i < sizeof(ups) / sizeof(ups[0]); i++) {
+        c[0] = buf_cmd(SHR_CMD_BUFFER_UPDATE, ups[i].id), c[0].src_rect = ups[i].r;
+        ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 2, 1), ups[i].want);
+    }
+    c[0] = buf_cmd(SHR_CMD_BUFFER_RELEASE, 2);
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 1, 1), SHR_OK);
+    c[0] = buf_cmd(SHR_CMD_BUFFER_UPDATE, 2), c[0].src_rect = (shr_rect){0, 0, 0, 0};
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 2, 1), SHR_E_INVALID_ARG); /* not registered */
+    /* Buffer commands lead the batch; the driver checks the batch even without commands to run. */
+    memset(px, 0, sizeof(px));
+    shr_draw_cmd late[3] = {fl, reg(1), fl};
+    late[1].src = ok;
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, late, 3, 1), SHR_E_INVALID_ARG);
+    ASSERT_MEM_EQ(zero, px, sizeof(px));
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, NULL, 1, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(drv.execute(drv.user, &s, NULL, 0, 1), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
+    PASS();
+}
+
+/* Draw regions: a registered id of a format the kind takes, a rect inside the buffer (A4 from an even column) and
+ * a source inside the rect. A rejected batch writes nothing. */
+TEST buffer_regions_are_validated(void) {
+    uint8_t px[4 * 4] = {0}, zero[sizeof(px)] = {0}, a8[4 * 3], a4[2 * 3], rgba[4 * 4 * 3];
+    memset(a8, 255, sizeof(a8)), memset(a4, 255, sizeof(a4)), memset(rgba, 255, sizeof(rgba));
+    shr_surface s = packed(px, SHR_FORMAT_RGBX8888, 4, 1);
+    shr_image t[4] = {{a8, 4, 3, 4, sizeof(a8), SHR_FORMAT_A8, 0}, {a4, 4, 3, 2, sizeof(a4), SHR_FORMAT_A4, 0},
+                      {rgba, 4, 3, 16, sizeof(rgba), SHR_FORMAT_RGBA8888, 0}, {0}};
+    const struct {
+        shr_cmd_kind kind;
+        uint32_t id;
+        shr_rect r;
+        shr_point o;
+        int32_t w;
+        shr_status want;
+    } cases[] = {
+        {SHR_CMD_GLYPH, 1, {1, 1, 4, 3}, {0, 0}, 3, SHR_OK},
+        {SHR_CMD_GLYPH, 1, {1, 1, 4, 3}, {1, 1}, 2, SHR_OK},
+        {SHR_CMD_GLYPH, 1, {1, 1, 4, 3}, {1, 0}, 3, SHR_E_INVALID_ARG}, /* inside the buffer, outside the rect */
+        {SHR_CMD_GLYPH, 1, {1, 1, 4, 3}, {0, 2}, 1, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 1, {1, 1, 4, 3}, {-1, 0}, 1, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 1, {1, 1, 4, 3}, {0, -1}, 1, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 1, {1, 1, 5, 3}, {0, 0}, 1, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 1, {1, 1, 4, 4}, {0, 0}, 1, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 1, {-1, 0, 1, 1}, {0, 0}, 1, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 1, {0, -1, 1, 1}, {0, 0}, 1, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 1, {2, 0, 1, 1}, {0, 0}, 0, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 1, {0, 2, 1, 1}, {0, 0}, 0, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 2, {2, 0, 3, 3}, {0, 0}, 1, SHR_OK},
+        {SHR_CMD_GLYPH, 2, {1, 0, 3, 3}, {0, 0}, 1, SHR_E_INVALID_ARG}, /* A4 from an odd column */
+        {SHR_CMD_GLYPH, 2, {3, 0, 3, 3}, {0, 0}, 0, SHR_E_INVALID_ARG},
+        {SHR_CMD_IMAGE, 3, {1, 0, 4, 3}, {0, 0}, 3, SHR_OK},
+        {SHR_CMD_IMAGE, 3, {1, 0, 4, 3}, {1, 0}, 3, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 3, {0, 0, 1, 1}, {0, 0}, 1, SHR_E_UNSUPPORTED},
+        {SHR_CMD_IMAGE, 1, {0, 0, 1, 1}, {0, 0}, 1, SHR_E_UNSUPPORTED},
+        {SHR_CMD_IMAGE, 2, {0, 0, 1, 1}, {0, 0}, 1, SHR_E_UNSUPPORTED},
+        {SHR_CMD_GLYPH, 4, {0, 0, 0, 0}, {0, 0}, 0, SHR_E_INVALID_ARG}, /* not registered */
+        {SHR_CMD_GLYPH, 0, {0, 0, 0, 0}, {0, 0}, 0, SHR_E_INVALID_ARG},
+        {SHR_CMD_GLYPH, 5, {0, 0, 0, 0}, {0, 0}, 0, SHR_E_INVALID_ARG},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        shr_draw_cmd c[2] = {fill((shr_rect){0, 0, 4, 1}, SHR_RGB(9, 9, 9)), cmd(cases[i].kind, (shr_rect){0, 0, cases[i].w, 1})};
+        c[1].buffer = cases[i].id, c[1].src_rect = cases[i].r, c[1].src_origin = cases[i].o;
+        memset(px, 0, sizeof(px));
+        ASSERT_EQ_LL(shr_software_execute(&s, c, 2, t, 4), cases[i].want);
+        if (cases[i].want != SHR_OK) ASSERT_MEM_EQ(zero, px, sizeof(px));
+    }
     PASS();
 }
 
@@ -758,24 +992,24 @@ TEST execute_rejects_bad_batches_without_drawing(void) {
                                  {0, 0, 5, 1},  {0, 0, 1, 5},  {4, 4, 5, 5}};
     for (int i = 0; i < 7; i++) {
         shr_draw_cmd c[2] = {ok, fill(outside[i], SHR_RGB(9, 9, 9))};
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_E_INVALID_ARG);
+        ASSERT_EQ_LL(exec(&s, c, 2), SHR_E_INVALID_ARG);
     }
     shr_draw_cmd c[2] = {ok, cmd((shr_cmd_kind)0, (shr_rect){0, 0, 1, 1})};
-    ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&s, c, 2), SHR_E_INVALID_ARG);
     c[1].kind = (shr_cmd_kind)99;
-    ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr_software_execute(&s, NULL, 1), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr_software_execute(&s, NULL, 0), SHR_OK);
-    ASSERT_EQ_LL(shr_software_execute(NULL, &ok, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&s, c, 2), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&s, NULL, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&s, NULL, 0), SHR_OK);
+    ASSERT_EQ_LL(exec(NULL, &ok, 1), SHR_E_INVALID_ARG);
     shr_surface bad = s;
     bad.stride = 8;
-    ASSERT_EQ_LL(shr_software_execute(&bad, &ok, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&bad, &ok, 1), SHR_E_INVALID_ARG);
     bad = s;
     bad.format = SHR_FORMAT_A8;
-    ASSERT_EQ_LL(shr_software_execute(&bad, &ok, 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(exec(&bad, &ok, 1), SHR_E_INVALID_ARG);
     bad = s;
     bad.domain = SHR_MEMORY_DEVICE;
-    ASSERT_EQ_LL(shr_software_execute(&bad, &ok, 1), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(exec(&bad, &ok, 1), SHR_E_UNSUPPORTED);
 
     uint8_t a8[4] = {0};
     const struct {
@@ -784,13 +1018,13 @@ TEST execute_rejects_bad_batches_without_drawing(void) {
         shr_point origin;
         shr_status want;
     } srcs[] = {
-        {SHR_CMD_GLYPH, {buf, 1, 1, 4, 4, SHR_FORMAT_RGBX8888, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
-        {SHR_CMD_GLYPH, {a8, 2, 2, 2, 4, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
+        {SHR_CMD_GLYPH, {a8, 1, 1, 4, 4, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
         {SHR_CMD_IMAGE, {a8, 2, 2, 2, 4, SHR_FORMAT_A8, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
+        {SHR_CMD_IMAGE, {a8, 4, 1, 2, 2, SHR_FORMAT_A4, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
         {SHR_CMD_COPY, {a8, 2, 2, 2, 4, SHR_FORMAT_A8, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
         {SHR_CMD_COPY, {a8, 1, 1, 4, 4, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
-        {SHR_CMD_GLYPH, {a8, 2, 2, 1, 4, SHR_FORMAT_A8, SHR_MEMORY_CPU}, {0, 0}, SHR_E_INVALID_ARG},
-        {SHR_CMD_GLYPH, {a8, 2, 2, 2, 4, SHR_FORMAT_A8, SHR_MEMORY_DEVICE}, {0, 0}, SHR_E_UNSUPPORTED},
+        {SHR_CMD_COPY, {a8, 2, 1, 2, 4, SHR_FORMAT_RGB565, SHR_MEMORY_CPU}, {0, 0}, SHR_E_INVALID_ARG},
+        {SHR_CMD_COPY, {a8, 1, 1, 4, 4, SHR_FORMAT_RGBX8888, SHR_MEMORY_DEVICE}, {0, 0}, SHR_E_UNSUPPORTED},
         {SHR_CMD_GLYPH, {a8, 2, 2, 2, 4, SHR_FORMAT_A8, SHR_MEMORY_CPU}, {-1, 0}, SHR_E_INVALID_ARG},
         {SHR_CMD_GLYPH, {a8, 2, 2, 2, 4, SHR_FORMAT_A8, SHR_MEMORY_CPU}, {0, -1}, SHR_E_INVALID_ARG},
         {SHR_CMD_GLYPH, {a8, 2, 2, 2, 4, SHR_FORMAT_A8, SHR_MEMORY_CPU}, {2, 0}, SHR_E_INVALID_ARG},
@@ -799,16 +1033,16 @@ TEST execute_rejects_bad_batches_without_drawing(void) {
     };
     for (size_t i = 0; i < sizeof(srcs) / sizeof(srcs[0]); i++) {
         c[1] = with_src(srcs[i].kind, (shr_rect){0, 0, 1, 1}, srcs[i].src, srcs[i].origin);
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), srcs[i].want);
+        ASSERT_EQ_LL(exec(&s, c, 2), srcs[i].want);
     }
     ASSERT_MEM_EQ(zero, buf, sizeof(buf));
     /* Empty rectangles are valid and draw nothing. */
     shr_draw_cmd empty[2] = {fill((shr_rect){1, 1, 1, 3}, SHR_RGB(9, 9, 9)), fill((shr_rect){1, 1, 3, 1}, SHR_RGB(9, 9, 9))};
-    ASSERT_EQ_LL(shr_software_execute(&s, empty, 2), SHR_OK);
+    ASSERT_EQ_LL(exec(&s, empty, 2), SHR_OK);
     ASSERT_MEM_EQ(zero, buf, sizeof(buf));
     shr_surface none = packed(buf, SHR_FORMAT_RGB565, 0, 0);
     shr_draw_cmd nothing = fill((shr_rect){0, 0, 0, 0}, 0);
-    ASSERT_EQ_LL(shr_software_execute(&none, &nothing, 1), SHR_OK);
+    ASSERT_EQ_LL(exec(&none, &nothing, 1), SHR_OK);
     PASS();
 }
 
@@ -829,11 +1063,13 @@ TEST cache_hints_are_validated(void) {
         {f, begin(1, g, g), fill((shr_rect){0, 0, 4, 3}, 0), end()},      /* command outside the group */
         {f, begin(1, (shr_rect){0, 0, 1, 1}, (shr_rect){0, 0, 1, 1}), rotate(&rs, (shr_rect){0, 0, 1, 1}, SHR_ROTATE_180), end()},
         {f, begin(1, g, g), with_src(SHR_CMD_COPY, (shr_rect){0, 0, 4, 1}, as_image(&s), (shr_point){0, 1}), end()}, /* reads the target */
+        {f, buf_cmd(SHR_CMD_BUFFER_RELEASE, 1), f, f},                    /* buffer command after a draw */
+        {begin(1, g, g), buf_cmd(SHR_CMD_BUFFER_RELEASE, 1), f, end()},   /* buffer command in a group */
     };
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, NBUF, &drv), SHR_OK);
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-        ASSERT_EQ_LL(shr_software_execute(&s, bad[i], 4), SHR_E_INVALID_ARG);
+        ASSERT_EQ_LL(exec(&s, bad[i], 4), SHR_E_INVALID_ARG);
         ASSERT_EQ_LL(drv.execute(drv.user, &s, bad[i], 4, 1), SHR_E_INVALID_ARG);
     }
     ASSERT_MEM_EQ(zero, buf, sizeof(buf));
@@ -844,7 +1080,7 @@ TEST cache_hints_are_validated(void) {
         shr_surface other = packed(mem + 32 * i, SHR_FORMAT_RGBX8888, 4, 1);
         shr_rect r = {0, 0, 4, 1};
         shr_draw_cmd ok[3] = {begin(1, r, r), with_src(SHR_CMD_COPY, r, as_image(&other), (shr_point){0, 0}), end()};
-        ASSERT_EQ_LL(shr_software_execute(&mid, ok, 3), SHR_OK);
+        ASSERT_EQ_LL(exec(&mid, ok, 3), SHR_OK);
         ASSERT_EQ_LL(drv.execute(drv.user, &mid, ok, 3, 1), SHR_OK);
     }
     ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
@@ -859,7 +1095,7 @@ TEST execute_clips_groups_to_cache_clip(void) {
         shr_rect g = {0, 0, 4, 2};
         shr_draw_cmd c[5] = {begin(7, g, (shr_rect){1, 1, 3, 2}), fill(g, SHR_RGB(255, 0, 0)), end(),
                              fill((shr_rect){0, 2, 4, 3}, SHR_RGB(0, 0, 255)), fill((shr_rect){0, 0, 1, 1}, SHR_RGB(0, 255, 0))};
-        ASSERT_EQ_LL(shr_software_execute(&s, c, 5), SHR_OK);
+        ASSERT_EQ_LL(exec(&s, c, 5), SHR_OK);
         for (int y = 0; y < 3; y++)
             for (int x = 0; x < 4; x++) {
                 uint32_t want = y == 2 ? 0x0000FF : (x == 0 && y == 0) ? 0x00FF00 : (y == 1 && x >= 1 && x < 3) ? 0xFF0000 : 0;
@@ -869,7 +1105,8 @@ TEST execute_clips_groups_to_cache_clip(void) {
     PASS();
 }
 
-/* A group whose content depends on the group origin: fill, glyph, image and copy at offsets. */
+/* A group whose content depends on the group origin: fill, glyph, image and copy at offsets, after the
+ * REGISTERs of its buffers. */
 static const uint8_t g_a8[4] = {0, 85, 170, 255};
 static const uint8_t g_rgba[8] = {255, 255, 0, 255, 0, 255, 255, 100};
 static uint8_t g_copy[2 * 4];
@@ -879,15 +1116,16 @@ static size_t group(shr_draw_cmd *c, uint64_t key, shr_rect dst, shr_rect clip, 
     put(&cs, 0, 0, enc(f, 0x804020));
     put(&cs, 1, 0, enc(f, 0x102040));
     int32_t x = dst.x0, y = dst.y0;
-    c[0] = begin(key, dst, clip);
-    c[1] = fill(dst, SHR_RGB(40, 40, 40));
-    c[2] = glyph((shr_rect){x + 1, y, x + 5, y + 1}, SHR_RGB(255, 255, 255),
+    c[2] = begin(key, dst, clip);
+    c[3] = fill(dst, SHR_RGB(40, 40, 40));
+    c[4] = glyph((shr_rect){x + 1, y, x + 5, y + 1}, SHR_RGB(255, 255, 255),
                  (shr_image){g_a8, 4, 1, 4, 4, SHR_FORMAT_A8, SHR_MEMORY_CPU}, (shr_point){0, 0});
-    c[3] = with_src(SHR_CMD_IMAGE, (shr_rect){x, y + 1, x + 2, y + 2},
+    c[5] = with_src(SHR_CMD_IMAGE, (shr_rect){x, y + 1, x + 2, y + 2},
                     (shr_image){g_rgba, 2, 1, 8, 8, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU}, (shr_point){0, 0});
-    c[4] = with_src(SHR_CMD_COPY, (shr_rect){x + 4, y + 1, x + 6, y + 2}, as_image(&cs), (shr_point){0, 0});
-    c[5] = end();
-    return 6;
+    c[6] = with_src(SHR_CMD_COPY, (shr_rect){x + 4, y + 1, x + 6, y + 2}, as_image(&cs), (shr_point){0, 0});
+    c[7] = end();
+    c[0] = reg(c[4].buffer), c[1] = reg(c[5].buffer);
+    return 8;
 }
 
 TEST cached_driver_hit_matches_direct_drawing(void) {
@@ -895,28 +1133,28 @@ TEST cached_driver_hit_matches_direct_drawing(void) {
         uint8_t ref[8 * 4 * 4], a[sizeof(ref)], b[sizeof(ref)];
         memset(ref, 0x11, sizeof(ref)), memset(a, 0x11, sizeof(a)), memset(b, 0x11, sizeof(b));
         shr_surface sr = packed(ref, FMTS[i], 8, 4), sa = packed(a, FMTS[i], 8, 4), sb = packed(b, FMTS[i], 8, 4);
-        shr_draw_cmd c[6];
+        shr_draw_cmd c[8];
         size_t n = group(c, 42, (shr_rect){1, 1, 7, 3}, (shr_rect){2, 1, 7, 3}, FMTS[i]);
-        ASSERT_EQ_LL(shr_software_execute(&sr, c, n), SHR_OK);
+        ASSERT_EQ_LL(exec(&sr, c, n), SHR_OK);
         shr_framebuffer_driver drv;
-        ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, &drv), SHR_OK);
+        ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, NBUF, &drv), SHR_OK);
         ASSERT_EQ_LL(drv.execute(drv.user, &sa, c, n, 1), SHR_OK); /* miss: renders and stores */
         ASSERT_MEM_EQ(ref, a, sizeof(ref));
         ASSERT_EQ_LL(drv.execute(drv.user, &sb, c, n, 2), SHR_OK); /* hit */
         ASSERT_MEM_EQ(ref, b, sizeof(ref));
         /* A hit copies the stored pixels: same key and size with other commands still draws the old content. */
-        c[1].color = SHR_RGB(0, 0, 0);
+        c[3].color = SHR_RGB(0, 0, 0);
         memset(b, 0x11, sizeof(b));
         ASSERT_EQ_LL(drv.execute(drv.user, &sb, c, n, 3), SHR_OK);
         ASSERT_MEM_EQ(ref, b, sizeof(ref));
         /* Same key and size at another position still hits. */
         n = group(c, 42, (shr_rect){2, 2, 8, 4}, (shr_rect){2, 2, 8, 4}, FMTS[i]);
-        c[1].color = SHR_RGB(0, 0, 0);
+        c[3].color = SHR_RGB(0, 0, 0);
         ASSERT_EQ_LL(drv.execute(drv.user, &sb, c, n, 4), SHR_OK);
         ASSERT_EQ_LL(raw(&sb, 2, 2), enc(FMTS[i], 0x282828));
         /* Another size misses. */
         n = group(c, 42, (shr_rect){0, 0, 7, 2}, (shr_rect){0, 0, 7, 2}, FMTS[i]);
-        c[1].color = SHR_RGB(0, 0, 0);
+        c[3].color = SHR_RGB(0, 0, 0);
         ASSERT_EQ_LL(drv.execute(drv.user, &sb, c, n, 5), SHR_OK);
         ASSERT_EQ_LL(raw(&sb, 0, 0), enc(FMTS[i], 0));
         /* An empty clip draws nothing. */
@@ -935,7 +1173,7 @@ TEST cached_entries_depend_on_format(void) {
     shr_rect r = {0, 0, 4, 1};
     shr_draw_cmd c[3] = {begin(5, r, r), fill(r, SHR_RGB(255, 0, 0)), end()};
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, NBUF, &drv), SHR_OK);
     ASSERT_EQ_LL(drv.execute(drv.user, &s565, c, 3, 1), SHR_OK);
     c[1].color = SHR_RGB(0, 0, 255);
     ASSERT_EQ_LL(drv.execute(drv.user, &s8888, c, 3, 2), SHR_OK);
@@ -967,7 +1205,7 @@ TEST cache_evicts_least_recently_used(void) {
     fail_alloc f = {-1, 0};
     shr_allocator al = fail_allocator(&f);
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(&al, KEYED_BUDGET, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(&al, KEYED_BUDGET, NBUF, &drv), SHR_OK);
     ASSERT_EQ_LL(draw_keyed(&drv, 1, 0x010101), 0x010101);
     ASSERT_EQ_LL(draw_keyed(&drv, 2, 0x020202), 0x020202);
     ASSERT_EQ_LL(draw_keyed(&drv, 1, 0xFFFFFF), 0x010101); /* hit, now most recent */
@@ -985,7 +1223,7 @@ TEST cache_evicts_only_after_a_new_entry_exists(void) {
     fail_alloc f = {-1, 0};
     shr_allocator al = fail_allocator(&f);
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(&al, KEYED_BUDGET, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(&al, KEYED_BUDGET, NBUF, &drv), SHR_OK);
     ASSERT_EQ_LL(draw_keyed(&drv, 1, 0x010101), 0x010101);
     ASSERT_EQ_LL(draw_keyed(&drv, 2, 0x020202), 0x020202);
     f.budget = 1; /* the entry, not its pixels */
@@ -1001,7 +1239,7 @@ TEST cache_evicts_only_after_a_new_entry_exists(void) {
 
 TEST cache_skips_groups_over_half_the_budget(void) {
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(NULL, KEYED_BUDGET, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, KEYED_BUDGET, NBUF, &drv), SHR_OK);
     ASSERT_EQ_LL(draw_keyed(&drv, 1, 0x010101), 0x010101);
     ASSERT_EQ_LL(draw_sized(&drv, 2, 0x020202, 40), 0x020202); /* fits the budget, but not half of it */
     ASSERT_EQ_LL(draw_sized(&drv, 2, 0x222222, 40), 0x222222);
@@ -1031,7 +1269,7 @@ TEST cache_budget_includes_the_table(void) {
     byte_alloc b = {0};
     shr_allocator al = {&b, ba_alloc, ba_free};
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(&al, 20000, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(&al, 20000, NBUF, &drv), SHR_OK);
     size_t state = b.live;
     uint8_t px[4];
     shr_surface s = packed(px, SHR_FORMAT_RGBX8888, 1, 1);
@@ -1058,7 +1296,7 @@ TEST small_budgets_do_not_store_and_evict(void) {
     int kept = 0;
     for (uint64_t budget = 0; budget <= 4096; budget += 16) {
         shr_framebuffer_driver drv;
-        ASSERT_EQ_LL(shr_software_driver_create(&al, budget, &drv), SHR_OK);
+        ASSERT_EQ_LL(shr_software_driver_create(&al, budget, NBUF, &drv), SHR_OK);
         f.budget = LONG_MAX;
         c[1].color = 0x010101;
         ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 3, 1), SHR_OK);
@@ -1087,7 +1325,7 @@ TEST cache_table_failures_draw_directly(void) {
     /* Allocations of a first miss: entry, pixels, table, buckets. */
     for (long fail_at = 2; fail_at <= 3; fail_at++) {
         shr_framebuffer_driver drv;
-        ASSERT_EQ_LL(shr_software_driver_create(&al, 1 << 20, &drv), SHR_OK);
+        ASSERT_EQ_LL(shr_software_driver_create(&al, 1 << 20, NBUF, &drv), SHR_OK);
         f.budget = fail_at;
         c[1].color = 0x123456;
         ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 3, 1), SHR_OK);
@@ -1101,7 +1339,7 @@ TEST cache_table_failures_draw_directly(void) {
     }
     /* Keys 32 apart share a bucket; the tenth one doubles the table, which fails once. */
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(&al, 1 << 20, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(&al, 1 << 20, NBUF, &drv), SHR_OK);
     for (uint32_t k = 0; k < 300; k++) {
         f.budget = k == 9 ? 2 : -1;
         c[0].key[0] = (uint64_t)k * 32, c[1].color = k;
@@ -1121,7 +1359,7 @@ TEST cache_table_failures_draw_directly(void) {
 
 TEST cache_table_grows_with_many_entries(void) {
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 20, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 20, NBUF, &drv), SHR_OK);
     uint8_t px[4];
     shr_surface s = packed(px, SHR_FORMAT_RGBX8888, 1, 1);
     shr_rect r = {0, 0, 1, 1};
@@ -1138,7 +1376,7 @@ TEST cache_table_grows_with_many_entries(void) {
 
 TEST cache_keys_are_128_bit(void) {
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, NBUF, &drv), SHR_OK);
     uint8_t px[4];
     shr_surface s = packed(px, SHR_FORMAT_RGBX8888, 1, 1);
     shr_rect r = {0, 0, 1, 1};
@@ -1156,7 +1394,7 @@ TEST cache_keys_are_128_bit(void) {
 
 TEST cache_keeps_sizes_and_formats_of_one_key_apart(void) {
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 20, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 20, NBUF, &drv), SHR_OK);
     /* Heights 64 apart share a bucket while the table is small. */
     static const int32_t hs[10] = {1, 2, 3, 4, 5, 65, 66, 67, 68, 69};
     uint8_t buf[10 * 69 * 4];
@@ -1180,7 +1418,7 @@ TEST cache_evicts_oldest_of_many(void) {
     fail_alloc f = {-1, 0};
     shr_allocator al = fail_allocator(&f);
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(&al, 100 * 80, &drv), SHR_OK); /* about 100 single pixels */
+    ASSERT_EQ_LL(shr_software_driver_create(&al, 100 * 80, NBUF, &drv), SHR_OK); /* about 100 single pixels */
     uint8_t px[4];
     shr_surface s = packed(px, SHR_FORMAT_RGBX8888, 1, 1);
     shr_rect r = {0, 0, 1, 1};
@@ -1215,17 +1453,17 @@ TEST uncacheable_groups_draw_directly(void) {
             uint8_t ref[6 * 3 * 4], out[sizeof(ref)];
             memset(ref, 0x5A, sizeof(ref)), memset(out, 0x5A, sizeof(out));
             shr_surface sr = packed(ref, FMTS[k], 6, 3), so = packed(out, FMTS[k], 6, 3);
-            shr_draw_cmd c[6];
+            shr_draw_cmd c[8];
             size_t n = group(c, 9, (shr_rect){0, 1, 6, 3}, (shr_rect){1, 1, 5, 2}, FMTS[k]);
-            ASSERT_EQ_LL(shr_software_execute(&sr, c, n), SHR_OK);
+            ASSERT_EQ_LL(exec(&sr, c, n), SHR_OK);
             f.budget = -1;
             shr_framebuffer_driver drv;
-            ASSERT_EQ_LL(shr_software_driver_create(&al, cases[i].budget, &drv), SHR_OK);
+            ASSERT_EQ_LL(shr_software_driver_create(&al, cases[i].budget, NBUF, &drv), SHR_OK);
             f.budget = cases[i].alloc_budget;
             ASSERT_EQ_LL(drv.execute(drv.user, &so, c, n, 1), SHR_OK);
             ASSERT_MEM_EQ(ref, out, sizeof(ref));
-            c[1].color = SHR_RGB(1, 2, 3); /* nothing was stored: the next draw shows the new content */
-            ASSERT_EQ_LL(shr_software_execute(&sr, c, n), SHR_OK);
+            c[3].color = SHR_RGB(1, 2, 3); /* nothing was stored: the next draw shows the new content */
+            ASSERT_EQ_LL(exec(&sr, c, n), SHR_OK);
             ASSERT_EQ_LL(drv.execute(drv.user, &so, c, n, 2), SHR_OK);
             ASSERT_MEM_EQ(ref, out, sizeof(ref));
             f.budget = -1;
@@ -1238,20 +1476,23 @@ TEST uncacheable_groups_draw_directly(void) {
 
 TEST driver_create_and_destroy(void) {
     shr_framebuffer_driver drv;
-    ASSERT_EQ_LL(shr_software_driver_create(NULL, 0, NULL), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 0, NBUF, NULL), SHR_E_INVALID_ARG);
     shr_allocator half = {NULL, fa_alloc, NULL};
-    ASSERT_EQ_LL(shr_software_driver_create(&half, 0, &drv), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_software_driver_create(&half, 0, NBUF, &drv), SHR_E_INVALID_ARG);
     ASSERT(!drv.execute && !drv.user);
     fail_alloc f = {0, 0};
     shr_allocator al = fail_allocator(&f);
-    ASSERT_EQ_LL(shr_software_driver_create(&al, 0, &drv), SHR_E_NO_MEMORY);
-    ASSERT_EQ_LL(f.live, 0);
-    ASSERT(!drv.execute);
-    f.budget = 1; /* the table comes with the first entry */
-    ASSERT_EQ_LL(shr_software_driver_create(&al, 1024, &drv), SHR_OK);
+    for (long budget = 0; budget < 2; budget++) { /* the driver, its buffer table */
+        f.budget = budget;
+        ASSERT_EQ_LL(shr_software_driver_create(&al, 0, NBUF, &drv), SHR_E_NO_MEMORY);
+        ASSERT_EQ_LL(f.live, 0);
+        ASSERT(!drv.execute);
+    }
+    f.budget = 2; /* the hash table comes with the first entry */
+    ASSERT_EQ_LL(shr_software_driver_create(&al, 1024, NBUF, &drv), SHR_OK);
     ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
     f.budget = -1;
-    ASSERT_EQ_LL(shr_software_driver_create(&al, 1 << 16, &drv), SHR_OK);
+    ASSERT_EQ_LL(shr_software_driver_create(&al, 1 << 16, NBUF, &drv), SHR_OK);
     ASSERT_EQ_LL(drv.caps.domains, SHR_MEMORY_CPU | SHR_MEMORY_DMA);
     ASSERT(drv.execute && drv.reset && !drv.cancel && !drv.sync);
     ASSERT_EQ_LL(drv.reset(drv.user), SHR_OK);
@@ -1275,7 +1516,8 @@ TEST driver_create_and_destroy(void) {
     ASSERT_EQ_LL(f.live, 0);
     ASSERT(!drv.execute && !drv.user);
     ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr_software_driver_create(NULL, 0, &drv), SHR_OK); /* default allocator, no cache */
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 0, 0, &drv), SHR_OK); /* default allocator, no cache, no buffers */
+    ASSERT_EQ_LL(drv.caps.max_buffers, 0);
     ASSERT_EQ_LL(drv.execute(drv.user, &s, c, 4, 1), SHR_OK);
     ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
     PASS();
@@ -1382,6 +1624,9 @@ int main(int argc, char **argv) {
     RUN_TEST(rotate_maps_every_rotation);
     RUN_TEST(rotate_rejects_bad_geometry_and_sources);
     RUN_TEST(check_uses_the_driver_reach);
+    RUN_TEST(buffers_register_replace_and_release);
+    RUN_TEST(buffer_commands_are_validated);
+    RUN_TEST(buffer_regions_are_validated);
     RUN_TEST(execute_rejects_bad_batches_without_drawing);
     RUN_TEST(cache_hints_are_validated);
     RUN_TEST(execute_clips_groups_to_cache_clip);

@@ -38,7 +38,7 @@ typedef struct backend {
     void (*finish)(void); /* waits until the device finished everything submitted (frame timing) */
 } backend;
 
-static shr_status sw_driver_create(shr_framebuffer_driver *out) { return shr_software_driver_create(NULL, 1u << 20, out); }
+static shr_status sw_driver_create(shr_framebuffer_driver *out) { return shr_software_driver_create(NULL, 1u << 20, 256, out); }
 
 static shr_status sw_surface_create(shr_framebuffer_driver *d, int32_t w, int32_t h, shr_pixel_format f, shr_surface *out) {
     (void)d;
@@ -71,7 +71,7 @@ static const backend software = {"software",         sw_driver_create, shr_softw
                                  sw_surface_destroy, sw_surface_read,  no_finish};
 
 #ifdef SHR_RENDER_ANGLE
-static shr_status angle_driver_create(shr_framebuffer_driver *out) { return shr_angle_driver_create(NULL, 64u << 20, out); }
+static shr_status angle_driver_create(shr_framebuffer_driver *out) { return shr_angle_driver_create(NULL, 0, 256, out); }
 static void angle_finish(void) { glFinish(); }
 static const backend angle = {"angle",
                               angle_driver_create,

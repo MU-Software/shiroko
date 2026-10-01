@@ -37,18 +37,21 @@ struct sw {
     uint64_t budget, used;
     shr__lru_node *lru;
     entry *table;
+    shr_image *buffers;
+    uint32_t nbuffers;
 };
 
 #include "cache_table.h"
 
-shr_status shr_software_execute(const shr_surface *dst, const shr_draw_cmd *cmds, size_t count) SHR_NONBLOCKING {
-    shr_status st = shr__raster_check(dst, cmds, count, NULL, NULL);
+shr_status shr_software_execute(const shr_surface *dst, const shr_draw_cmd *cmds, size_t count, const shr_image *buffers,
+                                uint32_t nbuffers) SHR_NONBLOCKING {
+    shr_status st = shr__raster_check(dst, cmds, count, buffers, nbuffers, NULL, NULL);
     if (st != SHR_OK) return st;
     shr_rect all = {0, 0, dst->width, dst->height}, clip = all;
     for (size_t i = 0; i < count; i++) {
         if (cmds[i].kind == SHR_CMD_CACHE_BEGIN) clip = cmds[i].cache_clip;
         else if (cmds[i].kind == SHR_CMD_CACHE_END) clip = all;
-        else shr__raster_draw(dst, &cmds[i], (shr_point){0, 0}, clip);
+        else if (!shr__buffer_cmd(cmds[i].kind)) shr__raster_draw(dst, &cmds[i], buffers, (shr_point){0, 0}, clip);
     }
     return SHR_OK;
 }
@@ -97,7 +100,7 @@ static entry *render(sw *s, const shr_surface *dst, const shr_draw_cmd *group, s
     shr_surface buf = {.pixels = pixels, .width = w, .height = h, .stride = stride, .byte_length = bytes,
                        .format = dst->format, .domain = SHR_MEMORY_CPU};
     shr_point origin = {group->dst.x0, group->dst.y0};
-    for (size_t i = 1; i < n; i++) shr__raster_draw(&buf, &group[i], origin, (shr_rect){0, 0, w, h});
+    for (size_t i = 1; i < n; i++) shr__raster_draw(&buf, &group[i], s->buffers, origin, (shr_rect){0, 0, w, h});
     if (table_add(s, e)) {
         shr__lru_push(&s->lru, &e->lru);
         s->used += sizeof(entry) + bytes;
@@ -119,7 +122,7 @@ static void draw_group(sw *s, const shr_surface *dst, const shr_draw_cmd *group,
         e = render(s, dst, group, n, &id);
     }
     if (!e) {
-        for (size_t i = 1; i < n; i++) shr__raster_draw(dst, &group[i], (shr_point){0, 0}, clip);
+        for (size_t i = 1; i < n; i++) shr__raster_draw(dst, &group[i], s->buffers, (shr_point){0, 0}, clip);
         return;
     }
     size_t bpp = shr__px_bytes(dst->format), stride = (size_t)id.width * bpp, row = (size_t)(clip.x1 - clip.x0) * bpp;
@@ -131,15 +134,27 @@ static void draw_group(sw *s, const shr_surface *dst, const shr_draw_cmd *group,
     while (s->used > s->budget) entry_free(s, SHR_CONTAINER(shr__lru_oldest(s->lru), entry, lru));
 }
 
+/* Buffer commands take effect before the batch is checked: after an error the registrations are unspecified. */
 static shr_status sw_execute(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t count,
                              shr_fence fence) {
     (void)fence;
-    shr_status st = shr__raster_check(dst, cmds, count, NULL, NULL);
+    sw *s = user;
+    size_t i = 0;
+    for (; cmds && i < count && shr__buffer_cmd(cmds[i].kind); i++) {
+        const shr_draw_cmd *c = &cmds[i];
+        shr_status st = shr__raster_buffer_check(c, s->buffers, s->nbuffers, NULL, NULL);
+        if (st != SHR_OK) return st;
+        if (c->kind == SHR_CMD_BUFFER_REGISTER)
+            s->buffers[c->buffer - 1] = c->src;
+        else if (c->kind == SHR_CMD_BUFFER_RELEASE && c->buffer && c->buffer <= s->nbuffers)
+            s->buffers[c->buffer - 1] = (shr_image){0};
+    }
+    shr_status st = shr__raster_check(dst, cmds, count, s->buffers, s->nbuffers, NULL, NULL);
     if (st != SHR_OK) return st;
     shr_rect all = {0, 0, dst->width, dst->height};
-    for (size_t i = 0; i < count; i++) {
+    for (; i < count; i++) {
         if (cmds[i].kind != SHR_CMD_CACHE_BEGIN) {
-            shr__raster_draw(dst, &cmds[i], (shr_point){0, 0}, all);
+            shr__raster_draw(dst, &cmds[i], s->buffers, (shr_point){0, 0}, all);
             continue;
         }
         size_t n = 1;
@@ -155,18 +170,23 @@ static shr_status sw_reset(void *user) {
     return SHR_OK;
 }
 
-shr_status shr_software_driver_create(const shr_allocator *allocator, uint64_t cache_bytes,
+shr_status shr_software_driver_create(const shr_allocator *allocator, uint64_t cache_bytes, uint32_t max_buffers,
                                       shr_framebuffer_driver *out) {
     if (!out) return SHR_E_INVALID_ARG;
     memset(out, 0, sizeof(*out));
     shr__alloc al;
     if (!shr__alloc_init(&al, allocator)) return SHR_E_INVALID_ARG;
     sw *s = SHR_NEW(&al, sw);
-    if (!s) return SHR_E_NO_MEMORY;
-    *s = (sw){.al = al, .budget = cache_bytes};
+    shr_image *buffers = s ? SHR_NEW_ARRAY(&al, shr_image, max_buffers) : NULL;
+    if (!buffers) {
+        SHR_DELETE(&al, s, sw);
+        return SHR_E_NO_MEMORY;
+    }
+    *s = (sw){.al = al, .budget = cache_bytes, .buffers = buffers, .nbuffers = max_buffers};
     shr_framebuffer_driver_init(out);
     out->user = s;
     out->caps.domains = SHR_MEMORY_CPU | SHR_MEMORY_DMA;
+    out->caps.max_buffers = max_buffers;
     out->execute = sw_execute;
     out->reset = sw_reset;
     return SHR_OK;
@@ -177,6 +197,7 @@ shr_status shr_software_driver_destroy(shr_framebuffer_driver *driver) {
     sw *s = driver->user;
     while (s->lru) entry_free(s, SHR_CONTAINER(s->lru, entry, lru));
     shr__alloc al = s->al;
+    SHR_FREE_ARRAY(&al, s->buffers, shr_image, s->nbuffers);
     SHR_DELETE(&al, s, sw);
     memset(driver, 0, sizeof(*driver));
     return SHR_OK;

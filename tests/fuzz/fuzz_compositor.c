@@ -4,8 +4,12 @@
  *   - presented frame ids only grow; a frame ends once (accepted, failed or superseded); only accepted frames
  *     are released (exactly once) or displayed; once settled, every frame a submission reported has ended
  *   - the driver only writes buffers the compositor owns; acquired surfaces always come back; an accepted
- *     submission's commands, destination and source pixels (images, composition) stay unchanged until its
- *     fence resolves
+ *     submission's commands, destination and the memory it reads (buffers it names, composition) stay unchanged
+ *     until its fence resolves
+ *   - buffer commands lead each batch with ids in 1..max_buffers, draws name registered ids (also after a failed
+ *     batch, which forgets every id or first runs its buffer commands, or a reset, which forgets every id), and a
+ *     driver keeping copies holds at most buffer_bytes at every REGISTER and draws what the images hold: every
+ *     change reached it through an UPDATE or REGISTER
  *   - no event is dropped, even with the smallest queue polled only now and then
  *   - once settled, the presented image equals a reference raster of the layer model (z, creation order,
  *     visibility, layer clipping, images with alpha), also rotated or converted
@@ -17,6 +21,8 @@
 #define NCMDS 6
 #define NIMAGES 3
 #define MAX_FRAMES 1024
+#define NIDS 16
+#define IMAGE_BYTES (8 * 8 * 4)
 
 enum { BUF_FREE, BUF_ACQUIRED, BUF_HELD };
 enum { FRAME_NONE, FRAME_ACCEPTED, FRAME_RELEASED, FRAME_ENDED };
@@ -57,7 +63,7 @@ typedef struct harness {
     shr_status acquire_result, present_result;
     uint64_t held[NBUF];
     int held_count;
-    bool release_on_present, reset_ok, async;
+    bool release_on_present, reset_ok, async, fail_late;
     int driver_fail, driver_block;
     shr_context *ctx;
     shr_fence pending;
@@ -72,6 +78,10 @@ typedef struct harness {
         uint64_t hash;
     } seen_src[16];
     int seen_srcs;
+    shr_driver_caps caps;
+    shr_image table[NIDS];          /* what each id names; with copies, the driver's copy */
+    const uint8_t *origin[NIDS];    /* with copies: the memory a REGISTER named */
+    uint8_t copies[NIDS][IMAGE_BYTES];
     uint8_t frames[MAX_FRAMES];
     bool submitted[MAX_FRAMES]; /* ids SHR_TRACE_SUBMIT reported */
     uint64_t last_accepted;
@@ -143,6 +153,81 @@ static uint64_t hash_bytes(const void *p, size_t n) {
     return v;
 }
 
+static bool copies(void) { return h.caps.buffer_flags & SHR_BUFFER_COPIES; }
+
+static size_t prologue_len(const shr_draw_cmd *cmds, size_t n) {
+    size_t i = 0;
+    while (i < n && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER) i++;
+    return i;
+}
+
+/* Applies a buffer command to `t`, as a driver keeping copies does when `copy`. */
+static void apply(shr_image *t, const shr_draw_cmd *c, bool copy) {
+    uint32_t k = c->buffer - 1;
+    if (c->kind == SHR_CMD_BUFFER_RELEASE) {
+        if (c->buffer && c->buffer <= NIDS) t[k] = (shr_image){0};
+        return;
+    }
+    FUZZ_CHECK(c->buffer >= 1 && c->buffer <= h.caps.max_buffers);
+    if (c->kind == SHR_CMD_BUFFER_REGISTER) {
+        FUZZ_CHECK(shr_image_validate(&c->src) == SHR_OK && c->src.byte_length <= IMAGE_BYTES);
+        t[k] = c->src;
+        if (!copy) return;
+        h.origin[k] = c->src.pixels;
+        memcpy(h.copies[k], c->src.pixels, c->src.byte_length);
+        t[k].pixels = h.copies[k];
+        uint64_t held = 0;
+        for (int i = 0; i < NIDS; i++) held += t[i].byte_length;
+        FUZZ_CHECK(!h.caps.buffer_bytes || held <= h.caps.buffer_bytes);
+        return;
+    }
+    FUZZ_CHECK(t[k].format && c->src_rect.x0 >= 0 && c->src_rect.y0 >= 0 && c->src_rect.x1 <= t[k].width &&
+               c->src_rect.y1 <= t[k].height && c->src_rect.x0 < c->src_rect.x1 && c->src_rect.y0 < c->src_rect.y1);
+    for (int32_t y = c->src_rect.y0; copy && y < c->src_rect.y1; y++) {
+        size_t at = (size_t)y * t[k].stride + (size_t)c->src_rect.x0 * 4;
+        memcpy(h.copies[k] + at, h.origin[k] + at, (size_t)(c->src_rect.x1 - c->src_rect.x0) * 4);
+    }
+}
+
+/* Runs a batch: its buffer prologue, then its draws from the table. */
+static void run_batch(const shr_surface *dst, const shr_draw_cmd *cmds, size_t n) {
+    size_t p = prologue_len(cmds, n);
+    for (size_t i = 0; i < p; i++) apply(h.table, &cmds[i], copies());
+    FUZZ_CHECK(shr_software_execute(dst, cmds + p, n - p, h.table, NIDS) == SHR_OK);
+}
+
+static void see(const void *pixels, size_t length) {
+    for (int k = 0; k < h.seen_srcs; k++)
+        if (h.seen_src[k].pixels == pixels) return;
+    FUZZ_CHECK(h.seen_srcs < 16);
+    h.seen_src[h.seen_srcs].pixels = pixels, h.seen_src[h.seen_srcs].length = length;
+    h.seen_src[h.seen_srcs++].hash = hash_bytes(pixels, length);
+}
+
+/* Remembers what the batch reads: COPY and ROTATE sources, and buffer memory (with copies only for REGISTER and
+ * UPDATE). */
+static void see_batch(const shr_draw_cmd *cmds, size_t n) {
+    shr_image after[NIDS];
+    memcpy(after, h.table, sizeof(after));
+    size_t p = prologue_len(cmds, n);
+    h.seen_srcs = 0;
+    for (size_t i = 0; i < p; i++) {
+        if (cmds[i].kind == SHR_CMD_BUFFER_UPDATE && copies()) {
+            const shr_image *m = &h.table[cmds[i].buffer - 1];
+            see(h.origin[cmds[i].buffer - 1], m->byte_length);
+        }
+        apply(after, &cmds[i], false);
+        if (cmds[i].kind == SHR_CMD_BUFFER_REGISTER) see(cmds[i].src.pixels, cmds[i].src.byte_length);
+    }
+    for (size_t i = p; i < n; i++) {
+        const shr_draw_cmd *c = &cmds[i];
+        if (c->kind == SHR_CMD_COPY || c->kind == SHR_CMD_ROTATE) see(c->src.pixels, c->src.byte_length);
+        if (c->kind != SHR_CMD_GLYPH && c->kind != SHR_CMD_IMAGE) continue;
+        FUZZ_CHECK(c->buffer >= 1 && c->buffer <= h.caps.max_buffers);
+        if (!copies()) see(after[c->buffer - 1].pixels, after[c->buffer - 1].byte_length);
+    }
+}
+
 static shr_status d_execute(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t n, shr_fence fence) {
     (void)user;
     int i = buf_index(dst->pixels);
@@ -150,6 +235,8 @@ static shr_status d_execute(void *user, const shr_surface *dst, const shr_draw_c
     FUZZ_CHECK(!h.pending);                             /* one submission at a time */
     if (h.driver_fail > 0) {
         h.driver_fail--;
+        for (size_t c = 0, p = prologue_len(cmds, n); h.fail_late && c < p; c++) apply(h.table, &cmds[c], copies());
+        if (!h.fail_late) memset(h.table, 0, sizeof(h.table));
         return SHR_E_DEVICE;
     }
     if (h.driver_block > 0) {
@@ -157,23 +244,14 @@ static shr_status d_execute(void *user, const shr_surface *dst, const shr_draw_c
         return SHR_E_WOULD_BLOCK;
     }
     if (!h.async || n > 512) {
-        FUZZ_CHECK(shr_software_execute(dst, cmds, n) == SHR_OK);
+        run_batch(dst, cmds, n);
         return SHR_OK;
     }
     h.pending = fence;
     h.pending_dst = dst, h.pending_cmds = cmds, h.pending_count = n;
     h.seen_dst = *dst;
     memcpy(h.seen_cmds, cmds, n * sizeof(*cmds));
-    h.seen_srcs = 0;
-    for (size_t c = 0; c < n; c++) {
-        const shr_image *src = &cmds[c].src;
-        bool known = cmds[c].kind < SHR_CMD_GLYPH || cmds[c].kind > SHR_CMD_ROTATE;
-        for (int k = 0; k < h.seen_srcs && !known; k++) known = h.seen_src[k].pixels == src->pixels;
-        if (known) continue;
-        FUZZ_CHECK(h.seen_srcs < 16);
-        h.seen_src[h.seen_srcs].pixels = src->pixels, h.seen_src[h.seen_srcs].length = src->byte_length;
-        h.seen_src[h.seen_srcs++].hash = hash_bytes(src->pixels, src->byte_length);
-    }
+    see_batch(cmds, n);
     return SHR_IN_PROGRESS;
 }
 
@@ -183,7 +261,7 @@ static void complete_pending(void) {
                !memcmp(h.seen_cmds, h.pending_cmds, h.pending_count * sizeof(*h.seen_cmds)));
     for (int k = 0; k < h.seen_srcs; k++)
         FUZZ_CHECK(hash_bytes(h.seen_src[k].pixels, h.seen_src[k].length) == h.seen_src[k].hash);
-    FUZZ_CHECK(shr_software_execute(h.pending_dst, h.pending_cmds, h.pending_count) == SHR_OK);
+    run_batch(h.pending_dst, h.pending_cmds, h.pending_count);
     shr_fence f = h.pending;
     h.pending = 0;
     shr_fence_signal(h.ctx, f, SHR_FENCE_SUCCEEDED);
@@ -193,6 +271,7 @@ static shr_status d_reset(void *user) {
     (void)user;
     if (!h.reset_ok) return SHR_E_DEVICE;
     h.pending = 0;
+    memset(h.table, 0, sizeof(h.table));
     return SHR_OK;
 }
 
@@ -251,7 +330,7 @@ static void release_one(bool lose_contents, bool displayed) {
 static void draw_model(const shr_surface *screen, shr_color clear) {
     shr_rect all = {0, 0, screen->width, screen->height};
     shr_draw_cmd c = {.kind = SHR_CMD_FILL, .dst = all, .color = clear};
-    FUZZ_CHECK(shr_software_execute(screen, &c, 1) == SHR_OK);
+    FUZZ_CHECK(shr_software_execute(screen, &c, 1, NULL, 0) == SHR_OK);
     bool done[NLAYERS] = {0};
     for (;;) {
         int k = -1;
@@ -273,16 +352,19 @@ static void draw_model(const shr_surface *screen, shr_color clear) {
                           (int32_t)(x1 < clip.x1 ? x1 : clip.x1), (int32_t)(y1 < clip.y1 ? y1 : clip.y1)};
             if (d.x0 >= d.x1 || d.y0 >= d.y1) continue;
             c = (shr_draw_cmd){.kind = SHR_CMD_FILL, .dst = d, .color = m->color};
+            shr_image table = {0};
             if (m->image) {
                 const mimage *im = &h.images[m->img];
                 /* Image pixel (0, 0) sits at the command's anchor. */
                 int64_t ax = (int64_t)l->rect.x0 + m->at.x, ay = (int64_t)l->rect.y0 + m->at.y;
-                c.kind = SHR_CMD_IMAGE;
-                c.src = (shr_image){im->px, im->w, im->h, (size_t)im->w * 4, sizeof(im->px), SHR_FORMAT_RGBA8888,
+                table = (shr_image){im->px, im->w, im->h, (size_t)im->w * 4, sizeof(im->px), SHR_FORMAT_RGBA8888,
                                     SHR_MEMORY_CPU};
+                c.kind = SHR_CMD_IMAGE;
+                c.buffer = 1;
+                c.src_rect = (shr_rect){0, 0, im->w, im->h};
                 c.src_origin = (shr_point){(int32_t)(d.x0 - ax), (int32_t)(d.y0 - ay)};
             }
-            FUZZ_CHECK(shr_software_execute(screen, &c, 1) == SHR_OK);
+            FUZZ_CHECK(shr_software_execute(screen, &c, 1, &table, 1) == SHR_OK);
         }
     }
 }
@@ -321,7 +403,7 @@ static void check_model(const shr_screen_desc *sd) {
                       .src = {logical, screen.width, screen.height, screen.stride, screen.byte_length, SHR_PIXEL_FORMAT,
                               SHR_MEMORY_CPU},
                       .rotation = sd->rotation};
-    FUZZ_CHECK(shr_software_execute(&o, &c, 1) == SHR_OK);
+    FUZZ_CHECK(shr_software_execute(&o, &c, 1, NULL, 0) == SHR_OK);
     FUZZ_CHECK(memcmp(expect, h.shown, o.byte_length) == 0);
 }
 
@@ -351,6 +433,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     shr_framebuffer_driver_init(&drv);
     drv.execute = d_execute, drv.reset = d_reset, drv.cancel = d_cancel;
     drv.caps.timeout_ns = (setup & 4) ? 1000 : 0;
+    drv.caps.max_buffers = (setup & 64) ? NIMAGES : NIDS; /* each image draws from one of its two buffers */
+    drv.caps.buffer_flags = (setup & 128) ? SHR_BUFFER_COPIES : 0;
+    drv.caps.buffer_bytes = (setup & 128) ? NIMAGES * IMAGE_BYTES : 0;
+    h.caps = drv.caps;
     shr_output out;
     shr_output_init(&out);
     out.flags = (h.release_on_present ? SHR_OUTPUT_RELEASE_ON_PRESENT : 0u) |
@@ -362,7 +448,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     cd.driver = &drv, cd.output = &out, cd.now_ns = clock_fn, cd.trace = trace_fn;
     cd.event_capacity = (setup & 16) ? 4 : 256;
     cd.max_unreleased_frames = 2;
-    cd.image_bytes = 2 * 8 * 8 * 4 + 64;
+    cd.image_bytes = 3 * IMAGE_BYTES + 64; /* a second buffer for some images */
     FUZZ_CHECK(shr_create(&cd, &h.ctx) == SHR_OK);
     shr_context *ctx = h.ctx;
     shr_screen_desc sd;
@@ -479,7 +565,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             h.acquire_result = arg % 4 == 0 ? SHR_E_WOULD_BLOCK : arg % 4 == 1 ? SHR_E_DEVICE : SHR_OK;
             break;
         case 17:
-            h.driver_fail = arg % 3, h.driver_block = (arg >> 2) % 3;
+            h.driver_fail = arg % 3, h.driver_block = (arg >> 2) % 3, h.fail_late = arg & 0x40;
             break;
         case 18:
             shr_output_ready(ctx);

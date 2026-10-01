@@ -21,10 +21,11 @@ static void rec_trace(void *user, const shr_trace_event *ev) {
 }
 
 static uint64_t budget_bytes;
+static shr_driver_caps caps; /* applied when max_buffers is set */
 static fail_alloc oom;
 static shr_allocator oom_allocator;
 static void tweak(shr_context_desc *d, shr_framebuffer_driver *drv) {
-    (void)drv;
+    if (caps.max_buffers) drv->caps = caps;
     memset(&rec, 0, sizeof(rec));
     d->trace = rec_trace;
     d->image_bytes = budget_bytes ? budget_bytes : d->image_bytes;
@@ -102,6 +103,20 @@ TEST test_image_budget(void) {
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 4, 4, px, 16, &a), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_release(a), SHR_OK);
     harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+
+    /* The budget counts the driver's padded rows; images beyond its buffer size are not made. */
+    budget_bytes = 64;
+    caps = (shr_driver_caps){.domains = SHR_MEMORY_CPU, .stride_align = 32, .max_buffers = HBUFS,
+                             .max_buffer_width = 8, .max_buffer_height = 8};
+    ctx = harness_open(&h, 0, tweak);
+    budget_bytes = 0;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 9, 1, px, 36, &b), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 1, 1, px, 4, &a), SHR_OK); /* 4 bytes, but a row of 32 */
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, px, 8, &b), SHR_E_LIMIT);
+    ASSERT_EQ_LL(shr_pl_res_image_release(a), SHR_OK);
+    harness_close(&h);
+    caps = (shr_driver_caps){0};
     ASSERT_EQ_LL(oom.live, 0);
     PASS();
 }
@@ -267,7 +282,8 @@ TEST test_image_update_damages_every_buffer(void) {
     PASS();
 }
 
-/* A frame reads the pixels until it ends: updates wait and release is deferred. */
+/* A frame reads the pixels it resolved until it ends, and release waits for it. An update meanwhile needs room
+ * for a second buffer in the budget. */
 TEST test_image_pinned_by_frames(void) {
     harness h;
     budget_bytes = 16;
@@ -281,7 +297,7 @@ TEST test_image_pinned_by_frames(void) {
     set_commands(l, 2, twice);
     h.drv.async = true;
     frame(ctx);
-    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){0, 0, 1, 1}, quad, 4), SHR_E_WOULD_BLOCK);
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){0, 0, 1, 1}, quad, 4), SHR_E_LIMIT);
     ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
     ASSERT_EQ_LL(shr_lyr_cmd_commit(l), SHR_OK); /* no command refers to it any more */
     ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
@@ -310,6 +326,98 @@ TEST test_image_pinned_by_frames(void) {
     PASS();
 }
 
+/* The memory the pending batch registered for buffer `id`. */
+static const uint8_t *pending_buffer(const harness *h, uint32_t id) {
+    for (size_t i = 0; i < h->drv.pending_count; i++)
+        if (h->drv.pending_cmds[i].kind == SHR_CMD_BUFFER_REGISTER && h->drv.pending_cmds[i].buffer == id)
+            return h->drv.pending_cmds[i].src.pixels;
+    return NULL;
+}
+
+/* An update while a frame reads the image goes to a second buffer: the frame in flight keeps the old pixels, the
+ * next frame draws the new ones. The two buffers then take turns, each brought level before it is written. */
+TEST test_image_double_buffer(void) {
+    harness h;
+    budget_bytes = 35;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak);
+    budget_bytes = 0;
+    shr_pl_res_image *img, *more;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &img), SHR_OK);
+    shr_lyr *l = image_layer(ctx, 0, img, (shr_rect){0, 0, 2, 2}, (shr_point){8, 8});
+    static const uint8_t green[4] = {0, 255, 0, 255}, blue[8] = {0, 0, 255, 255, 0, 0, 255, 255};
+    h.drv.async = true;
+    frame(ctx);
+    const uint8_t *first = pending_buffer(&h, 1);
+    uint8_t before[16];
+    memcpy(before, first, 16);
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){0, 0, 1, 1}, green, 4), SHR_OK);
+    ASSERT(memcmp(before, first, 16) == 0); /* the frame in flight still reads these */
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 1, 1, green, 4, &more), SHR_E_LIMIT); /* the budget counts both */
+    md_complete(&h.drv);
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 1 && px(h.out.shown, 8, 8) == RED);
+    frame(ctx);
+    const uint8_t *second = pending_buffer(&h, 2);
+    ASSERT(second && second != first);
+    md_complete(&h.drv);
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 2 && px(h.out.shown, 8, 8) == GREEN && px(h.out.shown, 9, 9) == BLUE);
+
+    frame(ctx); /* now the second buffer is read */
+    ASSERT_EQ_LL(h.drv.pending_count, 2);
+    memcpy(before, second, 16);
+    int updates = h.drv.updates;
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){0, 1, 2, 2}, blue, 8), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){1, 1, 2, 2}, green, 4), SHR_OK); /* in place */
+    ASSERT(memcmp(before, second, 16) == 0);
+    md_complete(&h.drv);
+    shr_pump(ctx);
+    frame(ctx);
+    ASSERT(h.drv.pending_count == 3 && h.drv.pending_cmds[0].kind == SHR_CMD_BUFFER_UPDATE);
+    shr_rect up = h.drv.pending_cmds[0].src_rect; /* the green pixel it missed and the new row */
+    ASSERT(h.drv.pending_cmds[0].buffer == 1 && up.x0 == 0 && up.y0 == 0 && up.x1 == 2 && up.y1 == 2);
+    md_complete(&h.drv);
+    shr_pump(ctx);
+    ASSERT(h.drv.updates == updates + 1 && px(h.out.shown, 8, 8) == GREEN && px(h.out.shown, 8, 9) == BLUE);
+    ASSERT_EQ_LL(px(h.out.shown, 9, 9), GREEN);
+
+    h.drv.async = false; /* not read by a frame: written in place */
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){1, 0, 2, 1}, green, 4), SHR_OK);
+    frame(ctx);
+    ASSERT_EQ_LL(px(h.out.shown, 9, 8), GREEN);
+    ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
+/* The second buffer may not be had: the update fails and changes nothing. */
+TEST test_image_second_buffer_out_of_memory(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak);
+    shr_pl_res_image *img;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &img), SHR_OK);
+    shr_lyr *l = image_layer(ctx, 0, img, (shr_rect){0, 0, 2, 2}, (shr_point){0, 0});
+    h.drv.async = true;
+    frame(ctx);
+    static const uint8_t green[4] = {0, 255, 0, 255};
+    oom.budget = 0;
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){0, 0, 1, 1}, green, 4), SHR_E_NO_MEMORY);
+    oom.budget = -1;
+    md_complete(&h.drv);
+    shr_pump(ctx);
+    shr_request_redraw(ctx);
+    h.drv.async = false;
+    frame(ctx);
+    ASSERT_EQ_LL(px(h.out.shown, 0, 0), RED);
+    ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -323,5 +431,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_image_update_arguments);
     RUN_TEST(test_image_update_damages_every_buffer);
     RUN_TEST(test_image_pinned_by_frames);
+    RUN_TEST(test_image_double_buffer);
+    RUN_TEST(test_image_second_buffer_out_of_memory);
     GREATEST_MAIN_END();
 }

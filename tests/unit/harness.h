@@ -14,6 +14,7 @@
 #define HW 64
 #define HH 48
 #define NBUF 3
+#define HBUFS 64 /* buffer ids of the mock driver */
 #define SCREEN_BPP (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? 2 : 4)
 
 typedef struct mock_output {
@@ -75,7 +76,10 @@ static inline uint64_t fake_clock(void *user) {
 }
 
 /* Runs commands on the software port, or, when async, keeps the compositor's own commands (no copy)
- * and runs them at md_complete(): the contract says they stay unchanged until the fence resolves. */
+ * and runs them at md_complete(): the contract says they stay unchanged until the fence resolves.
+ * The buffer prologue updates `buffers` (id k at [k - 1]) as the batch runs. A failed batch forgets them all, or
+ * with `fail_late` first applies its prologue, as a driver checking draws only after it may do. `budget` (0 = none)
+ * bounds the registered bytes like a driver keeping copies: a REGISTER beyond it fails the batch. */
 typedef struct mock_driver {
     int fail_next;
     int block_next;
@@ -89,7 +93,40 @@ typedef struct mock_driver {
     size_t pending_count;
     size_t last_count;
     shr_context *ctx;
+    shr_image buffers[HBUFS];
+    bool fail_late;
+    uint64_t budget;
+    int registers, updates, releases; /* buffer commands run */
+    shr_status completed;             /* of the last md_complete() */
 } mock_driver;
+
+static inline uint64_t md_held(const mock_driver *d) {
+    uint64_t n = 0;
+    for (int k = 0; k < HBUFS; k++) n += d->buffers[k].byte_length;
+    return n;
+}
+
+/* Runs the prologue, then (draw) the draws against the table. */
+static inline shr_status md_batch(mock_driver *d, const shr_surface *dst, const shr_draw_cmd *cmds, size_t n, bool draw) {
+    size_t i = 0;
+    for (; i < n && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER; i++) {
+        const shr_draw_cmd *c = &cmds[i];
+        if (c->kind != SHR_CMD_BUFFER_RELEASE && (!c->buffer || c->buffer > HBUFS)) return SHR_E_INVALID_ARG;
+        if (c->kind == SHR_CMD_BUFFER_REGISTER && d->budget &&
+            md_held(d) - d->buffers[c->buffer - 1].byte_length + c->src.byte_length > d->budget)
+            return SHR_E_UNSUPPORTED;
+        if (c->kind == SHR_CMD_BUFFER_REGISTER) d->buffers[c->buffer - 1] = c->src, d->registers++;
+        if (c->kind == SHR_CMD_BUFFER_UPDATE && !d->buffers[c->buffer - 1].format) return SHR_E_INVALID_ARG;
+        d->updates += c->kind == SHR_CMD_BUFFER_UPDATE;
+        if (c->kind == SHR_CMD_BUFFER_RELEASE && c->buffer && c->buffer <= HBUFS) d->buffers[c->buffer - 1] = (shr_image){0};
+        d->releases += c->kind == SHR_CMD_BUFFER_RELEASE;
+    }
+    return draw ? shr_software_execute(dst, cmds + i, n - i, d->buffers, HBUFS) : SHR_OK;
+}
+
+static inline shr_status md_run(mock_driver *d, const shr_surface *dst, const shr_draw_cmd *cmds, size_t n) {
+    return md_batch(d, dst, cmds, n, true);
+}
 
 static inline shr_status md_execute(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t n, shr_fence fence) {
     mock_driver *d = user;
@@ -97,6 +134,8 @@ static inline shr_status md_execute(void *user, const shr_surface *dst, const sh
     d->last_count = n;
     if (d->fail_next > 0) {
         d->fail_next--;
+        if (d->fail_late) md_batch(d, dst, cmds, n, false);
+        else memset(d->buffers, 0, sizeof(d->buffers));
         return SHR_E_DEVICE;
     }
     if (d->block_next > 0) {
@@ -104,7 +143,7 @@ static inline shr_status md_execute(void *user, const shr_surface *dst, const sh
         return SHR_E_WOULD_BLOCK;
     }
     if (dst->domain == SHR_MEMORY_DEVICE) return SHR_OK;
-    if (!d->async) return shr_software_execute(dst, cmds, n);
+    if (!d->async) return md_run(d, dst, cmds, n);
     d->pending = fence;
     d->pending_dst = dst;
     d->pending_cmds = cmds;
@@ -114,7 +153,7 @@ static inline shr_status md_execute(void *user, const shr_surface *dst, const sh
 
 static inline void md_complete(mock_driver *d) {
     if (!d->pending) return;
-    shr_software_execute(d->pending_dst, d->pending_cmds, d->pending_count);
+    d->completed = md_run(d, d->pending_dst, d->pending_cmds, d->pending_count);
     shr_fence f = d->pending;
     d->pending = 0;
     shr_fence_signal(d->ctx, f, SHR_FENCE_SUCCEEDED);
@@ -125,6 +164,7 @@ static inline shr_status md_reset(void *user) {
     d->resets++;
     if (!d->reset_ok) return SHR_E_DEVICE;
     d->pending = 0;
+    memset(d->buffers, 0, sizeof(d->buffers));
     return SHR_OK;
 }
 
@@ -142,6 +182,7 @@ static inline void harness_desc(harness *h, uint32_t output_flags, shr_output *o
     h->out.w = HW, h->out.h = HH, h->out.format = SHR_PIXEL_FORMAT;
     shr_framebuffer_driver_init(&h->driver);
     h->driver.user = &h->drv;
+    h->driver.caps.max_buffers = HBUFS;
     h->driver.execute = md_execute;
     h->driver.reset = md_reset;
     shr_output_init(out);

@@ -141,7 +141,12 @@ shr_status shr_pl_res_bitmap_font_create(shr_context *ctx, const shr_pl_res_bitm
     builtin->src.size = shr__builtin_package_size;
     const char *why;
     shr__pkg_map(builtin, shr__builtin_package, shr__builtin_package_size, &why); /* checked by the build */
-    shr__res_attach(ctx, &f->res, &font_ops);                                     /* not refused: checked above */
+    shr_status st = shr__pages_builtin(builtin);
+    if (st != SHR_OK) {
+        font_free(f);
+        return st;
+    }
+    shr__res_attach(ctx, &f->res, &font_ops); /* not refused: checked above */
     *out = f;
     return SHR_OK;
 }

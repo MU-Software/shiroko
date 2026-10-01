@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     const char *font_dir = argc > 2 ? argv[2] : "build/host/fonts";
     image_output out = {calloc((size_t)W * H, BPP), 0};
     shr_framebuffer_driver drv;
-    check("driver", shr_software_driver_create(NULL, 1u << 20, &drv), NULL);
+    check("driver", shr_software_driver_create(NULL, 1u << 20, 256, &drv), NULL);
     shr_output output;
     shr_output_init(&output);
     output.user = &out;
