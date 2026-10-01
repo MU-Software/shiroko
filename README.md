@@ -11,6 +11,7 @@ SPDX-License-Identifier: MIT (see `LICENSE`; third-party notices in `NOTICE`).
   `greatest` and `stb` (PNG output) for tests)
 - [uv](https://docs.astral.sh/uv/) for the Python tools (`pyproject.toml`, `uv.lock`, `.python-version`)
 - Docker for the Linux sanitizer, fuzz and x86_64 GCC targets (`make sanitizer-image gcc-image`)
+- For `make desktop-run` only: SDL3 and a shared ANGLE, both through vcpkg (preset `desktop`)
 - For `make vt-run` only: Zig 0.16.0 (`brew install zig`) and the `third_party/ghostty` submodule
 
 On macOS: `brew install cmake uv zig`.
@@ -58,6 +59,7 @@ make render-test   # render comparison suite (goldens, reftests)
 make render-export # every scene as PNG into build/render (RENDER_ARGS='--frames 100' times them instead)
 make headless-run  # render examples/headless into a PPM image
 make vt-run        # libghostty-vt consumer example
+make desktop-run   # SDL3 window, software and ANGLE drivers (DESKTOP_ARGS='--load scroll --frames 300 --quit')
 make bench         # per-part throughput (BENCH=software|compositor|tilemap|font|image|terminal filters;
                    #   SHR_BENCH_SECONDS=5 lengthens one case for a profiler)
 make test-asan test-ubsan test-tsan   # host sanitizers (Apple Clang or the host compiler)
@@ -107,6 +109,22 @@ GPUs blend; a GPU that blends 16-bit targets at reduced precision (Metal) still 
 one level off.
 `test_angle` compares both drivers and skips (exit code 77) without an EGL display. The library is installed but not
 exported in `shirokoConfig.cmake`.
+
+## Desktop example (SDL3)
+
+`examples/desktop` (`-DSHIROKO_EXAMPLE_DESKTOP=ON`, vcpkg feature `desktop`: SDL3; preset `desktop`, RelWithDebInfo with
+`SHIROKO_PORT_ANGLE`) shows the `tests/render` scenes and full-window load modes (`scroll`, `churn`, `restyle`, `blink`,
+`images`) in a window. Tab switches between the software driver (an SDL_Renderer streaming texture) and the ANGLE
+driver (SDL's OpenGL ES 3.0 context; the composition is a GPU surface blitted to the window). SDL loads ANGLE itself,
+so the preset uses the overlay triplet in `cmake/triplets` (arm64-osx for now: static, except ANGLE as a shared library) and the
+executable finds it through its rpath; with a static ANGLE the example is software only. `SHIROKO_ANGLE_BACKEND` picks
+the backend as for `shr_angle_offscreen_create()`.
+
+Each frame reports its render time (the scene's changes, submit and pump until presented, plus `glFinish` with ANGLE)
+and its present time (texture upload or blit, and the swap) separately: the first frame alone, and p50/p95/p99/max over
+the last 100 and 1000 frames, in the window title and on stdout. `--driver`, `--scene`/`--load`, `--frames N --quit`
+and `--toggle-every K` script a run; `--help` lists the options and keys. With vsync off, macOS still holds a window
+to the display rate, so frames shorter than that wait in present instead.
 
 ## Using an installed Shiroko
 

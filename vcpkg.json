@@ -34,6 +34,12 @@
       "dependencies": [
         "stb"
       ]
+    },
+    "desktop": {
+      "description": "SDL3 desktop example (examples/desktop)",
+      "dependencies": [
+        "sdl3"
+      ]
     }
   },
   "license": "MIT"

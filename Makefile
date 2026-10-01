@@ -5,7 +5,7 @@
 .PHONY: test core-test render-test render-export headless-run bench tools-env fontpack-fetch fontpack fontpack-locales \
         test-asan test-ubsan test-tsan sanitizer-image test-asan-linux test-lsan-linux test-msan-linux \
         test-tsan-linux test-ubsan-linux test-hwasan-linux test-rtsan-linux test-sanitizers \
-        fuzz fuzz-msan vt-run coverage test-gcc gcc-image clean
+        fuzz fuzz-msan vt-run desktop-run coverage test-gcc gcc-image clean
 
 COMMA := ,
 NPROC := $(shell getconf _NPROCESSORS_ONLN)
@@ -188,6 +188,12 @@ vt-run: $(FETCHED)
 	cmake -S examples/vt -B build/vt-example $(CMAKE_HOST) -DCMAKE_BUILD_TYPE=Release
 	cmake --build build/vt-example --target shiroko_vt shiroko_fonts
 	./build/vt-example/shiroko_vt build/vt-example/shiroko-vt build/vt-example/fonts examples/vt/fixture.ans
+
+# SDL3 window with the software and ANGLE drivers; DESKTOP_ARGS adds options (e.g. --load scroll --frames 300 --quit).
+desktop-run: $(FETCHED)
+	cmake --preset desktop $(CMAKE_HOST)
+	cmake --build --preset desktop --target shiroko_desktop shiroko_fonts
+	./build/desktop/examples/desktop/shiroko_desktop $(DESKTOP_ARGS)
 
 gcc-image:
 	docker build --platform linux/amd64 -t shiroko-gcc --build-context tools=. docker/gcc

@@ -32,7 +32,7 @@ set(CMAKE_CXX_STANDARD 17)
 shiroko_test(test_cpp unit/test_cpp.cpp)
 # Render comparison (tests/render): goldens and reftests on the software driver; `--backend angle` against it.
 find_path(STB_INCLUDE_DIR stb_image_write.h REQUIRED)
-shiroko_test(test_render render/test_render.c render/scenes.c render/png.c)
+shiroko_test(test_render render/test_render.c render/stage.c render/scenes.c render/png.c)
 target_include_directories(test_render SYSTEM PRIVATE ${STB_INCLUDE_DIR})
 target_compile_definitions(test_render PRIVATE SHR_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/render"
   SHR_UCD_DIR="${SHIROKO_UCD_CACHE}" SHR_RENDER_OUT="${PROJECT_SOURCE_DIR}/build/render")

@@ -87,6 +87,8 @@ shr_pl_res_image *stage_image(stage *s, int32_t w, int32_t h, const uint8_t *rgb
 void stage_text(stage *s, shr_lyr *l, int32_t row, int32_t col, const char *utf8, shr_text_style style, uint32_t flags);
 void stage_cell(stage *s, shr_lyr *l, int32_t row, int32_t col, const char *utf8, uint32_t span, shr_text_style style);
 void stage_fill(stage *s, shr_lyr *l, shr_rect r, shr_color c);
+/* Opens package `name` from `font_dir` as a scene with `flags` sees it (FONTS_NONE, FONTS_LATIN, FONTS_ASYNC). */
+shr_status stage_open_package(stage *s, uint32_t flags, const char *font_dir, const char *name, shr_asset_source *out);
 /* Completes every held read (more may follow) until none is left. */
 shr_status stage_release_reads(stage *s);
 
