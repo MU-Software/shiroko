@@ -13,6 +13,7 @@
 
 #include "check.h"
 #include "raster.h"
+#include "shr_glyph.h"
 
 static const shr_pixel_format FMTS[2] = {SHR_FORMAT_RGB565, SHR_FORMAT_RGBX8888};
 
@@ -239,6 +240,292 @@ TEST glyph_a8_dim_keeps_faint_coverage(void) {
         ASSERT_EQ_LL(raw(&s, 1, 0), mix(FMTS[i], 0xFFFFFF, black, 1));
         ASSERT_EQ_LL(raw(&s, 2, 0), mix(FMTS[i], 0xFFFFFF, black, 128));
     }
+    PASS();
+}
+
+/* ---- BOLD and ITALIC synthesis ---- */
+
+static uint32_t rng = 0x9E3779B9u;
+static uint32_t rnd(void) { return rng ^= (rng & 0x7FFFFu) << 13, rng ^= rng >> 17, rng ^= (rng & 0x7FFFFFFu) << 5; }
+
+/* Coverage bytes with long runs of 0 and 255, so the BOLD gap rule meets every case. */
+static void coverage_noise(uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t v = rnd();
+        p[i] = (uint8_t)(v % 4 == 0 ? 0 : v % 4 == 1 ? 0xFF : v >> 8);
+    }
+}
+
+/* The shiroko_driver.h formula, written independently: the BOLD row first, then the shear. */
+static uint32_t ref_in(const shr_image *m, int32_t x, int32_t y) {
+    if (x < 0 || x >= m->width || y < 0 || y >= m->height) return 0;
+    const uint8_t *row = (const uint8_t *)m->pixels + (size_t)y * m->stride;
+    return m->format == SHR_FORMAT_A8 ? row[x] : 17u * (x % 2 ? row[x / 2] & 15u : row[x / 2] >> 4u);
+}
+
+/* Coverage of columns [xa, xa + n) of src row y; n <= 64. */
+static void ref_row(const shr_image *m, uint32_t flags, int32_t axis, int32_t y, int32_t xa, int32_t n, uint32_t *out) {
+    int32_t k = 0, f = 0;
+    if (flags & SHR_GLYPH_ITALIC) {
+        int32_t t = SHR_GLYPH_SLANT / 2 * (axis - 2 * y - 1);
+        k = t >= 0 ? t / 256 : -((255 - t) / 256);
+        f = t - 256 * k;
+    }
+    uint32_t b[65]; /* b[i] = b(xa - k - 1 + i) */
+    for (int32_t i = 0; i <= n; i++) {
+        int32_t x = xa - k - 1 + i;
+        uint32_t l = ref_in(m, x - 1, y), c = ref_in(m, x, y), r = ref_in(m, x + 1, y);
+        b[i] = !(flags & SHR_GLYPH_BOLD) ? c : r > c ? c : c > l ? c : l;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        uint32_t c = (b[i + 1] * (uint32_t)(256 - f) + b[i] * (uint32_t)f + 128) >> 8;
+        out[i] = flags & SHR_GLYPH_DIM ? (c + 1) >> 1 : c;
+    }
+}
+
+TEST synth_hand_vectors(void) {
+    int32_t k, f;
+    shr__slant(11, 0, &k, &f);
+    ASSERT_EQ_LL(k, 1);
+    ASSERT_EQ_LL(f, 14);
+    static const uint8_t gap[5] = {0, 255, 0, 255, 0}, dot[2] = {255, 255};
+    static const uint8_t a4[2] = {0xFF, 0x0F}; /* 255 255 0, pad 15 */
+    const uint32_t B = SHR_GLYPH_BOLD, I = SHR_GLYPH_ITALIC, D = SHR_GLYPH_DIM;
+    const struct {
+        shr_image src;
+        uint32_t flags;
+        int32_t axis, x0, n;
+        uint8_t want[2][6];
+    } v[] = {
+        {{gap, 5, 1, 5, 5, SHR_FORMAT_A8, 0}, B, 0, 0, 6, {{0, 255, 0, 255, 255, 0}}},
+        {{dot, 1, 1, 1, 1, SHR_FORMAT_A8, 0}, I, 11, 1, 2, {{241, 14}}},
+        {{dot, 1, 1, 1, 1, SHR_FORMAT_A8, 0}, I | D, 11, 1, 2, {{121, 7}}},
+        {{dot, 1, 1, 1, 1, SHR_FORMAT_A8, 0}, B | I, 11, 1, 3, {{241, 255, 14}}},
+        {{a4, 3, 1, 2, 2, SHR_FORMAT_A4, 0}, B, 0, 0, 4, {{255, 255, 255, 0}}},
+        /* Rows 0 and 1 shift by 1 + 14/256 and 216/256: the footprint takes k(1) on the left, k(0) on the right. */
+        {{dot, 1, 2, 1, 2, SHR_FORMAT_A8, 0}, I, 11, 0, 3, {{0, 241, 14}, {40, 215, 0}}},
+    };
+    for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+        int32_t x0, x1, h = v[i].src.height;
+        shr__glyph_footprint(v[i].src.width, h, v[i].flags, v[i].axis, &x0, &x1);
+        ASSERT_EQ_LL(x0, v[i].x0);
+        ASSERT_EQ_LL(x1, v[i].x0 + v[i].n);
+        uint8_t buf[2 * 6 * 4];
+        shr_surface s = packed(buf, SHR_FORMAT_RGBX8888, v[i].n, h);
+        shr_draw_cmd c[2] = {fill((shr_rect){0, 0, v[i].n, h}, 0),
+                             glyph((shr_rect){0, 0, v[i].n, h}, SHR_RGB(255, 255, 255), v[i].src, (shr_point){x0, 0})};
+        c[1].flags = v[i].flags, c[1].slant_axis = v[i].axis;
+        ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+        for (int32_t y = 0; y < h; y++)
+            for (int32_t x = 0; x < v[i].n; x++) ASSERT_EQ_LL(buf[4 * (y * v[i].n + x)], v[i].want[y][x]);
+    }
+    PASS();
+}
+
+TEST synth_matches_the_spec_reference(void) {
+    static const int32_t widths[] = {1, 2, 5, 7, 8}, heights[] = {1, 4, 9};
+    static const shr_pixel_format srcs[2] = {SHR_FORMAT_A8, SHR_FORMAT_A4};
+    uint8_t px[9 * 10], ink[sizeof(px)], buf[67 * 9 * 4];
+    uint32_t want[64];
+    memset(ink, 255, sizeof(ink));
+    for (int sf = 0; sf < 2; sf++)
+        for (int wi = 0; wi < 5; wi++)
+            for (int hi = 0; hi < 3; hi++) {
+                int32_t w = widths[wi], h = heights[hi];
+                size_t stride = (sf ? (size_t)(w + 1) / 2 : (size_t)w) + rnd() % 3;
+                coverage_noise(px, sizeof(px)); /* the A4 padding nibble too */
+                shr_image m = {px, w, h, stride, stride * (size_t)h, srcs[sf], 0}, solid = m;
+                solid.pixels = ink;
+                const int32_t axes[] = {-40, -1, 0, 1, h, 2 * h - 1, 2 * h, 2 * h + 1, 3 * h + 37};
+                for (uint32_t flags = 0; flags < 8; flags++)
+                    for (int ai = 0; ai < 9; ai++) {
+                        int32_t axis = axes[ai], x0, x1;
+                        shr__glyph_footprint(w, h, flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC), axis, &x0, &x1);
+                        int32_t fw = x1 - x0;
+                        ASSERT(fw + 4 <= 64);
+                        /* Nothing is drawn outside the footprint, and a fully inked source fills it to both ends. */
+                        int32_t left = INT32_MAX, right = INT32_MIN;
+                        for (int32_t y = 0; y < h; y++) {
+                            uint32_t edge[2];
+                            ref_row(&m, flags, axis, y, x0 - 1, 1, edge), ref_row(&m, flags, axis, y, x1, 1, edge + 1);
+                            ASSERT_EQ_LL(edge[0] | edge[1], 0);
+                            ref_row(&solid, flags, axis, y, x0 - 2, fw + 4, want);
+                            for (int32_t x = x0 - 2; x < x1 + 2; x++)
+                                if (want[x - x0 + 2]) left = x < left ? x : left, right = x > right ? x : right;
+                        }
+                        ASSERT_EQ_LL(left, x0);
+                        ASSERT_EQ_LL(right, x1 - 1);
+                        for (int fi = 0; fi < 2; fi++) {
+                            shr_surface s = packed(buf, FMTS[fi], fw + 3, h);
+                            shr_draw_cmd c[2] = {fill((shr_rect){0, 0, fw + 3, h}, 0),
+                                                 glyph((shr_rect){3, 0, fw + 3, h}, SHR_RGB(255, 255, 255), m,
+                                                       (shr_point){x0, 0})};
+                            c[1].flags = flags, c[1].slant_axis = axis;
+                            ASSERT_EQ_LL(shr_software_execute(&s, c, 2), SHR_OK);
+                            for (int32_t y = 0; y < h; y++) {
+                                ref_row(&m, flags, axis, y, x0, fw, want);
+                                for (int32_t x = 0; x < fw; x++)
+                                    ASSERT_EQ_LL(raw(&s, x + 3, y), mix(FMTS[fi], 0xFFFFFF, enc(FMTS[fi], 0), want[x]));
+                            }
+                        }
+                    }
+            }
+    PASS();
+}
+
+TEST synth_is_clip_invariant(void) {
+    enum { W = 7, H = 6, SW = 16, SH = 9 };
+    uint8_t px[5 * H];
+    coverage_noise(px, sizeof(px));
+    shr_image m = {px, W, H, 5, sizeof(px), SHR_FORMAT_A4, 0};
+    const uint32_t flags = SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC | SHR_GLYPH_DIM;
+    int32_t x0, x1;
+    shr__glyph_footprint(W, H, flags, 5, &x0, &x1);
+    shr_rect d = {2, 1, 2 + x1 - x0, 1 + H};
+    ASSERT(d.x1 <= SW);
+    shr_draw_cmd whole = glyph(d, SHR_RGB(250, 200, 30), m, (shr_point){x0, 0});
+    whole.flags = flags, whole.slant_axis = 5;
+    for (int fi = 0; fi < 2; fi++) {
+        uint8_t init[SW * SH * 4], ref[sizeof(init)], out[sizeof(init)];
+        coverage_noise(init, sizeof(init));
+        memcpy(ref, init, sizeof(init)), memcpy(out, init, sizeof(init));
+        shr_surface rs = packed(ref, FMTS[fi], SW, SH), os = packed(out, FMTS[fi], SW, SH);
+        ASSERT_EQ_LL(shr_software_execute(&rs, &whole, 1), SHR_OK);
+        /* The same glyph in 3 x 2 tiles, each with its own src_origin. */
+        shr_draw_cmd tiles[16];
+        size_t n = 0;
+        for (int32_t y = d.y0; y < d.y1; y += 2)
+            for (int32_t x = d.x0; x < d.x1; x += 3) {
+                shr_rect t = {x, y, x + 3 < d.x1 ? x + 3 : d.x1, y + 2};
+                tiles[n] = whole;
+                tiles[n].dst = t, tiles[n++].src_origin = (shr_point){x0 + x - d.x0, y - d.y0};
+            }
+        ASSERT_EQ_LL(shr_software_execute(&os, tiles, n), SHR_OK);
+        ASSERT_MEM_EQ(ref, out, sizeof(ref));
+        /* Moved by an origin and limited to a clip, as a cached group is drawn. */
+        uint8_t win[5 * 4 * 4];
+        shr_surface ws = packed(win, FMTS[fi], 5, 4);
+        for (int32_t y = 0; y < 4; y++) memcpy(win + (size_t)y * ws.stride, init + (size_t)(y + 2) * rs.stride + 3 * bpp(FMTS[fi]), ws.stride);
+        shr__raster_draw(&ws, &whole, (shr_point){3, 2}, (shr_rect){0, 0, 5, 4});
+        for (int32_t y = 0; y < 4; y++)
+            for (int32_t x = 0; x < 5; x++) ASSERT_EQ_LL(raw(&ws, x, y), raw(&rs, x + 3, y + 2));
+        /* Through the caching driver, missing and then hitting. */
+        shr_draw_cmd g[4] = {begin(77, (shr_rect){0, 0, SW, SH}, (shr_rect){3, 2, 9, 6}), fill((shr_rect){0, 0, SW, SH}, SHR_RGB(9, 40, 90)),
+                             whole, end()};
+        memcpy(ref, init, sizeof(init));
+        ASSERT_EQ_LL(shr_software_execute(&rs, g, 4), SHR_OK);
+        shr_framebuffer_driver drv;
+        ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, &drv), SHR_OK);
+        for (int pass = 0; pass < 2; pass++) {
+            memcpy(out, init, sizeof(init));
+            ASSERT_EQ_LL(drv.execute(drv.user, &os, g, 4, 1), SHR_OK);
+            ASSERT_MEM_EQ(ref, out, sizeof(ref));
+        }
+        ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
+    }
+    PASS();
+}
+
+TEST synth_sources_stay_in_the_footprint(void) {
+    uint8_t buf[8 * 2 * 4], px[4 * 2];
+    coverage_noise(px, sizeof(px));
+    shr_surface s = packed(buf, SHR_FORMAT_RGBX8888, 8, 2);
+    shr_image m = {px, 4, 2, 4, sizeof(px), SHR_FORMAT_A8, 0};
+    static const uint32_t styles[3] = {SHR_GLYPH_BOLD, SHR_GLYPH_ITALIC, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC};
+    static const int32_t axes[3] = {-9, 3, 20};
+    for (int i = 0; i < 3; i++)
+        for (int a = 0; a < 3; a++) {
+            int32_t x0, x1;
+            shr__glyph_footprint(4, 2, styles[i], axes[a], &x0, &x1);
+            const struct {
+                int32_t ox, oy, w, h;
+                shr_status want;
+            } e[] = {
+                {x0, 0, x1 - x0, 2, SHR_OK},         {x0 - 1, 0, x1 - x0, 2, SHR_E_INVALID_ARG},
+                {x0, 0, x1 - x0 + 1, 2, SHR_E_INVALID_ARG}, {x0, -1, x1 - x0, 1, SHR_E_INVALID_ARG},
+                {x0, 1, x1 - x0, 2, SHR_E_INVALID_ARG}, {x1, 0, 0, 2, SHR_OK},
+            };
+            for (size_t k = 0; k < sizeof(e) / sizeof(e[0]); k++) {
+                shr_draw_cmd c[2] = {fill((shr_rect){0, 0, 8, 2}, 0),
+                                     glyph((shr_rect){0, 0, e[k].w, e[k].h}, SHR_RGB(255, 255, 255), m,
+                                           (shr_point){e[k].ox, e[k].oy})};
+                c[1].flags = styles[i], c[1].slant_axis = axes[a];
+                ASSERT_EQ_LL(shr_software_execute(&s, c, 2), e[k].want);
+            }
+        }
+    PASS();
+}
+
+/* Sizes and axis bounds, checked before the footprint is computed; BOLD alone ignores the axis. */
+TEST synth_size_and_axis_limits(void) {
+    static uint8_t big[1025];
+    uint8_t buf[8 * 2 * 4] = {0}, other[sizeof(buf)] = {0}, px[4 * 2];
+    coverage_noise(px, sizeof(px));
+    shr_surface s = packed(buf, SHR_FORMAT_RGBX8888, 8, 2), os = packed(other, SHR_FORMAT_RGBX8888, 8, 2);
+    const struct {
+        int32_t w, h;
+        uint32_t flags;
+        int32_t axis;
+        shr_status want;
+    } lim[] = {
+        {1024, 1, SHR_GLYPH_BOLD, 0, SHR_OK},
+        {1025, 1, SHR_GLYPH_BOLD, 0, SHR_E_INVALID_ARG},
+        {1, 1024, SHR_GLYPH_BOLD, 0, SHR_OK},
+        {1, 1025, SHR_GLYPH_BOLD, 0, SHR_E_INVALID_ARG},
+        {1, 1025, SHR_GLYPH_DIM, 0, SHR_OK},
+        {1, 1, SHR_GLYPH_ITALIC, 4096, SHR_OK},
+        {1, 1, SHR_GLYPH_ITALIC, -4096, SHR_OK},
+        {1, 1, SHR_GLYPH_ITALIC, 4097, SHR_E_INVALID_ARG},
+        {1, 1, SHR_GLYPH_ITALIC, -4097, SHR_E_INVALID_ARG},
+        {1, 1, SHR_GLYPH_ITALIC, INT32_MAX, SHR_E_INVALID_ARG},
+        {1, 1, SHR_GLYPH_ITALIC, INT32_MIN, SHR_E_INVALID_ARG},
+        {1, 1, SHR_GLYPH_BOLD, INT32_MAX, SHR_OK},
+        {1, 1, SHR_GLYPH_BOLD, INT32_MIN, SHR_OK},
+    };
+    for (size_t k = 0; k < sizeof(lim) / sizeof(lim[0]); k++) {
+        int32_t x0 = 0, x1, axis = lim[k].axis;
+        if (axis >= -4097 && axis <= 4097) /* so that only the bound rejects 4097 */
+            shr__glyph_footprint(lim[k].w, lim[k].h, lim[k].flags & SHR_GLYPH_ITALIC, axis, &x0, &x1);
+        shr_draw_cmd c = glyph((shr_rect){0, 0, 1, 1}, SHR_RGB(255, 255, 255),
+                               (shr_image){big, lim[k].w, lim[k].h, (size_t)lim[k].w, sizeof(big), SHR_FORMAT_A8, 0},
+                               (shr_point){x0, 0});
+        c.flags = lim[k].flags, c.slant_axis = axis;
+        ASSERT_EQ_LL(shr_software_execute(&s, &c, 1), lim[k].want);
+    }
+    shr_image m = {px, 4, 2, 4, sizeof(px), SHR_FORMAT_A8, 0};
+    shr_draw_cmd b[2] = {fill((shr_rect){0, 0, 8, 2}, 0),
+                         glyph((shr_rect){0, 0, 5, 2}, SHR_RGB(255, 255, 255), m, (shr_point){0, 0})};
+    b[1].flags = SHR_GLYPH_BOLD;
+    ASSERT_EQ_LL(shr_software_execute(&s, b, 2), SHR_OK);
+    b[1].slant_axis = INT32_MIN;
+    ASSERT_EQ_LL(shr_software_execute(&os, b, 2), SHR_OK);
+    ASSERT_MEM_EQ(buf, other, sizeof(buf));
+    PASS();
+}
+
+/* BOLD and ITALIC mean nothing to an IMAGE; a source without columns has no coverage; a rejected batch writes
+ * nothing. */
+TEST synth_edge_sources(void) {
+    uint8_t buf[8 * 2 * 4] = {0}, zero[sizeof(buf)] = {0}, px[4 * 2];
+    coverage_noise(px, sizeof(px));
+    shr_surface s = packed(buf, SHR_FORMAT_RGBX8888, 8, 2);
+    uint8_t rgba[4] = {1, 2, 3, 255};
+    shr_draw_cmd img = with_src(SHR_CMD_IMAGE, (shr_rect){0, 0, 1, 1},
+                                (shr_image){rgba, 1, 1, 4, 4, SHR_FORMAT_RGBA8888, 0}, (shr_point){-1, 0});
+    img.flags = SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC;
+    ASSERT_EQ_LL(shr_software_execute(&s, &img, 1), SHR_E_INVALID_ARG);
+    shr_image none = {NULL, 0, 2, 0, 0, SHR_FORMAT_A8, 0};
+    shr_draw_cmd empty[2] = {glyph((shr_rect){0, 0, 1, 2}, SHR_RGB(255, 255, 255), none, (shr_point){0, 0}),
+                             glyph((shr_rect){1, 0, 2, 2}, SHR_RGB(255, 255, 255), none, (shr_point){-1, 0})};
+    empty[0].flags = SHR_GLYPH_BOLD, empty[1].flags = SHR_GLYPH_ITALIC;
+    ASSERT_EQ_LL(shr_software_execute(&s, empty, 2), SHR_OK);
+    ASSERT_MEM_EQ(zero, buf, sizeof(buf));
+    shr_image m = {px, 4, 2, 4, sizeof(px), SHR_FORMAT_A8, 0};
+    shr_draw_cmd bad[3] = {fill((shr_rect){0, 0, 8, 2}, SHR_RGB(9, 9, 9)),
+                           glyph((shr_rect){0, 0, 5, 2}, SHR_RGB(255, 255, 255), m, (shr_point){0, 0})};
+    bad[1].flags = SHR_GLYPH_BOLD, bad[2] = bad[1], bad[2].src_origin.x = -1;
+    ASSERT_EQ_LL(shr_software_execute(&s, bad, 3), SHR_E_INVALID_ARG);
+    ASSERT_MEM_EQ(zero, buf, sizeof(buf));
     PASS();
 }
 
@@ -1082,6 +1369,12 @@ int main(int argc, char **argv) {
     RUN_TEST(rgb565_blends_round_once_for_every_input);
     RUN_TEST(glyph_a4_nibbles_origin_and_dim);
     RUN_TEST(glyph_a8_dim_keeps_faint_coverage);
+    RUN_TEST(synth_hand_vectors);
+    RUN_TEST(synth_matches_the_spec_reference);
+    RUN_TEST(synth_is_clip_invariant);
+    RUN_TEST(synth_sources_stay_in_the_footprint);
+    RUN_TEST(synth_size_and_axis_limits);
+    RUN_TEST(synth_edge_sources);
     RUN_TEST(image_is_straight_alpha_source_over);
     RUN_TEST(copy_converts_between_formats);
     RUN_TEST(copy_scrolls_within_one_surface);

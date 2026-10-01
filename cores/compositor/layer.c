@@ -127,7 +127,8 @@ shr_status shr_lyr_destroy(shr_lyr *l) {
 static shr_status validate(const shr__lcmd *c, size_t n) {
     bool open = false;
     for (size_t i = 0; i < n; i++) {
-        if (!shr__rect_valid(c[i].dst) || (c[i].flags & ~(uint32_t)(SHR__LCMD_DIM | SHR__LCMD_BLINK)) ||
+        if (!shr__rect_valid(c[i].dst) ||
+            (c[i].flags & ~(uint32_t)(SHR__LCMD_DIM | SHR__LCMD_BOLD | SHR__LCMD_ITALIC | SHR__LCMD_BLINK)) ||
             (uses_res(&c[i]) && !c[i].res))
             return SHR_E_INVALID_ARG;
         if (c[i].kind == SHR__LCMD_CACHE_BEGIN || c[i].kind == SHR__LCMD_CACHE_END) {

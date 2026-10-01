@@ -8,6 +8,8 @@ import pathlib
 import struct
 import sys
 
+import xxhash
+
 ROOT = pathlib.Path(sys.argv[1])
 
 
@@ -58,8 +60,10 @@ def fill(rect, color=(255, 0, 0), dim=0):
     return bytes([1, dim]) + i8(*rect) + bytes(color) + bytes([0, 0, 0, 0]) + u16(0) + i8(0, 0)
 
 
-def src_cmd(kind, rect, fmt, sw, sh, stride, length, origin=(0, 0)):
-    return bytes([kind, 0]) + i8(*rect) + bytes([200, 100, 50, fmt]) + i8(sw, sh) + bytes([stride]) + u16(length) + i8(*origin)
+# GLYPH (kind 2) ends with an axis byte: as i8, or 40 times that beyond +-100.
+def src_cmd(kind, rect, fmt, sw, sh, stride, length, origin=(0, 0), flags=0, axis=0):
+    return (bytes([kind, flags]) + i8(*rect) + bytes([200, 100, 50, fmt]) + i8(sw, sh) + bytes([stride]) + u16(length)
+            + i8(*origin) + (i8(axis) if kind == 2 else b""))
 
 
 def rotate(rot):
@@ -75,6 +79,12 @@ END = bytes([7])
 
 def batch(*cmds):
     return bytes([len(cmds) - 1 + sum(1 for c in cmds if c[0] == 6)]) + b"".join(cmds)
+
+
+# fuzz_package: a sealed header of one A4 section of a `size`-byte package (another text profile).
+def header(version, size):
+    head = b"SHRFPKG1" + struct.pack("<HHIIIQQ", version, 128, 1, 1, 0, 128, size) + bytes(32)
+    return head + struct.pack("<Q", xxhash.xxh3_64_intdigest(head)) + bytes(48)
 
 
 # fuzz_compositor: setup, then [op, arg, extra...] (see tests/fuzz/fuzz_compositor.c).
@@ -108,6 +118,7 @@ SEEDS = {
         + cell(0, 1, b"A", flags=0x80, color=0x12) + RENDER + cell(0, 1, b"A", flags=0x80, color=0x22) + RENDER
         + cell(0, 1, b"A", 2, flags=0x80, color=0x22) + RENDER
         + clear(0, 0, 1, 8, flags=0) + cell(0, 2, b"A", 2, flags=0x80, color=0x22) + RENDER
+        + b"".join(cell(0, 2, b"A", 2, flags=f, color=0x22) + RENDER for f in (0x81, 0x80, 0x82, 0x80))
         + cell(0, 2, b"A", 2, flags=0x88, color=0x22) + RENDER + cell(0, 2, b"B", 2, flags=0x88, color=0x22) + RENDER
         + bytes([3 | 16, 2, 8]) + RENDER,
         bytes([0]) + resize(3, 8) + text(0, 0, "A가😀B\tx\nwrap é".encode()) + RENDER,
@@ -136,11 +147,20 @@ SEEDS = {
         + batch(group((0, 6, 16, 12), (4, 0, 12, 6)), src_cmd(2, (1, 7, 9, 11), 1, 8, 8, 8, 64), END)
         + batch(group((0, 0, 16, 6), (2, 2, 6, 4)), fill((1, 1, 5, 5)), END),
         bytes([4, 16, 12, 0, 7]) + batch(group((0, 0, 16, 6), (0, 0, 16, 6)), END) + batch(END) + batch(group((0, 0, 8, 8), (0, 0, 9, 9))),
+        # BOLD, ITALIC and both (with DIM) over their whole footprints, in A8 and A4 with a padding nibble
+        bytes([0, 23, 19, 0, 8]) + batch(fill((0, 0, 24, 20), (0, 0, 0)), src_cmd(2, (0, 0, 6, 4), 1, 5, 4, 5, 20, flags=2),
+                                         src_cmd(2, (1, 5, 8, 9), 1, 5, 4, 5, 20, (-1, 0), flags=4, axis=4),
+                                         src_cmd(2, (2, 10, 12, 16), 0, 7, 6, 4, 24, (-4, 0), flags=7, axis=-20)),
+        # the same in a cached group under a smaller clip, drawn twice; then outside the footprint, and a bad axis
+        bytes([1 | 6, 15, 11, 1, 9]) + batch(group((0, 0, 16, 8), (2, 1, 10, 6)), src_cmd(2, (1, 1, 11, 7), 0, 7, 6, 4, 24, (-4, 0), flags=6, axis=-20), END) * 2
+        + batch(src_cmd(2, (0, 0, 10, 6), 0, 7, 6, 4, 24, (-5, 0), flags=6, axis=-20))
+        + batch(src_cmd(2, (0, 0, 2, 2), 1, 5, 4, 5, 20, flags=4, axis=110)),
     ],
     "fuzz_package": [
         b"\x00",
         b"\x00SHRFPKG1" + bytes(120),
-        b"\x08" + b"SHRFPKG1" + struct.pack("<HHIIIQQ", 2, 128, 1, 1, 0, 128, 200) + bytes(72),
+        b"\x08" + header(3, 200) + bytes(72),
+        b"\x00" + header(2, 200) + bytes(72),
     ],
     "fuzz_compositor": [
         bytes([1]) + layer(0, 0, (0, 0, 64, 48)) + lfill(0, (4, 4, 40, 30)) + SUBMIT + PUMP + check(),

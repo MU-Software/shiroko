@@ -2358,7 +2358,7 @@ TEST test_command_validation(void) {
         ASSERT_EQ_LL(shr__lyr_group_set(l, 0, bad[i].c, bad[i].n), SHR_E_INVALID_ARG);
     const shr__lcmd good[4] = {begin, fill((shr_rect){0, 0, 4, 4}, RED), end, fill(FULL, 0)};
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, good, 4), SHR_OK);
-    flagged.flags = SHR__LCMD_DIM | SHR__LCMD_BLINK;
+    flagged.flags = SHR__LCMD_DIM | SHR__LCMD_BOLD | SHR__LCMD_ITALIC | SHR__LCMD_BLINK;
     ASSERT_EQ_LL(shr__lyr_group_set(l, 1, &flagged, 1), SHR_OK);
     ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
     ASSERT_EQ_LL(shr__lyr_cmd_add(l, &begin), SHR_E_INVALID_ARG); /* one command is never a cache pair */
@@ -2697,6 +2697,72 @@ TEST test_resource_resolution(void) {
     ASSERT_EQ_LL(im.ends, 1); /* no pin was taken */
     destroy_layers(&l, 1);
     r.res.dead = im.res.dead = off.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* BOLD and ITALIC reach the driver only where the resource allows them; a styled glyph covers its footprint,
+ * still cut at its cell. */
+TEST test_glyph_styles(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    fake r, plain, im, up;
+    fake_attach(&r, ctx, &fk_ops);
+    fake_attach(&plain, ctx, &fk_ops);
+    fake_attach(&im, ctx, &fk_ops);
+    fake_attach(&up, ctx, &fk_ops);
+    r.px.offset = (shr_point){2, 0};
+    up.px.offset = (shr_point){2, -3}; /* sticks out above the cell */
+    r.px.synth = im.px.synth = up.px.synth = SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC;
+    r.px.slant_axis = up.px.slant_axis = 16; /* rows 0 and 15 shift by 1 + 149/256 and -2 + 107/256: columns -2 to 11 */
+    plain.px.slant_axis = 7;
+    im.px.image = (shr_image){im.cov, 8, 16, 32, sizeof(im.cov), SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU};
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, (shr_rect){4, 4, 60, 40}, &l), SHR_OK);
+    const uint32_t bi = SHR__LCMD_BOLD | SHR__LCMD_ITALIC;
+    shr__lcmd c[7] = {glyph(&r, 0, 0, RED),  glyph(&r, 16, 0, RED),   glyph(&r, 40, 0, RED),  glyph(&plain, 0, 18, RED),
+                      glyph(&im, 16, 18, 0), glyph(&up, 40, 18, RED), glyph(&up, 48, 18, RED)};
+    c[0].flags = bi | SHR__LCMD_DIM;
+    c[1].flags = bi, c[1].dst.x1 += 16; /* two cells: the whole footprint */
+    c[2].flags = SHR__LCMD_BOLD, c[2].dst.x1 += 8;
+    c[3].flags = bi | SHR__LCMD_DIM; /* the resource draws no styles */
+    c[4].kind = SHR__LCMD_IMAGE, c[4].flags = bi;
+    c[5].flags = bi, c[6].flags = SHR__LCMD_BOLD;
+    paint(l, 7, c);
+    frame(ctx);
+    ASSERT_EQ_LL(rec.n, 8);
+    /* The axis only with ITALIC, so equal draws are equal commands. */
+    const struct {
+        uint32_t flags;
+        shr_rect dst;
+        int32_t sx, sy, axis;
+    } want[7] = {{SHR_GLYPH_DIM | SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC, {4, 4, 12, 20}, -2, 0, 16},
+                 {SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC, {20, 4, 33, 20}, -2, 0, 16},
+                 {SHR_GLYPH_BOLD, {46, 4, 55, 20}, 0, 0, 0},
+                 {SHR_GLYPH_DIM, {4, 22, 12, 38}, 0, 0, 0},
+                 {0, {20, 22, 28, 38}, 0, 0, 0},
+                 {SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC, {44, 22, 52, 35}, -2, 3, 16},
+                 {SHR_GLYPH_BOLD, {54, 22, 60, 35}, 0, 3, 0}};
+    for (int i = 0; i < 7; i++) {
+        const shr_draw_cmd *g = &rec.cmds[i + 1];
+        ASSERT_EQ_LL(g->kind, i == 4 ? SHR_CMD_IMAGE : SHR_CMD_GLYPH);
+        ASSERT_EQ_LL(g->flags, want[i].flags);
+        ASSERT(rect_eq(g->dst, want[i].dst));
+        ASSERT(g->src_origin.x == want[i].sx && g->src_origin.y == want[i].sy);
+        ASSERT_EQ_LL(g->slant_axis, want[i].axis);
+    }
+    shr_pl_res_image *img; /* an image resource draws no styles */
+    static const uint32_t rgba = 0xFFFFFFFFu;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 1, 1, &rgba, 4, &img), SHR_OK);
+    shr__res *ir = (shr__res *)img;
+    shr__resolved out;
+    memset(&out, 0xFF, sizeof(out));
+    ASSERT_EQ_LL(ir->ops->resolve(ir, 0, 1, &out), SHR_OK);
+    ASSERT(out.synth == 0 && out.slant_axis == 0);
+    ir->ops->frame_end(ir, 1);
+    ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
+    destroy_layers(&l, 1);
+    r.res.dead = plain.res.dead = im.res.dead = up.res.dead = true;
     harness_close(&h);
     PASS();
 }
@@ -3242,6 +3308,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_large_group_blocks_skipped);
     RUN_TEST(test_cache_hints);
     RUN_TEST(test_resource_resolution);
+    RUN_TEST(test_glyph_styles);
     RUN_TEST(test_provisional_pixels_redrawn);
     RUN_TEST(test_provisional_change_during_raster);
     RUN_TEST(test_fallback_areas_redrawn_with_changes);

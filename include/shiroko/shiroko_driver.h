@@ -138,7 +138,10 @@ typedef enum shr_cmd_kind {
     SHR_CMD_CACHE_END
 } shr_cmd_kind;
 
-enum { SHR_GLYPH_DIM = 1u << 0 }; /* GLYPH coverage, or a FILL, at half strength */
+/* DIM: GLYPH coverage, or a FILL, at half strength. BOLD, ITALIC: GLYPH style synthesized from the coverage. */
+enum { SHR_GLYPH_DIM = 1u << 0, SHR_GLYPH_BOLD = 1u << 1, SHR_GLYPH_ITALIC = 1u << 2 };
+#define SHR_GLYPH_SLANT 54       /* italic slope in 1/256 (about 12 degrees) */
+#define SHR_GLYPH_SYNTH_MAX 1024 /* largest src width or height of a BOLD or ITALIC GLYPH */
 
 typedef enum shr_rotation {
     SHR_ROTATE_NONE = 0,
@@ -160,10 +163,19 @@ shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t 
  * reads no destination pixels and holds no ROTATE.
  * ROTATE: `src` is the whole logical surface and `dst` a rect of the output whose size is `src` rotated;
  * `src_origin` is unused.
+ * GLYPH coverage of src pixel (x, y), exactly: in(x, y) is the coverage widened to 8 bits (A4 n -> 17n), 0 outside
+ * `src` (W x H). BOLD: b(x) = in(x + 1) > in(x) ? in(x) : max(in(x), in(x - 1)), else b = in. ITALIC, with
+ * t = SHR_GLYPH_SLANT / 2 * (slant_axis - 2y - 1) + 2^23, k = (t >> 8) - 2^15, f = t & 255:
+ * c(x) = (b(x - k) * (256 - f) + b(x - k - 1) * f + 128) >> 8, else c = b. DIM: (c + 1) >> 1. `dst` pixel (x, y)
+ * takes the coverage of src (src_origin.x + x - dst.x0, src_origin.y + y - dst.y0). A BOLD or ITALIC GLYPH may
+ * name source columns outside `src` within its footprint [x0, x1): x0 = ITALIC ? k(H - 1) : 0,
+ * x1 = W + BOLD + (ITALIC ? k(0) + (f(0) != 0) : 0); its rows stay inside `src`.
  * A batch is checked before anything is drawn. SHR_E_INVALID_ARG: a rect outside the destination or its group,
  * a nested or unbalanced group, a group command reading the destination, ROTATE in a group, a source rect
- * outside `src`, a bad rotation or ROTATE size. SHR_E_UNSUPPORTED: a source format the kind does not take, a
- * COPY whose source overlaps `dst` with another format or stride, a ROTATE whose source overlaps `dst`. */
+ * outside `src` (or a styled GLYPH's footprint), a BOLD or ITALIC GLYPH with `src` larger than
+ * SHR_GLYPH_SYNTH_MAX, an ITALIC GLYPH with |slant_axis| > 4 * SHR_GLYPH_SYNTH_MAX, a bad rotation or ROTATE
+ * size. SHR_E_UNSUPPORTED: a source format the kind does not take, a COPY whose source overlaps `dst` with
+ * another format or stride, a ROTATE whose source overlaps `dst`. */
 typedef struct shr_draw_cmd {
     shr_cmd_kind kind;
     uint32_t flags;
@@ -174,6 +186,7 @@ typedef struct shr_draw_cmd {
     shr_rotation rotation;    /* ROTATE */
     uint64_t key[2];          /* CACHE_BEGIN: 128-bit content hash */
     shr_rect cache_clip;      /* CACHE_BEGIN: part of dst drawn this time */
+    int32_t slant_axis;       /* ITALIC GLYPH: twice the src y the shear turns about */
 } shr_draw_cmd;
 
 typedef enum shr_fence_state {

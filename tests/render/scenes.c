@@ -246,6 +246,16 @@ static shr_status styles(stage *s) {
     return s->st;
 }
 
+/* Sprites, emoji and icons are drawn as they are, whatever BOLD and ITALIC say. */
+static shr_status styled_exempt_with(stage *s, uint32_t flags) {
+    shr_lyr *l = stage_grid(s, 1, cells(1, 1, 14, 1), NULL);
+    stage_text(s, l, 0, 0, "─│┼█▒\U0001FB00 \U0001F600 \uE0B0", STYLE(FG, 0, flags), 0);
+    return s->st;
+}
+
+static shr_status styled_exempt(stage *s) { return styled_exempt_with(s, SHR_STYLE_BOLD | SHR_STYLE_ITALIC); }
+static shr_status styled_exempt_ref(stage *s) { return styled_exempt_with(s, 0); }
+
 /* ===== Tilemap background vs transparent cells over an image ===== */
 
 static void gradient(uint8_t *rgba, int32_t w, int32_t h, bool holes) {
@@ -488,6 +498,28 @@ static shr_status tm_update_ref(stage *s) {
     shr_lyr *l = stage_grid(s, 1, cells(1, 1, 26, 6), NULL);
     tm_initial(s, l);
     tm_changes(s, l);
+    return s->st;
+}
+
+/* Restyled cached rows: the update only adds BOLD and ITALIC to the text the build drew. */
+static const char restyle_text[] = "abc 한글 ─ \U0001F600";
+
+static shr_status tm_restyle_build(stage *s) {
+    const shr_color bg = DARK;
+    stage_text(s, stage_grid(s, 1, cells(1, 1, 16, 1), &bg), 0, 0, restyle_text, plain, 0);
+    return s->st;
+}
+
+static shr_status tm_restyle(stage *s) {
+    stage_text(s, s->nlayers ? s->layers[0] : NULL, 0, 0, restyle_text,
+               STYLE(FG, 0, SHR_STYLE_BOLD | SHR_STYLE_ITALIC), 0);
+    return s->st;
+}
+
+static shr_status tm_restyle_ref(stage *s) {
+    const shr_color bg = DARK;
+    stage_text(s, stage_grid(s, 1, cells(1, 1, 16, 1), &bg), 0, 0, restyle_text,
+               STYLE(FG, 0, SHR_STYLE_BOLD | SHR_STYLE_ITALIC), 0);
     return s->st;
 }
 
@@ -1006,6 +1038,8 @@ const scene scenes[] = {
     {.name = "styles", SCREEN(36, 18), .build = styles},
     {.name = "styles-blink-off", SCREEN(36, 18), .now_ns = BLINK_NS, .build = styles},
     {.name = "styles-rot90cw", SCREEN(36, 18), .rotation = SHR_ROTATE_90_CW, .build = styles},
+    {.name = "styled-exempt", SCREEN(16, 3), .build = styled_exempt},
+    {.name = "styled-exempt-ref", SCREEN(16, 3), .build = styled_exempt_ref},
     {.name = "tilemap-over-image", SCREEN(40, 8), .build = tilemap_over_image},
     {.name = "tm-background", SCREEN(26, 6), .build = tm_background},
     {.name = "tm-background-ref", SCREEN(26, 6), .build = tm_background_ref},
@@ -1013,6 +1047,8 @@ const scene scenes[] = {
     {.name = "tm-update-ref", SCREEN(28, 8), .build = tm_update_ref},
     {.name = "tm-update-rot180", SCREEN(28, 8), .rotation = SHR_ROTATE_180, .build = tm_update_build, .update = tm_update},
     {.name = "tm-update-rot180-ref", SCREEN(28, 8), .rotation = SHR_ROTATE_180, .build = tm_update_ref},
+    {.name = "tm-restyle", SCREEN(18, 3), .build = tm_restyle_build, .update = tm_restyle},
+    {.name = "tm-restyle-ref", SCREEN(18, 3), .build = tm_restyle_ref},
     {.name = "cleared", SCREEN(14, 6), .build = cleared},
     {.name = "cleared-ref", SCREEN(14, 6), .build = cleared_ref},
     {.name = "text-layout", SCREEN(18, 4), .build = text_layout},
@@ -1068,6 +1104,8 @@ const reftest reftests[] = {
     {"tm-background", "tm-background-ref"},
     {"tm-update", "tm-update-ref"},
     {"tm-update-rot180", "tm-update-rot180-ref"},
+    {"styled-exempt", "styled-exempt-ref"},
+    {"tm-restyle", "tm-restyle-ref"},
     {"cleared", "cleared-ref"},
     {"text-layout", "text-cells"},
     {"occluded", "occluded-ref"},

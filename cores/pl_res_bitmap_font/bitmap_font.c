@@ -195,16 +195,14 @@ static shr_status intern(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t 
 }
 
 shr_status shr__bitmap_font_glyph(shr_pl_res_bitmap_font *font, const uint32_t *cps, size_t n,
-                                  const shr__cluster_class *cls, uint32_t style_flags, uint64_t *out_id) {
+                                  const shr__cluster_class *cls, uint64_t *out_id) {
     if (!font || !cps || !n || !cls || !out_id || cps[0] > 0x10FFFF) return SHR_E_INVALID_ARG;
     if (cls->glyph_kind == SHR_GLYPH_NONE) return SHR_E_NOT_FOUND;
-    uint64_t style = (style_flags & SHR_STYLE_BOLD ? 1u : 0u) | (style_flags & SHR_STYLE_ITALIC ? 2u : 0u);
-    uint64_t id = style << SHR_ID_STYLE_SHIFT;
     if (cls->glyph_kind == SHR_GLYPH_REPLACEMENT) {
-        *out_id = id | 0xFFFD;
+        *out_id = 0xFFFD;
         return SHR_OK;
     }
-    if (cls->flags & SHR_CLUSTER_EMOJI) id |= SHR_ID_EMOJI;
+    uint64_t id = cls->flags & SHR_CLUSTER_EMOJI ? SHR_ID_EMOJI : 0;
     if (n == 1) {
         *out_id = id | cps[0];
         return SHR_OK;
@@ -212,7 +210,7 @@ shr_status shr__bitmap_font_glyph(shr_pl_res_bitmap_font *font, const uint32_t *
     uint32_t index;
     shr_status st = intern(font, cps, n, cls, &index);
     if (st == SHR_E_LIMIT) { /* the table is full: the visible base, else U+FFFD */
-        *out_id = cls->glyph_kind == SHR_GLYPH_SCALAR ? id | cls->glyph_cp : (style << SHR_ID_STYLE_SHIFT) | 0xFFFD;
+        *out_id = cls->glyph_kind == SHR_GLYPH_SCALAR ? id | cls->glyph_cp : 0xFFFD;
         return SHR_OK;
     }
     if (st == SHR_OK) *out_id = id | SHR_ID_CLUSTER | index;

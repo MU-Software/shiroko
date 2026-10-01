@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "raster.h"
+#include "shr_glyph.h"
 #include "shr_rect.h"
 
 static inline uint32_t expand(uint32_t v, uint32_t m) { return (v * 255 + m / 2) / m; }
@@ -117,14 +118,23 @@ static shr_status reach(shr__reach_fn fn, const void *user, const void *pixels, 
     return dom == SHR_MEMORY_DEVICE ? SHR_E_UNSUPPORTED : SHR_OK;
 }
 
-static shr_status src_check(const shr_draw_cmd *c, bool format_ok, shr__reach_fn fn, const void *user) {
+/* `syn`: the BOLD and ITALIC flags of a GLYPH, whose columns may reach into its footprint. */
+static shr_status src_check(const shr_draw_cmd *c, bool format_ok, uint32_t syn, shr__reach_fn fn, const void *user) {
     if (!format_ok) return SHR_E_UNSUPPORTED;
     const shr_image *m = &c->src;
     shr_status st = shr_image_validate(m);
     if (st != SHR_OK) return st;
+    int32_t x0 = 0, x1 = m->width;
+    if (syn) {
+        if (m->width > SHR_GLYPH_SYNTH_MAX || m->height > SHR_GLYPH_SYNTH_MAX ||
+            ((syn & SHR_GLYPH_ITALIC) &&
+             (c->slant_axis > 4 * SHR_GLYPH_SYNTH_MAX || c->slant_axis < -4 * SHR_GLYPH_SYNTH_MAX)))
+            return SHR_E_INVALID_ARG;
+        shr__glyph_footprint(m->width, m->height, syn, c->slant_axis, &x0, &x1);
+    }
     int64_t sx1 = (int64_t)c->src_origin.x + (c->dst.x1 - c->dst.x0);
     int64_t sy1 = (int64_t)c->src_origin.y + (c->dst.y1 - c->dst.y0);
-    if (c->src_origin.x < 0 || c->src_origin.y < 0 || sx1 > m->width || sy1 > m->height) return SHR_E_INVALID_ARG;
+    if (c->src_origin.x < x0 || c->src_origin.y < 0 || sx1 > x1 || sy1 > m->height) return SHR_E_INVALID_ARG;
     return reach(fn, user, m->pixels, m->width, m->height, m->format, m->domain);
 }
 
@@ -166,10 +176,13 @@ shr_status shr__raster_check(const shr_surface *dst, const shr_draw_cmd *cmds, s
         if (!rect_inside(c->dst, group ? group->dst : all)) return SHR_E_INVALID_ARG;
         switch (c->kind) {
         case SHR_CMD_FILL: break;
-        case SHR_CMD_GLYPH: st = src_check(c, c->src.format == SHR_FORMAT_A4 || c->src.format == SHR_FORMAT_A8, fn, user); break;
-        case SHR_CMD_IMAGE: st = src_check(c, c->src.format == SHR_FORMAT_RGBA8888, fn, user); break;
+        case SHR_CMD_GLYPH:
+            st = src_check(c, c->src.format == SHR_FORMAT_A4 || c->src.format == SHR_FORMAT_A8,
+                           c->flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC), fn, user);
+            break;
+        case SHR_CMD_IMAGE: st = src_check(c, c->src.format == SHR_FORMAT_RGBA8888, 0, fn, user); break;
         case SHR_CMD_COPY:
-            st = src_check(c, screen_format(c->src.format), fn, user);
+            st = src_check(c, screen_format(c->src.format), 0, fn, user);
             /* Row-wise memmove handles overlap only between identical layouts. */
             if (st == SHR_OK && (c->src.format != dst->format || c->src.stride != dst->stride) &&
                 !shr__rect_empty(c->dst) && spans_overlap(copy_src_span(&c->src, c->src_origin, c->dst), dst_span(dst, c->dst)))
@@ -226,8 +239,60 @@ static inline __attribute__((always_inline)) void glyph_rows(const shr_surface *
     }
 }
 
+/* Coverage of src column x in `row`: 0 outside the image, so also for the A4 padding nibble. */
+static inline uint32_t synth_in(const uint8_t *row, int32_t x, int32_t w, shr_pixel_format g) {
+    if ((uint32_t)x >= (uint32_t)w) return 0;
+    uint32_t u = (uint32_t)x;
+    if (g == SHR_FORMAT_A8) return row[u];
+    return 17u * (u & 1 ? row[u >> 1] & 0x0Fu : row[u >> 1] >> 4);
+}
+
+/* BOLD of the middle sample m between neighbours l and r. */
+static inline uint32_t embolden(uint32_t l, uint32_t m, uint32_t r, bool bold) {
+    return (!bold || r > m) ? m : m > l ? m : l;
+}
+
+/* The shiroko_driver.h coverage formula over a window in(q - 2 .. q + 1), q = sx - k, moved one column per pixel;
+ * every term derives from absolute src coordinates, so clipping never changes a pixel. */
+static inline __attribute__((always_inline)) void glyph_synth_rows(const shr_surface *dst, const shr_draw_cmd *c,
+                                                                   shr_rect r, shr_point s, shr_pixel_format f,
+                                                                   shr_pixel_format g) {
+    rgb fg = color_rgb(c->color);
+    size_t bpp = shr__px_bytes(f);
+    uint32_t dim = (c->flags & SHR_GLYPH_DIM) != 0;
+    bool bold = c->flags & SHR_GLYPH_BOLD, italic = c->flags & SHR_GLYPH_ITALIC;
+    int32_t w = c->src.width;
+    for (int32_t y = r.y0; y < r.y1; y++) {
+        int32_t sy = s.y + (y - r.y0), k = 0, fr = 0;
+        if (italic) shr__slant(c->slant_axis, sy, &k, &fr);
+        const uint8_t *row = (const uint8_t *)c->src.pixels + (size_t)sy * c->src.stride;
+        int32_t q = s.x - k;
+        uint32_t i0 = synth_in(row, q - 2, w, g), i1 = synth_in(row, q - 1, w, g), i2 = synth_in(row, q, w, g);
+        uint32_t b1 = embolden(i0, i1, i2, bold);
+        uint8_t *p = pixel_at(dst, r.x0, y);
+        for (int32_t x = r.x0; x < r.x1; x++, p += bpp, q++) {
+            uint32_t i3 = synth_in(row, q + 1, w, g), b2 = embolden(i1, i2, i3, bold);
+            uint32_t a = (((b2 * (uint32_t)(256 - fr) + b1 * (uint32_t)fr + 128) >> 8) + dim) >> dim;
+            i1 = i2, i2 = i3, b1 = b2;
+            if (a) blend_px(f, p, fg, a);
+        }
+    }
+}
+
 static void do_glyph(const shr_surface *dst, const shr_draw_cmd *c, shr_rect r, shr_point s) {
     bool rgb565 = dst->format == SHR_FORMAT_RGB565, a8 = c->src.format == SHR_FORMAT_A8;
+    if (c->flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC)) {
+        if (!c->src.width) return; /* no coverage, and `pixels` may be NULL */
+        if (rgb565 && a8)
+            glyph_synth_rows(dst, c, r, s, SHR_FORMAT_RGB565, SHR_FORMAT_A8);
+        else if (rgb565)
+            glyph_synth_rows(dst, c, r, s, SHR_FORMAT_RGB565, SHR_FORMAT_A4);
+        else if (a8)
+            glyph_synth_rows(dst, c, r, s, SHR_FORMAT_RGBX8888, SHR_FORMAT_A8);
+        else
+            glyph_synth_rows(dst, c, r, s, SHR_FORMAT_RGBX8888, SHR_FORMAT_A4);
+        return;
+    }
     if (rgb565 && a8)
         glyph_rows(dst, c, r, s, SHR_FORMAT_RGB565, SHR_FORMAT_A8);
     else if (rgb565)

@@ -83,7 +83,8 @@ static const char *parse_index(shr__pkg *pkg, shr_status *st) {
         const uint8_t *e = order[i];
         uint32_t type = shr__rd32(e), count = shr__rd32(e + 4), length = shr__rd32(e + 16);
         uint64_t off = shr__rd64(e + 8);
-        if (type < 1 || type > 10 || sec[type].data || shr__rd32(e + 20)) return "unknown or duplicate section";
+        if (type < 1 || type > 10 || type == 5 || sec[type].data || shr__rd32(e + 20))
+            return "unknown or duplicate section";
         if (off < prev_end) return "overlapping sections";
         if (off > index_end || index_end - off < length) return "section out of range"; /* table re-read may differ */
         if (XXH3_64bits(base + (off - toff), length) != shr__rd64(e + 24)) return "section checksum";
@@ -91,7 +92,7 @@ static const char *parse_index(shr__pkg *pkg, shr_status *st) {
         sec[type] = (section){count, base + (off - toff), length};
         prev_end = off + length;
     }
-    if (!sec[1].data || !sec[4].data || !sec[5].data || !sec[6].data || !sec[9].data) return "missing section";
+    if (!sec[1].data || !sec[4].data || !sec[6].data || !sec[9].data) return "missing section";
     const uint8_t *meta = sec[1].data;
     if (sec[1].count != 1 || sec[1].length != 36 || meta[1] | meta[2] | meta[3]) return "MANIFEST";
     if (meta[0] < ROLE_LATIN || meta[0] > ROLE_NERD) return "role";
@@ -103,10 +104,9 @@ static const char *parse_index(shr__pkg *pkg, shr_status *st) {
     uint64_t name_end = (uint64_t)shr__rd32(meta + 12) + shr__rd32(meta + 16);
     uint64_t build_end = (uint64_t)shr__rd32(meta + 20) + shr__rd32(meta + 24);
     if (name_end > sec[2].length || build_end > sec[2].length) return "string reference";
-    uint32_t nglyphs = shr__rd32(meta + 28), ninst = shr__rd32(meta + 32);
-    if (nglyphs == 0 || nglyphs > SHR_PKG_MAX_RECORDS || ninst == 0 || ninst > SHR_PKG_MAX_INSTANCES)
-        return "glyph or instance count";
-    if (sec[4].count != ninst || sec[4].length != 48ull * ninst) return "INSTANCES size";
+    uint32_t nglyphs = shr__rd32(meta + 28);
+    if (nglyphs == 0 || nglyphs > SHR_PKG_MAX_RECORDS || shr__rd32(meta + 32) != 1) return "glyph or instance count";
+    if (sec[4].count != 1 || sec[4].length != 48) return "INSTANCES size";
     if (sec[3].data && sec[3].length != 48ull * sec[3].count) return "SOURCES size";
     if (sec[10].data && (sec[10].count != 9 || sec[10].length != 36)) return "COVERAGE size";
     for (uint32_t i = 0; sec[3].data && i < sec[3].count; i++) {
@@ -115,48 +115,20 @@ static const char *parse_index(shr__pkg *pkg, shr_status *st) {
             (uint64_t)shr__rd32(r + 40) + shr__rd32(r + 44) > sec[2].length)
             return "source string reference";
     }
-#define INST(i) (sec[4].data + 48ull * (i))
-    for (uint32_t i = 0; i < ninst; i++) {
-        const uint8_t *r = INST(i);
-        uint16_t lh = shr__rd16(r + 4), cw = shr__rd16(r + 6);
-        int16_t baseline = (int16_t)shr__rd16(r + 12), under = (int16_t)shr__rd16(r + 14),
-                strike = (int16_t)shr__rd16(r + 16);
-        uint8_t style = r[2], format = r[3];
-        if (sec[3].data && shr__rd16(r) >= sec[3].count) return "instance source";
-        if (style > 1 || (format != 1 && format != 2) || !(features & (format == 1 ? 1u : 2u)))
-            return "instance style or format";
-        if (!lh || lh > SHR_MAX_CELL_SIZE || !cw || cw > SHR_MAX_CELL_SIZE) return "instance size";
-        if (baseline < 0 || baseline > lh || under < 0 || under >= lh || strike < 0 || strike >= lh)
-            return "instance line metrics";
-        if (shr__rd16(r + 18) & ~1u) return "instance raster flags";
-        for (int k = 36; k < 48; k++)
-            if (r[k]) return "instance reserved bytes";
-        pkg->inst_format[i] = format;
-    }
-    uint32_t heights = 0;
-    for (uint32_t i = 0; i < ninst; i++) {
-        uint32_t k = 0;
-        while (shr__rd16(INST(k) + 4) != shr__rd16(INST(i) + 4)) k++;
-        heights += k == i;
-    }
-    if (sec[5].count != 4 * heights || sec[5].length != 8ull * sec[5].count) return "STYLES size";
-    int64_t own = -1;
-    for (uint32_t i = 0; i < sec[5].count; i++) {
-        const uint8_t *r = sec[5].data + 8ull * i;
-        uint16_t lh = shr__rd16(r), idx = shr__rd16(r + 4);
-        if (r[2] != i % 4 || r[3] || idx >= ninst || shr__rd16(INST(idx) + 4) != lh || shr__rd16(r + 6))
-            return "style mapping";
-        if (i % 4 ? lh != shr__rd16(r - 8) : i && lh <= shr__rd16(r - 8)) return "style order";
-        if (lh == SHR_CELL_HEIGHT && i % 4 == 0) own = i;
-    }
-    if (own < 0) return *st = SHR_E_UNSUPPORTED, "no instance for the cell size";
-    for (int s = 0; s < 4; s++) {
-        uint16_t idx = shr__rd16(sec[5].data + 8ull * (uint64_t)(own + s) + 4);
-        if (shr__rd16(INST(idx) + 6) != SHR_CELL_WIDTH) return *st = SHR_E_UNSUPPORTED, "no instance for the cell size";
-        pkg->style_inst[s] = idx;
-        pkg->style_baseline[s] = (int16_t)shr__rd16(INST(idx) + 12);
-    }
-#undef INST
+    const uint8_t *in = sec[4].data;
+    uint16_t lh = shr__rd16(in + 4), cw = shr__rd16(in + 6);
+    int16_t baseline = (int16_t)shr__rd16(in + 12), under = (int16_t)shr__rd16(in + 14),
+            strike = (int16_t)shr__rd16(in + 16);
+    uint8_t format = in[3];
+    if (sec[3].data && shr__rd16(in) >= sec[3].count) return "instance source";
+    if (in[2] || (format != 1 && format != 2) || !(features & format)) return "instance style or format";
+    if (!lh || lh > SHR_MAX_CELL_SIZE || !cw || cw > SHR_MAX_CELL_SIZE) return "instance size";
+    if (baseline < 0 || baseline > lh || under < 0 || under >= lh || strike < 0 || strike >= lh)
+        return "instance line metrics";
+    if (shr__rd16(in + 18) & ~1u) return "instance raster flags";
+    for (int k = 36; k < 48; k++)
+        if (in[k]) return "instance reserved bytes";
+    if (lh != SHR_CELL_HEIGHT || cw != SHR_CELL_WIDTH) return *st = SHR_E_UNSUPPORTED, "no instance for the cell size";
     if (sec[6].length != 8ull * sec[6].count) return "CMAP size";
     for (uint32_t i = 0; i < sec[6].count; i++) {
         uint32_t cp = shr__rd32(sec[6].data + 8ull * i);
@@ -196,7 +168,9 @@ static const char *parse_index(shr__pkg *pkg, shr_status *st) {
         glyph += count;
         prev = off + length;
     }
-    if (glyph != (uint64_t)nglyphs * ninst) return "pages do not cover every glyph";
+    if (glyph != nglyphs) return "pages do not cover every glyph";
+    pkg->format = format;
+    pkg->baseline = baseline;
     pkg->npages = npages;
     pkg->nglyphs = nglyphs;
     pkg->cmap = sec[6].data, pkg->ncmap = sec[6].count;
@@ -208,17 +182,17 @@ static const char *parse_index(shr__pkg *pkg, shr_status *st) {
 
 bool shr__page_valid(const shr__page *p) {
     const uint8_t *d = p->data, *rec = shr__page_rec(p);
-    uint32_t length = shr__rd32(rec + 16), first = shr__rd32(rec + 20), count = shr__rd32(rec + 24);
+    uint32_t length = shr__rd32(rec + 16), count = shr__rd32(rec + 24);
     if (XXH3_64bits(d, length) != shr__rd64(rec + 8) || shr__rd32(d) != count) return false;
     uint64_t table = 4 + 16ull * count;
     for (uint32_t g = 0; g < count; g++) {
         const uint8_t *e = d + 4 + 16ull * g;
         uint32_t off = shr__rd32(e), len = shr__rd16(e + 4);
         uint8_t w = e[6], h = e[7], stride = e[10], flags = e[11], fmt = flags & 3, cells = (flags >> 2) & 3;
-        if (cells < 1 || cells > 2 || (flags & 0xE0) || shr__rd16(e + 14)) return false;
+        if (cells < 1 || cells > 2 || (flags & 0xF0) || shr__rd16(e + 14)) return false;
         if (fmt) {
             uint64_t row = fmt == 1 ? (uint64_t)w / 2 + w % 2 : w;
-            if (fmt != p->pkg->inst_format[(first + g) / p->pkg->nglyphs] || !w || !h || stride < row ||
+            if (fmt != p->pkg->format || !w || !h || stride < row ||
                 (uint64_t)(h - 1) * stride + row > len || off < table || (uint64_t)off + len > length)
                 return false;
             for (uint32_t y = 0; fmt == 1 && w % 2 && y < h; y++)
@@ -360,15 +334,11 @@ void shr__pkg_load_done(shr__pkg *pkg, shr_status result) {
     pkg_fail(pkg, st, why);
 }
 
-/* The built-in package is baked by the build for the cell size alone: its first STYLES record is Regular. */
+/* The built-in package is baked by the build for the cell size: its one instance. */
 shr__line_metrics shr__bitmap_font_line_metrics(void) {
-    const uint8_t *d = shr__builtin_package, *inst = NULL, *styles = NULL;
-    for (uint32_t i = 0; i < shr__rd32(d + 16); i++) {
-        const uint8_t *e = d + shr__rd64(d + 24) + (uint64_t)SHR_PKG_ENTRY * i;
-        if (shr__rd32(e) == 4) inst = d + shr__rd64(e + 8);
-        if (shr__rd32(e) == 5) styles = d + shr__rd64(e + 8);
-    }
-    const uint8_t *s = inst + 48ull * shr__rd16(styles + 4);
+    const uint8_t *d = shr__builtin_package, *e = d + shr__rd64(d + 24);
+    while (shr__rd32(e) != 4) e += SHR_PKG_ENTRY;
+    const uint8_t *s = d + shr__rd64(e + 8);
     return (shr__line_metrics){(int16_t)shr__rd16(s + 12), (int16_t)shr__rd16(s + 14), (int16_t)shr__rd16(s + 16)};
 }
 

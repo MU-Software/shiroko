@@ -5,10 +5,9 @@
 #include "shr_hash.h"
 #include "shr_lru.h"
 
-#define SHR_PKG_VERSION 2
+#define SHR_PKG_VERSION 3
 #define SHR_PKG_ENTRY 32 /* section table entries and page records */
 #define SHR_PKG_MAX_SECTIONS 16
-#define SHR_PKG_MAX_INSTANCES 64
 #define SHR_PKG_MAX_RECORDS (1u << 22)
 #define SHR_PKG_MAX_PAGES (1u << 16)
 #define SHR_PKG_MAX_PAGE_BYTES (1u << 20)
@@ -64,9 +63,8 @@ struct shr__pkg {
     shr__retry retry;
     uint32_t nglyphs, ncmap, nseqs, npages;
     const uint8_t *cmap, *seqs, *pool, *page_recs;
-    uint8_t inst_format[SHR_PKG_MAX_INSTANCES];
-    uint16_t style_inst[4]; /* instance of the build's cell size per requested style */
-    int16_t style_baseline[4];
+    uint8_t format;
+    int16_t baseline;
     shr__page **pages; /* npages entries, NULL until wanted */
 };
 
@@ -145,9 +143,8 @@ bool shr__page_due(const shr__page *p, uint64_t now);
 void shr__font_frame_end(shr_pl_res_bitmap_font *f, uint64_t frame);
 shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t frame, shr__resolved *out);
 
-/* Glyph id layout: scalar or cluster index, style, emoji presentation, interned cluster. */
+/* Glyph id layout: scalar or cluster index, emoji presentation, interned cluster. */
 #define SHR_ID_VALUE 0x1FFFFFull
-#define SHR_ID_STYLE_SHIFT 21
 #define SHR_ID_EMOJI (1ull << 23)
 #define SHR_ID_CLUSTER (1ull << 24)
 

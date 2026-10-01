@@ -31,7 +31,9 @@ static shr_status img_resolve(shr__res *res, uint64_t id, uint64_t frame, shr__r
     *out = (shr__resolved){{img->pixels, img->width, img->height, (size_t)img->width * 4, img->bytes,
                             SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU},
                            {0, 0},
-                           false};
+                           false,
+                           0,
+                           0};
     return SHR_OK;
 }
 

@@ -13,6 +13,7 @@
 
 import argparse
 import collections
+import functools
 import hashlib
 import io
 import json
@@ -47,17 +48,16 @@ OUT = ROOT / "build" / "fonts"
 LOCK = json.loads((FONTS / "fonts.lock.json").read_text(encoding="utf-8"))
 CONFIG = json.loads((FONTS / "fontpack.config.json").read_text(encoding="utf-8"))
 UNICODE_C = os.environ.get("SHIROKO_UNICODE_TABLES")
-VERSION = "fontpack 2"
-FORMAT_VERSION = 2
+VERSION = "fontpack 3"
+FORMAT_VERSION = 3
 LOAD_FLAGS = {"target_light": freetype.FT_LOAD_TARGET_LIGHT, "target_normal": freetype.FT_LOAD_TARGET_NORMAL}
 RENDER_MODES = {"normal": freetype.FT_RENDER_MODE_NORMAL, "light": freetype.FT_RENDER_MODE_LIGHT}
 
 ROLES = {"latin": 1, "cjk": 2, "symbols": 3, "emoji": 4, "nerd": 5}
-STYLES = ["regular", "bold", "italic", "bold_italic"]
 FMT_A4, FMT_A8 = 1, 2
 SEQ_GLYPH, SEQ_ALIAS, SEQ_UVS_DEFAULT, SEQ_UVS_ALT = 1, 2, 3, 4
-SECTION = {"MANIFEST": 1, "STRINGS": 2, "SOURCES": 3, "INSTANCES": 4, "STYLES": 5, "CMAP": 6,
-           "SEQS": 7, "SEQPOOL": 8, "PAGES": 9, "COVERAGE": 10}
+SECTION = {"MANIFEST": 1, "STRINGS": 2, "SOURCES": 3, "INSTANCES": 4, "CMAP": 6, "SEQS": 7, "SEQPOOL": 8,
+           "PAGES": 9, "COVERAGE": 10}
 FEAT_A4, FEAT_A8, FEAT_SEQ = 1, 2, 4
 HEADER_SIZE = 128
 ENTRY_SIZE = 32  # section table entries and page records
@@ -367,9 +367,45 @@ def fit_ppem(face, role, size, baseline):
     lh, cw = size["line_height"], size["cell_width"]
     if role == "latin":
         return cw * face.upem / face.advance
-    cells = 2 if role in ("cjk", "emoji") else 1
-    width_fit = cells * cw * face.upem / (face.upem if role in ("cjk", "emoji") else face.advance)
+    cells = 2 if role == "emoji" else 1
+    width_fit = cells * cw * face.upem / (face.upem if role == "emoji" else face.advance)
     return min(width_fit, baseline * face.upem / face.ascent, (lh - baseline) * face.upem / face.descent)
+
+
+CJK_CORE = ((0x3040, 0x30FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7A3))  # kana, Han, Hangul syllables
+
+
+def cjk_ink(face, gids, p):
+    """Rows above and below the baseline of the hinted bitmaps at ppem p/64, 99.9th percentile."""
+    face.ft.set_char_size(p, p, 72, 72)
+    above, below = [], []
+    for gid in gids:
+        face.ft.load_glyph(gid, freetype.FT_LOAD_DEFAULT | LOAD_FLAGS[CONFIG["raster"]["load"]])
+        box = face.ft.glyph.outline.get_cbox()
+        if box.yMax > box.yMin:
+            above.append(-(-box.yMax // 64))
+            below.append(-(box.yMin // 64))
+    return tuple(sorted(v)[len(v) * 999 // 1000] for v in (above, below)) if above else (0, 0)
+
+
+def cjk_ppem(face, scalars, size, baseline, em):
+    """The latin em, unless two cells of the ideographic advance or the line height need less: the largest ppem
+    (in 1/64) at which the package's kana, Han and Hangul bitmaps fit the line, 99.9th percentile above plus below
+    the baseline, so a few tall or deep glyphs do not shrink the rest (the build fits those one by one). Also the
+    rows to raise every glyph by so that the family sits inside the line."""
+    lh, cw = size["line_height"], size["cell_width"]
+    core = [cp for cp in scalars if any(lo <= cp <= hi for lo, hi in CJK_CORE)] or list(scalars)
+    gids = [g for g in map(face.gid, core) if g]
+    ink = functools.cache(lambda p: cjk_ink(face, gids, p))
+    cap = min(em, 2 * cw * face.upem / face.advance)
+    hi = lo = round(cap * 64)
+    while lo > 64 and sum(ink(lo)) > lh:
+        hi, lo = lo, max(64, lo * 3 // 4)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if sum(ink(mid)) <= lh else (lo, mid)
+    above, below = ink(lo)
+    return cap if lo == round(cap * 64) else lo / 64, max(0, below - lh + baseline) - max(0, above - baseline)
 
 
 def raster(face, gid, ppem, box=None, width=0, height=0, snap=False):
@@ -424,75 +460,60 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep):
             slot_of[key] = len(slot_keys)
             slot_keys.append(key)
 
-    real_styles = [s for s in ("regular", "bold") if s in pkg["faces"]]
     latin_face = faces[CONFIG["packages"]["latin"]["faces"]["regular"]]
     baseline, underline, strike = size_metrics(latin_face, size)
     fmt = FMT_A8 if any(e.get("package") == name for e in CONFIG["a8"]) else FMT_A4
-    instances = [{"size": size, "style": style, "face": faces[pkg["faces"][style]], "fmt": fmt,
-                  "ppem": fit_ppem(faces[pkg["faces"][style]], role, size, baseline), "baseline": baseline,
-                  "underline": underline, "strike": strike} for style in real_styles]
-
-    sources = [pkg["faces"][s] for s in real_styles]
+    lh, cw = size["line_height"], size["cell_width"]
     em = fit_ppem(latin_face, "latin", size, baseline)
+    inst_ppem, lift = (cjk_ppem(regular, scalars, size, baseline, em) if role == "cjk"
+                       else (fit_ppem(regular, role, size, baseline), 0))
     glyph_records, bitmaps = [], []
-    clipped = fallbacks = notdef = 0
-    for inst in instances:
-        face, lh, cw = inst["face"], inst["size"]["line_height"], inst["size"]["cell_width"]
-        for key in slot_keys:
-            kind, v = key
-            if kind == "cp":
-                gid = face.gid(v)
-            elif kind == "gid":
-                gid = v if face is regular else 0
-            else:
-                shaped = face.shape(v, role)
-                gid = shaped[0] if len(shaped) == 1 else 0
-            fb = False
-            src_face = face
-            if gid == 0 and face is not regular:
-                src_face, fb = regular, True
-                gid = (regular.gid(v) if kind == "cp" else v if kind == "gid"
-                       else (regular.shape(v, role) or [0])[0])
-            if gid == 0:
-                notdef += 1
-            fallbacks += fb
-            cells = key_cells(profile, role, key)
-            cp = v if kind == "cp" else -1
-            box = (src_face.cell_box if 0x2500 <= cp <= 0x259F or 0x1FB00 <= cp <= 0x1FBFF
-                   else src_face.bounds(gid) if 0xE0B0 <= cp <= 0xE0D7 and gid else None)
-            ppem, own = inst["ppem"], role == "symbols" and gid and not box
-            if own:  # each symbol scaled on its own: the latin em, shrunk until its ink fits its cells
-                x0, y0, x1, y1 = src_face.bounds(gid) or (0, 0, 1, 1)
-                ppem = min(em, cells * cw * src_face.upem / max(1, x1 - x0), lh * src_face.upem / max(1, y1 - y0))
-            snap = 0x1FB00 <= cp <= 0x1FB6F  # sextants, wedges and triangles: thirds and halves of the cell
-            rows, left, top, advance = (raster(src_face, gid, ppem, box, cells * cw, lh, snap) if gid
-                                        else (None, 0, 0, 0))
-            while own and rows and (len(rows[0]) > cells * cw or len(rows) > lh):
-                ppem *= min(cells * cw / len(rows[0]), lh / len(rows)) * 0.98
-                rows, left, top, advance = raster(src_face, gid, ppem)
-            if rows is None:
-                glyph_records.append((0, 0, 0, 0, 0, 0, (cells << 2) | (0x10 if fb else 0), gid, b""))
-                continue
-            w, h = len(rows[0]), len(rows)
-            if box:
-                bx, top = left, inst["baseline"] - (lh - top)
-            else:
-                bx = round((cells * cw - advance) / 2) + left
-            if own:
-                bx, top = min(max(bx, 0), cells * cw - w), max(min(top, inst["baseline"]), inst["baseline"] + h - lh)
-            if not box and (bx < 0 or bx + w > cells * cw or inst["baseline"] - top < 0
-                            or inst["baseline"] - top + h > lh):
-                clipped += 1
-            stride, data = pack_bitmap(rows, inst["fmt"])
-            if not (-128 <= bx <= 127 and -128 <= top <= 127 and w < 256 and h < 256):
-                sys.exit(f"{name}: glyph {key} exceeds record range")
-            flags = inst["fmt"] | (cells << 2) | (0x10 if fb else 0)
-            glyph_records.append((len(data), w, h, bx, top, stride, flags, gid, data))
-            bitmaps.append(len(data))
-    report.update(slots=len(slot_keys), instances=len(instances), clipped=clipped, style_fallbacks=fallbacks,
-                  notdef=notdef, bitmap_bytes=sum(bitmaps))
-    if not slot_keys or not instances:
-        sys.exit(f"{name}: the build has no glyphs or no instances")
+    clipped = notdef = 0
+    for key in slot_keys:
+        kind, v = key
+        if kind == "cp":
+            gid = regular.gid(v)
+        elif kind == "gid":
+            gid = v
+        else:
+            shaped = regular.shape(v, role)
+            gid = shaped[0] if len(shaped) == 1 else 0
+        if gid == 0:
+            notdef += 1
+        cells = key_cells(profile, role, key)
+        cp = v if kind == "cp" else -1
+        box = (regular.cell_box if 0x2500 <= cp <= 0x259F or 0x1FB00 <= cp <= 0x1FBFF
+               else regular.bounds(gid) if 0xE0B0 <= cp <= 0xE0D7 and gid else None)
+        ppem, own = inst_ppem, role == "symbols" and gid and not box
+        fit = own or (role == "cjk" and gid and not box)  # shrunk or moved into its cells where it would be cut
+        if own:  # each symbol scaled on its own: the latin em, shrunk until its ink fits its cells
+            x0, y0, x1, y1 = regular.bounds(gid) or (0, 0, 1, 1)
+            ppem = min(em, cells * cw * regular.upem / max(1, x1 - x0), lh * regular.upem / max(1, y1 - y0))
+        snap = 0x1FB00 <= cp <= 0x1FB6F  # sextants, wedges and triangles: thirds and halves of the cell
+        rows, left, top, advance = raster(regular, gid, ppem, box, cells * cw, lh, snap) if gid else (None, 0, 0, 0)
+        while fit and rows and (len(rows[0]) > cells * cw or len(rows) > lh):
+            ppem *= min(cells * cw / len(rows[0]), lh / len(rows)) * 0.98
+            rows, left, top, advance = raster(regular, gid, ppem)
+        if rows is None:
+            glyph_records.append((0, 0, 0, 0, 0, 0, cells << 2, gid, b""))
+            continue
+        w, h = len(rows[0]), len(rows)
+        if box:
+            bx, top = left, baseline - (lh - top)
+        else:
+            bx = round((cells * cw - advance) / 2) + left
+        if fit:
+            bx, top = min(max(bx, 0), cells * cw - w), max(min(top + lift, baseline), baseline + h - lh)
+        if not box and (bx < 0 or bx + w > cells * cw or baseline - top < 0 or baseline - top + h > lh):
+            clipped += 1
+        stride, data = pack_bitmap(rows, fmt)
+        if not (-128 <= bx <= 127 and -128 <= top <= 127 and w < 256 and h < 256):
+            sys.exit(f"{name}: glyph {key} exceeds record range")
+        glyph_records.append((len(data), w, h, bx, top, stride, fmt | (cells << 2), gid, data))
+        bitmaps.append(len(data))
+    report.update(slots=len(slot_keys), clipped=clipped, notdef=notdef, bitmap_bytes=sum(bitmaps))
+    if not slot_keys:
+        sys.exit(f"{name}: the build has no glyphs")
 
     keys = [(k,) if isinstance(k, int) else k for k in cmap] + list(seqs)
     longest = max((len(k) for k in keys), default=0)
@@ -505,10 +526,9 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep):
     pages, payload = [], bytearray()
     page_limit = CONFIG["page_bytes"]
     g = 0
-    while g < len(glyph_records):
-        first, inst_end = g, (g // nglyphs + 1) * nglyphs
-        used = 4
-        while g < inst_end and (g == first or used + 16 + glyph_records[g][0] <= page_limit):
+    while g < nglyphs:
+        first, used = g, 4
+        while g < nglyphs and (g == first or used + 16 + glyph_records[g][0] <= page_limit):
             used += 16 + glyph_records[g][0]
             g += 1
         count = g - first
@@ -536,19 +556,14 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep):
               f"fonttools {tools['fonttools']}; raster {CONFIG['raster']['load']}/{CONFIG['raster']['render']}; "
               f"shaping {shaping_script(role)}/{SHAPING['language']}/{SHAPING['direction']}/default features")
     pname = s(f"shiroko-{name}")
-    meta = struct.pack("<B3x8sIIIIII", ROLES[role], locale, *pname, *build, nglyphs, len(instances))
-    src_recs = b"".join(struct.pack("<II32sII", *s(f), bytes.fromhex(LOCK["faces"][f]["sha256"]),
-                                    *s(spdx_expression(LOCK["licenses"][pkg["license"]]))) for f in sources)
-    inst_recs = bytearray()
-    for inst in instances:
-        iid = hashlib.sha256(json.dumps([LOCK["faces"][inst["face"].id]["sha256"], pkg.get("locale", ""),
-                                         inst["style"], round(inst["ppem"] * 64), inst["baseline"],
-                                         CONFIG["raster"]], sort_keys=True).encode()).digest()[:16]
-        inst_recs += struct.pack("<HBBHHIhhhH16s12x", sources.index(inst["face"].id), real_styles.index(inst["style"]),
-                                 inst["fmt"], inst["size"]["line_height"], inst["size"]["cell_width"],
-                                 round(inst["ppem"] * 64), inst["baseline"], inst["underline"], inst["strike"], 1, iid)
-    style_recs = b"".join(struct.pack("<HBxHH", size["line_height"], req, real_styles.index(pkg["styles"][real]), 0)
-                          for req, real in enumerate(STYLES))
+    meta = struct.pack("<B3x8sIIIIII", ROLES[role], locale, *pname, *build, nglyphs, 1)
+    src_rec = struct.pack("<II32sII", *s(regular.id), bytes.fromhex(LOCK["faces"][regular.id]["sha256"]),
+                          *s(spdx_expression(LOCK["licenses"][pkg["license"]])))
+    iid = hashlib.sha256(json.dumps([LOCK["faces"][regular.id]["sha256"], pkg.get("locale", ""), "regular",
+                                     round(inst_ppem * 64), baseline, CONFIG["raster"]],
+                                    sort_keys=True).encode()).digest()[:16]
+    inst_rec = struct.pack("<HBBHHIhhhH16s12x", 0, 0, fmt, lh, cw, round(inst_ppem * 64), baseline, underline, strike,
+                           1, iid)
     cmap_recs = b"".join(struct.pack("<II", cp, slot_of[k]) for cp, k in sorted(cmap.items()))
     pool, seq_recs = [], bytearray()
     for key in sorted(seqs):
@@ -558,11 +573,11 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep):
     seqpool = struct.pack(f"<{len(pool)}I", *pool)
     coverage = struct.pack("<9I", len(cmap), sum(1 for k in seqs.values() if k[0] == SEQ_GLYPH),
                            sum(1 for k in seqs.values() if k[0] == SEQ_ALIAS), report.get("uvs", 0),
-                           report.get("ivs", 0), report.get("emoji_unsupported", 0), fallbacks,
+                           report.get("ivs", 0), report.get("emoji_unsupported", 0), 0,
                            len(glyph_records), sum(bitmaps))
-    sections = [("MANIFEST", 1, meta), ("STRINGS", len(strings), bytes(strings)), ("SOURCES", len(sources), src_recs),
-                ("INSTANCES", len(instances), bytes(inst_recs)), ("STYLES", len(style_recs) // 8, bytes(style_recs)),
-                ("CMAP", len(cmap), cmap_recs), ("SEQS", len(seqs), bytes(seq_recs)), ("SEQPOOL", len(pool), seqpool),
+    sections = [("MANIFEST", 1, meta), ("STRINGS", len(strings), bytes(strings)), ("SOURCES", 1, src_rec),
+                ("INSTANCES", 1, inst_rec), ("CMAP", len(cmap), cmap_recs), ("SEQS", len(seqs), bytes(seq_recs)),
+                ("SEQPOOL", len(pool), seqpool),
                 ("PAGES", len(pages), None), ("COVERAGE", 9, coverage)]
     table_off = HEADER_SIZE
     off = table_off + ENTRY_SIZE * len(sections)
@@ -574,7 +589,7 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep):
     page_base = off
     page_recs = b"".join(struct.pack("<QQIII4x", page_base + o, xxh3(p), len(p), first, count)
                          for o, p, first, count in pages)
-    layout[8][4] = page_recs
+    next(e for e in layout if e[0] == "PAGES")[4] = page_recs
     body = bytearray(off - HEADER_SIZE)
     table = bytearray()
     for sname, count, soff, length, data in layout:
@@ -582,9 +597,7 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep):
         body[soff - HEADER_SIZE:soff - HEADER_SIZE + length] = data
     body[0:len(table)] = table
     body += payload
-    features = FEAT_SEQ if seqs else 0
-    features |= FEAT_A4 if any(i["fmt"] == FMT_A4 for i in instances) else 0
-    features |= FEAT_A8 if any(i["fmt"] == FMT_A8 for i in instances) else 0
+    features = (FEAT_SEQ if seqs else 0) | (FEAT_A4 if fmt == FMT_A4 else FEAT_A8)
     file_size = HEADER_SIZE + len(body)
     head = struct.pack("<8sHHIIIQQ32s", b"SHRFPKG1", FORMAT_VERSION, HEADER_SIZE, features, len(sections), 0,
                        table_off, file_size, profile.id)
@@ -641,14 +654,14 @@ class Package:
                          key=lambda e: e[2])
         sec, end = {}, toff + ENTRY_SIZE * nsec
         for t, count, off, length, zero, digest in entries:
-            check(1 <= t <= 10 and t not in sec, "unknown or duplicate section")
+            check(1 <= t <= 10 and t != 5 and t not in sec, "unknown or duplicate section")
             check(off >= end and off + length <= fsize, "overlapping sections or out of range")
             data = blob[off:off + length]
             check(zero == 0 and xxh3(data) == digest and count <= 1 << 22, "section checksum or record count")
             sec[t] = (count, data)
             end = off + length
         check(end - toff <= 128 << 20, "package index too large")
-        check(all(t in sec for t in (1, 4, 5, 6, 9)), "missing section")
+        check(all(t in sec for t in (1, 4, 6, 9)), "missing section")
         strings = len(sec.get(2, (0, b""))[1])
         check(sec[1][0] == 1 and len(sec[1][1]) == 36, "MANIFEST")
         (self.role, pad, self.locale, name_off, name_len, build_off, build_len, self.nglyphs,
@@ -656,27 +669,19 @@ class Package:
         check(1 <= self.role <= 5 and pad == bytes(3), "role")
         check(all(c == 0 or 0x20 <= c <= 0x7E for c in self.locale), "locale")
         check(name_off + name_len <= strings and build_off + build_len <= strings, "string reference")
-        check(1 <= self.nglyphs <= 1 << 22 and 1 <= self.ninst <= 64, "glyph or instance count")
-        check(sec[4][0] == self.ninst and len(sec[4][1]) == 48 * self.ninst, "INSTANCES size")
+        check(1 <= self.nglyphs <= 1 << 22 and self.ninst == 1, "glyph or instance count")
+        check(sec[4][0] == 1 and len(sec[4][1]) == 48, "INSTANCES size")
         sources = sec.get(3, (0, b""))
         check(len(sources[1]) == 48 * sources[0], "SOURCES size")
         for name_off, name_len, _, lic_off, lic_len in struct.iter_unpack("<II32sII", sources[1]):
             check(name_off + name_len <= strings and lic_off + lic_len <= strings, "source string reference")
-        self.inst = [struct.unpack_from("<HBBHHIhhhH16s12s", sec[4][1], 48 * i) for i in range(self.ninst)]
-        for src, style, fmt, lh, cw, _, base, under, strike, raster, _, reserved in self.inst:
-            check(3 not in sec or src < sources[0], "instance source")
-            check(style <= 1 and fmt in (FMT_A4, FMT_A8) and feat & (FEAT_A4 if fmt == FMT_A4 else FEAT_A8),
-                  "instance style or format")
-            check(1 <= lh <= 1024 and 1 <= cw <= 1024, "instance size")
-            check(0 <= base <= lh and 0 <= under < lh and 0 <= strike < lh, "instance line metrics")
-            check(raster & ~1 == 0 and reserved == bytes(12), "instance reserved bytes")
-        heights = sorted({i[3] for i in self.inst})
-        check(len(sec[5][1]) == 8 * sec[5][0] and sec[5][0] == 4 * len(heights), "STYLES size")
-        styles = list(struct.iter_unpack("<HBBHH", sec[5][1]))
-        check([(lh, req) for lh, req, _, _, _ in styles] == [(lh, req) for lh in heights for req in range(4)],
-              "style order")
-        for lh, req, zero, idx, zero2 in styles:
-            check(zero == 0 and zero2 == 0 and idx < self.ninst and self.inst[idx][3] == lh, "style mapping")
+        self.inst = struct.unpack("<HBBHHIhhhH16s12s", sec[4][1])
+        src, style, fmt, lh, cw, _, base, under, strike, raster, _, reserved = self.inst
+        check(3 not in sec or src < sources[0], "instance source")
+        check(style == 0 and fmt in (FMT_A4, FMT_A8) and feat & fmt, "instance style or format")
+        check(1 <= lh <= 1024 and 1 <= cw <= 1024, "instance size")
+        check(0 <= base <= lh and 0 <= under < lh and 0 <= strike < lh, "instance line metrics")
+        check(raster & ~1 == 0 and reserved == bytes(12), "instance reserved bytes")
         check(len(sec[6][1]) == 8 * sec[6][0], "CMAP size")
         self.cmap = dict(struct.iter_unpack("<II", sec[6][1]))
         keys = list(self.cmap)
@@ -708,7 +713,7 @@ class Package:
             self.check_page(blob[off:off + length], digest, first, count)
             expect += count
             prev_end = off + length
-        check(expect == self.nglyphs * self.ninst, "pages do not cover every glyph")
+        check(expect == self.nglyphs, "pages do not cover every glyph")
         check(10 not in sec or (sec[10][0] == 9 and len(sec[10][1]) == 36), "COVERAGE size")
 
     def check_page(self, page, digest, first, count):
@@ -716,26 +721,25 @@ class Package:
         for g in range(count):
             off, length, w, h, _, _, stride, flags, _, zero = struct.unpack_from("<IHBBbbBBHH", page, 4 + 16 * g)
             fmt, cells = flags & 3, flags >> 2 & 3
-            check(1 <= cells <= 2 and flags & 0xE0 == 0 and zero == 0, f"glyph {first + g} flags")
+            check(1 <= cells <= 2 and flags & 0xF0 == 0 and zero == 0, f"glyph {first + g} flags")
             if not fmt:
                 check(length == w == h == 0, f"glyph {first + g} without bitmap")
                 continue
             row = (w + 1) // 2 if fmt == FMT_A4 else w
-            check(fmt == self.inst[(first + g) // self.nglyphs][2] and w and h and stride >= row
+            check(fmt == self.inst[2] and w and h and stride >= row
                   and (h - 1) * stride + row <= length and off >= 4 + 16 * count and off + length <= len(page),
                   f"glyph {first + g} bitmap")
             check(fmt == FMT_A8 or w % 2 == 0 or not any(page[off + y * stride + w // 2] & 15 for y in range(h)),
                   f"glyph {first + g} A4 padding")
 
-    def glyph(self, inst, slot):
-        g = inst * self.nglyphs + slot
+    def glyph(self, slot):
         for off, _, length, first, count, _ in self.pages:
-            if first <= g < first + count:
+            if first <= slot < first + count:
                 page = self.blob[off:off + length]
                 boff, blen, w, h, bx, top, stride, flags, _, _ = struct.unpack_from("<IHBBbbBBHH", page,
-                                                                                      4 + 16 * (g - first))
+                                                                                      4 + 16 * (slot - first))
                 return flags & 3, w, h, bx, top, stride, flags, page[boff:boff + blen]
-        raise KeyError(g)
+        raise KeyError(slot)
 
 
 def pinned_profile():
@@ -770,27 +774,25 @@ def cell_fit(pkg):
     for cp in (0x2588, 0x2502, 0x2500, 0xE0B0, 0xE0B2):
         if cp not in pkg.cmap:
             continue
-        ok = True
-        for i, inst in enumerate(pkg.inst):
-            lh, cw, base = inst[3], inst[4], inst[6]
-            fmt, w, h, bx, top, stride, flags, data = pkg.glyph(i, pkg.cmap[cp])
-            cov = [[0] * cw for _ in range(lh)]
-            for y in range(h):
-                for x in range(w):
-                    a = (data[y * stride + x // 2] >> (4 if x % 2 == 0 else 0) & 15) * 17 if fmt == FMT_A4 else data[y * stride + x]
-                    px, py = bx + x, base - top + y
-                    if 0 <= px < cw and 0 <= py < lh:
-                        cov[py][px] = a
-            need = {0x2588: [(x, y) for y in range(lh) for x in range(cw)],
-                    0x2502: [(cw // 2 - 1 + (cw % 2), y) for y in (0, lh - 1)],
-                    0x2500: [(x, lh // 2) for x in (0, cw - 1)],
-                    0xE0B0: [(0, y) for y in range(lh)], 0xE0B2: [(cw - 1, y) for y in range(lh)]}[cp]
-            if cp == 0x2588:
-                ok &= all(cov[y][x] == 255 for x, y in need)
-            elif cp in (0xE0B0, 0xE0B2):
-                ok &= all(cov[y][x] and (cov[y][x] == 255 or y in (0, lh - 1)) for x, y in need)
-            else:
-                ok &= all(any(cov[y][xx] for xx in range(cw)) and any(cov[yy][x] for yy in range(lh)) for x, y in need)
+        lh, cw, base = pkg.inst[3], pkg.inst[4], pkg.inst[6]
+        fmt, w, h, bx, top, stride, flags, data = pkg.glyph(pkg.cmap[cp])
+        cov = [[0] * cw for _ in range(lh)]
+        for y in range(h):
+            for x in range(w):
+                a = (data[y * stride + x // 2] >> (4 if x % 2 == 0 else 0) & 15) * 17 if fmt == FMT_A4 else data[y * stride + x]
+                px, py = bx + x, base - top + y
+                if 0 <= px < cw and 0 <= py < lh:
+                    cov[py][px] = a
+        need = {0x2588: [(x, y) for y in range(lh) for x in range(cw)],
+                0x2502: [(cw // 2 - 1 + (cw % 2), y) for y in (0, lh - 1)],
+                0x2500: [(x, lh // 2) for x in (0, cw - 1)],
+                0xE0B0: [(0, y) for y in range(lh)], 0xE0B2: [(cw - 1, y) for y in range(lh)]}[cp]
+        if cp == 0x2588:
+            ok = all(cov[y][x] == 255 for x, y in need)
+        elif cp in (0xE0B0, 0xE0B2):
+            ok = all(cov[y][x] and (cov[y][x] == 255 or y in (0, lh - 1)) for x, y in need)
+        else:
+            ok = all(any(cov[y][xx] for xx in range(cw)) and any(cov[yy][x] for yy in range(lh)) for x, y in need)
         out[f"U+{cp:04X}"] = ok
         if not ok:
             print(f"warning: U+{cp:04X} does not fill its cell edges")
@@ -798,30 +800,22 @@ def cell_fit(pkg):
 
 
 def preview(pkg, path, report):
-    cells = []
     step = max(1, pkg.nglyphs // 192)
-    for inst_i, inst in enumerate(pkg.inst):
-        lh, cw, baseline = inst[3], inst[4], inst[6]
-        slots = list(range(0, pkg.nglyphs, step))[:192]
-        cols = 32
-        img = Image.new("L", (cols * 2 * cw + 8, ((len(slots) + cols - 1) // cols) * lh + 8), 0)
-        for n, slot in enumerate(slots):
-            fmt, w, h, bx, top, stride, flags, data = pkg.glyph(inst_i, slot)
-            ox, oy = 4 + (n % cols) * 2 * cw, 4 + (n // cols) * lh
-            for y in range(h):
-                for x in range(w):
-                    a = (data[y * stride + x // 2] >> (4 if x % 2 == 0 else 0) & 15) * 17 if fmt == FMT_A4 else \
-                        data[y * stride + x] if fmt == FMT_A8 else 0
-                    px, py = ox + bx + x, oy + baseline - top + y
-                    if 0 <= px < img.width and 0 <= py < img.height:
-                        img.putpixel((px, py), max(img.getpixel((px, py)), a))
-        cells.append(img.resize((img.width * 2, img.height * 2), Image.NEAREST))
-    sheet = Image.new("L", (max(c.width for c in cells), sum(c.height for c in cells)), 32)
-    y = 0
-    for c in cells:
-        sheet.paste(c, (0, y))
-        y += c.height
-    sheet.save(path)
+    lh, cw, baseline = pkg.inst[3], pkg.inst[4], pkg.inst[6]
+    slots = list(range(0, pkg.nglyphs, step))[:192]
+    cols = 32
+    img = Image.new("L", (cols * 2 * cw + 8, ((len(slots) + cols - 1) // cols) * lh + 8), 0)
+    for n, slot in enumerate(slots):
+        fmt, w, h, bx, top, stride, flags, data = pkg.glyph(slot)
+        ox, oy = 4 + (n % cols) * 2 * cw, 4 + (n // cols) * lh
+        for y in range(h):
+            for x in range(w):
+                a = (data[y * stride + x // 2] >> (4 if x % 2 == 0 else 0) & 15) * 17 if fmt == FMT_A4 else \
+                    data[y * stride + x] if fmt == FMT_A8 else 0
+                px, py = ox + bx + x, oy + baseline - top + y
+                if 0 <= px < img.width and 0 <= py < img.height:
+                    img.putpixel((px, py), max(img.getpixel((px, py)), a))
+    img.resize((img.width * 2, img.height * 2), Image.NEAREST).save(path)
     report["preview"] = path.name
 
 
@@ -865,15 +859,14 @@ def write_licenses(out, names, reports):
                 if text.exists():
                     (lic_dir / key / text.name).write_bytes(text.read_bytes())
             inventory["licenses"][key] = entry
-        for style, face_id in pkg["faces"].items():
-            face = LOCK["faces"][face_id]
-            tt = TTFont(io.BytesIO(face_bytes(face_id)), lazy=True)
-            copyright_ = tt["name"].getDebugName(0) or ""
-            inventory["sources"][face_id] = {"file": face["file"], "member": face.get("member"),
-                                             "url": LOCK["files"][face["file"]]["url"], "sha256": face["sha256"],
-                                             "license": spdx_expression(lic), "copyright": copyright_,
-                                             "axes": face.get("axes")}
-            notice.append(f"{face_id}: {copyright_} License: {spdx_expression(lic)} (LICENSES/{key}/)")
+        face_id = pkg["faces"]["regular"]
+        face = LOCK["faces"][face_id]
+        copyright_ = TTFont(io.BytesIO(face_bytes(face_id)), lazy=True)["name"].getDebugName(0) or ""
+        inventory["sources"][face_id] = {"file": face["file"], "member": face.get("member"),
+                                         "url": LOCK["files"][face["file"]]["url"], "sha256": face["sha256"],
+                                         "license": spdx_expression(lic), "copyright": copyright_,
+                                         "axes": face.get("axes")}
+        notice.append(f"{face_id}: {copyright_} License: {spdx_expression(lic)} (LICENSES/{key}/)")
         notice += [f"  {c['name']} ({c['spdx']}): {c['notes']}" for c in lic.get("components", [])
                    if "notes" in c]
         inventory["packages"][f"shiroko-{name}"] = {"license": key, "spdx": spdx_expression(lic), "rfn_checked": rfn,
@@ -907,10 +900,8 @@ def build(names, size, out=None, keep=None):
     tools = fetch(False)
     profile = Profile()
     ivd = ivd_pairs()
-    needed = set(names) | {"latin"}
     resolve_set = CONFIG["packages"]
-    fids = {f for n in needed for f in CONFIG["packages"][n]["faces"].values()}
-    faces = {f: Face(f) for f in fids | {p["faces"]["regular"] for p in resolve_set.values()}}
+    faces = {f: Face(f) for f in {p["faces"]["regular"] for p in resolve_set.values()}}
     providers = resolve_providers(profile, resolve_set, faces)
     gaps = unserved(profile, resolve_set, faces, providers) if keep is None else {}
     out.mkdir(parents=True, exist_ok=True)
@@ -933,8 +924,7 @@ def build(names, size, out=None, keep=None):
             preview(pkg, stage / f"shiroko-{name}.png", report)
             reports[name] = report
             print(f"{out / f'shiroko-{name}.shrf'}: {report['file_bytes']} bytes, {report['cmap']} scalars, "
-                  f"{report['sequences']} sequences, {report['pages']} pages, clipped {report['clipped']}, "
-                  f"style fallbacks {report['style_fallbacks']}")
+                  f"{report['sequences']} sequences, {report['pages']} pages, clipped {report['clipped']}")
         write_licenses(stage, names, reports)
         (stage / "coverage.json").write_text(json.dumps(reports, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         bad = {n: r["unserved"] for n, r in reports.items() if r.get("unserved")}
@@ -955,8 +945,7 @@ def builtin(size, out):
     if not cps <= set(face.cmap):
         sys.exit(f"{face_id} does not cover the built-in scalars")
     profile = Profile()
-    pkg = {"role": "latin", "license": latin["license"], "faces": {"regular": face_id},
-           "styles": dict.fromkeys(STYLES, "regular")}
+    pkg = {"role": "latin", "license": latin["license"], "faces": {"regular": face_id}}
     blob, _ = build_package("builtin", pkg, profile, {face_id: face}, cps, set(), tools, size, cps)
     try:
         Package(blob, profile.id, profile.max_scalars)
@@ -1006,6 +995,14 @@ def verified(path, profile):
         sys.exit(f"{path}: {e}")
 
 
+def named(path, pkg):
+    """The runtime opens shiroko-<role>.shrf, or shiroko-cjk-<locale>.shrf, and rejects any other manifest."""
+    m = re.fullmatch(r"shiroko-(?:(latin|symbols|emoji|nerd)|cjk-(.{1,8}))", pathlib.Path(path).stem)
+    if not m or pkg.role != ROLES[m[1] or "cjk"] or (m[2] and pkg.locale != m[2].encode().ljust(8, b"\0")):
+        sys.exit(f"{path}: package role or locale differs from its file name")
+    return pkg
+
+
 def active_packages(dest):
     """Package id of each package with a valid activation record in dest, by name: the higher generation, slot a
     on a tie (as shr_pl_res_bitmap_font_activation_select() picks)."""
@@ -1050,7 +1047,7 @@ def install_notices(src, dest, packages):
     unknown = sorted(n for n in names if n.removeprefix("shiroko-") not in CONFIG["packages"])
     if unknown:  # the inventory does not record each package's faces
         sys.exit(f"{', '.join(unknown)} not in {FONTS / 'fontpack.config.json'}: cannot tell the source faces to list")
-    faces = {f for n in names for f in CONFIG["packages"][n.removeprefix("shiroko-")]["faces"].values()}
+    faces = {CONFIG["packages"][n.removeprefix("shiroko-")]["faces"]["regular"] for n in names}
     inventory["sources"] = {k: v for k, v in inventory.get("sources", {}).items() if k in faces}
     replace_synced(dest / "inventory.json", (json.dumps(inventory, indent=2, ensure_ascii=False) + "\n").encode())
 
@@ -1062,7 +1059,7 @@ def install(dest, files):
     dirs = {pathlib.Path(f).resolve().parent for f in files}
     if len(dirs) != 1:
         sys.exit("install packages from one build directory at a time")
-    blobs = [(pathlib.Path(f).stem, verified(f, profile).blob) for f in files]
+    blobs = [(pathlib.Path(f).stem, named(f, verified(f, profile)).blob) for f in files]
     install_notices(dirs.pop(), dest, [(name, hashlib.sha256(blob).digest()) for name, blob in blobs])
     for name, blob in blobs:
         pid = hashlib.sha256(blob).digest()
@@ -1119,6 +1116,13 @@ def selftest(packages):
             sys.exit("selftest: install without a licence inventory succeeded")
         except SystemExit as e:
             if "inventory" not in str(e.code):
+                raise
+        shutil.copyfile(src, lone / "shiroko-cjk-xx.shrf")
+        try:
+            install(pathlib.Path(tmp) / "dest3", [lone / "shiroko-cjk-xx.shrf"])
+            sys.exit("selftest: a package installed under another role's or locale's name")
+        except SystemExit as e:
+            if "file name" not in str(e.code):
                 raise
     print("fontpack selftest: ok")
 
@@ -1177,7 +1181,7 @@ def main():
         profile = pinned_profile()
         for f in args.files:
             pkg = verified(f, profile)
-            print(f"{f}: ok ({pkg.nglyphs} slots x {pkg.ninst} instances, {len(pkg.pages)} pages)")
+            print(f"{f}: ok ({pkg.nglyphs} slots, {len(pkg.pages)} pages)")
     elif args.cmd == "selftest":
         selftest(args.packages)
     else:

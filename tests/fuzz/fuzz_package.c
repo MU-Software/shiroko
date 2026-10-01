@@ -1,7 +1,7 @@
 /* Font packages with arbitrary bytes, opened by the font plugin as memory-mapped sources (in place) and
  * through read() (header, table, index and pages read and cached), then read again next to a second package
  * whose reads always fail (two packages cool down). Byte 0 selects the package role (bits 0-2), asynchronous
- * reads completed later (0x08), bold text (0x10), a tiny page cache (0x20), every fourth read failing (0x40)
+ * reads completed later (0x08), bold italic text (0x10), a tiny page cache (0x20), every fourth read failing (0x40)
  * and (0x80) with 0x08 reads that never complete (the watchdog cancels them), else reads returning different
  * bytes each time. Invariants: no out-of-bounds access, every frame rasters (bad packages or pages fall back),
  * both paths draw the same pixels while reads are faithful, each opened source is closed. */
@@ -14,7 +14,7 @@ static const char *const samples[3] = {
     "\xF0\x9F\x98\x80\xE2\x9D\xA4\xEF\xB8\x8F\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x92\xBB",
     "\xEE\x82\xB0\xE2\x96\x88\xE6\xBC\xA2\x65\xCC\x81\xEF\xBF\xBD"};
 
-enum { ASYNC = 0x08, BOLD = 0x10, TINY_CACHE = 0x20, FAIL_FIRST = 0x40, ODD = 0x80 };
+enum { ASYNC = 0x08, BOLD_ITALIC = 0x10, TINY_CACHE = 0x20, FAIL_FIRST = 0x40, ODD = 0x80 };
 
 typedef struct pending_read {
     uint64_t request, offset;
@@ -135,7 +135,7 @@ static void render(pkg_source *src, uint8_t mode) {
     shr_lyr *l;
     FUZZ_CHECK(shr_lyr_create(ctx, 0, (shr_rect){0, 0, FUZZ_W, FUZZ_H}, &l) == SHR_OK);
     FUZZ_CHECK(shr_pl_lyr_tilemap_resize(l, font, 3, FUZZ_W / SHR_CELL_WIDTH, NULL) == SHR_OK);
-    shr_text_style style = {SHR_RGB(255, 255, 255), 0, (mode & BOLD) ? SHR_STYLE_BOLD : 0};
+    shr_text_style style = {SHR_RGB(255, 255, 255), 0, (mode & BOLD_ITALIC) ? SHR_STYLE_BOLD | SHR_STYLE_ITALIC : 0};
     for (int i = 0; i < 3; i++)
         FUZZ_CHECK(shr_pl_lyr_tilemap_set_text(l, i, 0, samples[i], strlen(samples[i]), style, NULL, 0, 0, NULL) ==
                    SHR_OK);

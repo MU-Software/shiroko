@@ -48,6 +48,8 @@ typedef struct shr__resolved {
     shr_image image;
     shr_point offset;  /* top-left of `image` relative to shr__lcmd.anchor */
     bool provisional;  /* temporary fallback: redrawn after pump() reports a change */
+    uint32_t synth;    /* SHR_GLYPH_BOLD / SHR_GLYPH_ITALIC the glyph may be drawn with */
+    int32_t slant_axis;
 } shr__resolved;
 
 typedef struct shr__res_ops {
@@ -102,6 +104,8 @@ typedef enum shr__lcmd_kind {
 
 enum {
     SHR__LCMD_DIM = SHR_GLYPH_DIM, /* GLYPH or FILL at half strength */
+    SHR__LCMD_BOLD = SHR_GLYPH_BOLD, /* GLYPH styles, synthesized where the resource allows */
+    SHR__LCMD_ITALIC = SHR_GLYPH_ITALIC,
     SHR__LCMD_BLINK = 1u << 8 /* hidden while the blink phase is off */
 };
 

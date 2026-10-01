@@ -37,12 +37,14 @@ static int tex_kind(shr_pixel_format f) {
     return f == SHR_FORMAT_RGB565 ? TEX_RGB565 : f == SHR_FORMAT_A4 || f == SHR_FORMAT_A8 ? TEX_R8 : TEX_RGBA8;
 }
 
-enum { MODE_FILL, MODE_GLYPH, MODE_GLYPH_DIM, MODE_IMAGE, MODE_COPY };
+enum { MODE_FILL, MODE_GLYPH, MODE_GLYPH_DIM, MODE_IMAGE, MODE_COPY, MODE_GLYPH_SYNTH };
 
+/* `syn`: src width, height, slant_axis and flags of a MODE_GLYPH_SYNTH quad. */
 typedef struct vtx {
     float x, y, u, v;
     uint8_t rgba[4];
     uint8_t mode, pad[3];
+    int16_t syn[4];
 } vtx;
 
 #define MAX_VERTS (6 * 1024)
@@ -123,33 +125,58 @@ static const char *const vs_src =
     "layout(location = 1) in vec2 a_uv;\n"
     "layout(location = 2) in vec4 a_color;\n"
     "layout(location = 3) in uint a_mode;\n"
+    "layout(location = 4) in ivec4 a_syn;\n"
     "out vec2 v_uv;\n"
     "out vec4 v_color;\n"
     "flat out uint v_mode;\n"
+    "flat out ivec4 v_syn;\n"
     "void main() {\n"
     "    v_uv = a_uv;\n"
     "    v_color = a_color;\n"
     "    v_mode = a_mode;\n"
+    "    v_syn = a_syn;\n"
     "    gl_Position = vec4(a_pos * u_scale - 1.0, 0.0, 1.0);\n"
     "}\n";
 
 /* Blending is source-over with the output alpha; coverage is rounded like the software port's. Opaque
  * colours are quantized here to the target's levels (u_levels): GPUs may convert outputs at half precision,
- * which would round some 8-bit values to the wrong 5/6-bit level. */
+ * which would round some 8-bit values to the wrong 5/6-bit level. MODE_GLYPH_SYNTH evaluates the
+ * shiroko_driver.h coverage formula in integers over the whole source at texel (0, 0);
+ * texelFetch outside the texture is undefined, so columns outside the source are clamped and then masked. */
+_Static_assert(SHR_GLYPH_SLANT / 2 == 27, "the shader's italic slope");
+_Static_assert(4 * SHR_GLYPH_SYNTH_MAX <= INT16_MAX, "slant_axis packs into an int16 attribute");
 static const char *const fs_src =
     "#version 300 es\n"
     "precision highp float;\n"
+    "precision highp int;\n"
     "uniform highp sampler2D u_tex;\n"
     "uniform vec3 u_levels;\n"
     "in vec2 v_uv;\n"
     "in vec4 v_color;\n"
     "flat in uint v_mode;\n"
+    "flat in ivec4 v_syn;\n"
     "out vec4 o;\n"
+    "int cov(int x, int y) {\n"
+    "    int c = int(floor(texelFetch(u_tex, ivec2(clamp(x, 0, v_syn.x - 1), y), 0).r * 255.0 + 0.5));\n"
+    "    return x >= 0 && x < v_syn.x ? c : 0;\n"
+    "}\n"
+    "int bolden(int l, int m, int r) { return (v_syn.w & 2) == 0 || r > m ? m : max(m, l); }\n"
     "void main() {\n"
+    "    ivec2 p = ivec2(floor(v_uv));\n"
     "    if (v_mode == 0u) {\n"
     "        o = v_color;\n"
+    "    } else if (v_mode == 5u) {\n"
+    "        int k = 0, f = 0;\n"
+    "        if ((v_syn.w & 4) != 0) {\n"
+    "            int t = 27 * (v_syn.z - 2 * p.y - 1) + 8388608;\n"
+    "            k = (t >> 8) - 32768, f = t & 255;\n"
+    "        }\n"
+    "        int q = p.x - k, i0 = cov(q - 2, p.y), i1 = cov(q - 1, p.y), i2 = cov(q, p.y), i3 = cov(q + 1, p.y);\n"
+    "        int c = (bolden(i1, i2, i3) * (256 - f) + bolden(i0, i1, i2) * f + 128) >> 8;\n"
+    "        if ((v_syn.w & 1) != 0) c = (c + 1) >> 1;\n"
+    "        o = vec4(v_color.rgb, float(c) / 255.0);\n"
     "    } else {\n"
-    "        vec4 t = texelFetch(u_tex, ivec2(v_uv), 0);\n"
+    "        vec4 t = texelFetch(u_tex, p, 0);\n"
     "        float c = floor(t.r * 255.0 + 0.5);\n"
     "        if (v_mode == 2u) c = floor((c + 1.0) * 0.5);\n"
     "        o = v_mode == 3u ? t : v_mode == 4u ? vec4(t.rgb, 1.0) : vec4(v_color.rgb, c / 255.0);\n"
@@ -225,9 +252,18 @@ static bool staged(const shr_image *m) {
            (bpp == 2 && (uintptr_t)m->pixels % 2);
 }
 
+static bool styled(const shr_draw_cmd *c) {
+    return c->kind == SHR_CMD_GLYPH && c->flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC);
+}
+
+/* The source texels a command reads: a styled glyph's whole source, which its footprint may reach beyond. */
+static shr_rect src_area(const shr_draw_cmd *c) {
+    return styled(c) ? (shr_rect){0, 0, c->src.width, c->src.height} : src_rect(c);
+}
+
 static size_t src_staging(const gl_drv *g, const shr_draw_cmd *c) {
     if (c->src.domain == SHR_MEMORY_DEVICE || !staged(&c->src)) return 0;
-    return 4 * (cacheable(g, c) ? texels((shr_rect){0, 0, c->src.width, c->src.height}) : texels(src_rect(c)));
+    return 4 * (cacheable(g, c) ? texels((shr_rect){0, 0, c->src.width, c->src.height}) : texels(src_area(c)));
 }
 
 /* The software port's checks with this driver's reach; also the destination area and the staging bytes the
@@ -470,7 +506,7 @@ static GLuint cached_texture(gl_drv *g, const shr_draw_cmd *c) {
 /* The texture a command reads and the source texel at its (0, 0). */
 static GLuint source(gl_drv *g, const run *x, const shr_draw_cmd *c, shr_point *off) {
     const shr_image *m = &c->src;
-    shr_rect s = src_rect(c);
+    shr_rect s = src_area(c);
     int kind = tex_kind(m->format);
     if (m->domain == SHR_MEMORY_DEVICE) {
         const surf *f = find(g, m->pixels);
@@ -500,20 +536,28 @@ static void quad(gl_drv *g, const run *x, const shr_draw_cmd *c, shr_point off, 
         shr_point uv = src_point(c, xs[i], ys[i]);
         v[i] = (vtx){(float)(xs[i] - x->origin.x), (float)(ys[i] - x->origin.y), (float)(uv.x - off.x),
                      (float)(uv.y - off.y),
-                     {(uint8_t)(c->color >> 16), (uint8_t)(c->color >> 8), (uint8_t)c->color, alpha}, mode, {0}};
+                     {(uint8_t)(c->color >> 16), (uint8_t)(c->color >> 8), (uint8_t)c->color, alpha}, mode, {0}, {0}};
+    }
+    if (mode == MODE_GLYPH_SYNTH) {
+        /* Checked: W, H <= SHR_GLYPH_SYNTH_MAX and an ITALIC axis within 4 * SHR_GLYPH_SYNTH_MAX. */
+        const int16_t syn[4] = {(int16_t)c->src.width, (int16_t)c->src.height,
+                                (int16_t)(c->flags & SHR_GLYPH_ITALIC ? c->slant_axis : 0), (int16_t)(c->flags & 7)};
+        for (int i = 0; i < 4; i++) memcpy(v[i].syn, syn, sizeof(syn));
     }
     for (int i = 0; i < 6; i++) g->verts[g->nverts++] = v[order[i]];
 }
 
 static void draw(gl_drv *g, const run *x, const shr_draw_cmd *c) {
-    if (shr__rect_empty(c->dst)) return;
+    /* A styled glyph without source columns has no coverage, and no texture can hold it. */
+    if (shr__rect_empty(c->dst) || (styled(c) && !c->src.width)) return;
     shr_point off = {0, 0};
     if (c->kind == SHR_CMD_FILL) {
         quad(g, x, c, off, c->flags & SHR_GLYPH_DIM ? 128 : 255, MODE_FILL);
         return;
     }
     bind(g, source(g, x, c, &off));
-    int mode = c->kind == SHR_CMD_GLYPH ? (c->flags & SHR_GLYPH_DIM ? MODE_GLYPH_DIM : MODE_GLYPH)
+    int mode = styled(c)                ? MODE_GLYPH_SYNTH
+               : c->kind == SHR_CMD_GLYPH ? (c->flags & SHR_GLYPH_DIM ? MODE_GLYPH_DIM : MODE_GLYPH)
                : c->kind == SHR_CMD_IMAGE ? MODE_IMAGE
                                           : MODE_COPY;
     quad(g, x, c, off, 255, (uint8_t)mode);
@@ -645,11 +689,12 @@ shr_status shr_angle_driver_create(const shr_allocator *allocator, uint64_t text
     glBindVertexArray(g->vao);
     glGenBuffers(1, &g->vbo);
     glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
-    for (GLuint i = 0; i < 4; i++) glEnableVertexAttribArray(i);
+    for (GLuint i = 0; i < 5; i++) glEnableVertexAttribArray(i);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, (GLsizei)sizeof(vtx), (const void *)offsetof(vtx, x));
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, (GLsizei)sizeof(vtx), (const void *)offsetof(vtx, u));
     glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, (GLsizei)sizeof(vtx), (const void *)offsetof(vtx, rgba));
     glVertexAttribIPointer(3, 1, GL_UNSIGNED_BYTE, (GLsizei)sizeof(vtx), (const void *)offsetof(vtx, mode));
+    glVertexAttribIPointer(4, 4, GL_SHORT, (GLsizei)sizeof(vtx), (const void *)offsetof(vtx, syn));
     glGenFramebuffers(1, &g->fbo);
     /* ANGLE's viewport and renderbuffer limits are not below its texture size; min(that, MAX_SIZE). */
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &g->max);

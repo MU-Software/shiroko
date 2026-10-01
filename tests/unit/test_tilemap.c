@@ -682,7 +682,8 @@ TEST set_text_style_runs_on_cluster_boundaries(void) {
 
     shr_style_run two[2] = {{0, 3, plain}, {6, 7, {WHITE, 0, SHR_STYLE_BOLD}}}; /* the last one ends the text */
     ASSERT_EQ_LL(RUNS(two, 2), SHR_OK);
-    ASSERT_EQ_LL(cmd(l, 0, 2)->id >> SHR_ID_STYLE_SHIFT, 1);
+    ASSERT_EQ_LL(cmd(l, 0, 2)->id, 'B'); /* styles are drawn, not part of the glyph id */
+    ASSERT_EQ_LL(cmd(l, 0, 2)->flags, SHR__LCMD_BOLD);
     two[1].byte_start = 2;
     ASSERT_EQ_LL(RUNS(two, 2), SHR_E_INVALID_ARG); /* overlaps */
     ASSERT_EQ_LL(err.item_index, 1);
@@ -850,7 +851,8 @@ TEST row_commands_follow_cell_styles(void) {
     shr_lyr *l = open_grid(3, 8, NULL);
     const shr__line_metrics lm = shr__bitmap_font_line_metrics();
     shr__res *res = shr__bitmap_font_res(H.font);
-    uint32_t all = SHR_STYLE_BG | SHR_STYLE_UNDERLINE | SHR_STYLE_STRIKE | SHR_STYLE_DIM | SHR_STYLE_BLINK;
+    uint32_t all = SHR_STYLE_BG | SHR_STYLE_UNDERLINE | SHR_STYLE_STRIKE | SHR_STYLE_DIM | SHR_STYLE_BLINK |
+                   SHR_STYLE_BOLD | SHR_STYLE_ITALIC;
     ASSERT_EQ_LL(set_cell(l, 0, 1, "A", 1, (shr_text_style){RED, BLUE, all}), SHR_OK);
     ASSERT_EQ_LL(ncmds(l, 0), 4);
     const shr__lcmd *bg = cmd(l, 0, 0), *g = cmd(l, 0, 1), *u = cmd(l, 0, 2), *s = cmd(l, 0, 3);
@@ -860,14 +862,15 @@ TEST row_commands_follow_cell_styles(void) {
     ASSERT_EQ_LL(bg->color, BLUE);
     ASSERT(memcmp(&bg->dst, &cell, sizeof(cell)) == 0);
     ASSERT_EQ_LL(g->kind, SHR__LCMD_GLYPH);
-    ASSERT_EQ_LL(g->flags, SHR__LCMD_DIM | SHR__LCMD_BLINK);
+    ASSERT_EQ_LL(g->flags, SHR__LCMD_DIM | SHR__LCMD_BLINK | SHR__LCMD_BOLD | SHR__LCMD_ITALIC);
     ASSERT_EQ_LL(g->color, RED);
     ASSERT(g->res == res);
     ASSERT_EQ_LL(g->id, 'A');
     ASSERT(memcmp(&g->dst, &cell, sizeof(cell)) == 0);
     ASSERT_EQ_LL(g->anchor.x, CW);
     ASSERT_EQ_LL(g->anchor.y, 0);
-    ASSERT_EQ_LL(u->flags, SHR__LCMD_DIM | SHR__LCMD_BLINK);
+    ASSERT_EQ_LL(u->flags, SHR__LCMD_DIM | SHR__LCMD_BLINK); /* the lines are not slanted or thickened */
+    ASSERT_EQ_LL(s->flags, SHR__LCMD_DIM | SHR__LCMD_BLINK);
     ASSERT_EQ_LL(u->color, RED);
     ASSERT_EQ_LL(u->dst.y0, lm.underline_y);
     ASSERT_EQ_LL(u->dst.y1, lm.underline_y + 1);
@@ -880,10 +883,10 @@ TEST row_commands_follow_cell_styles(void) {
     ASSERT_EQ_LL(ncmds(l, 1), 1); /* concealed: background only */
     ASSERT_EQ_LL(set_cell(l, 1, 3, "B", 1, (shr_text_style){RED, 0, SHR_STYLE_BOLD | SHR_STYLE_ITALIC}), SHR_OK);
     ASSERT_EQ_LL(ncmds(l, 1), 2);
-    ASSERT_EQ_LL(cmd(l, 1, 1)->flags, 0);
+    ASSERT_EQ_LL(cmd(l, 1, 1)->flags, SHR__LCMD_BOLD | SHR__LCMD_ITALIC);
     ASSERT_EQ_LL(cmd(l, 1, 1)->anchor.x, 3 * CW);
     ASSERT_EQ_LL(cmd(l, 1, 1)->anchor.y, CH);
-    ASSERT_EQ_LL(cmd(l, 1, 1)->id, (uint64_t)3 << SHR_ID_STYLE_SHIFT | 'B');
+    ASSERT_EQ_LL(cmd(l, 1, 1)->id, 'B');
 
     ASSERT_EQ_LL(set_cell(l, 2, 0, "", 2, (shr_text_style){RED, 0, SHR_STYLE_UNDERLINE}), SHR_OK);
     ASSERT_EQ_LL(ncmds(l, 2), 1); /* no glyph, just the line */
@@ -944,8 +947,8 @@ TEST row_key_follows_every_input(void) {
     shr_pl_res_bitmap_font *f2;
     ASSERT_EQ_LL(shr_pl_res_bitmap_font_create(H.ctx, &fd, &f2), SHR_OK);
     const key_case base = {1, 1, on_blue, "A", RED, false, false};
-    key_case v[8];
-    for (size_t i = 0; i < 8; i++) v[i] = base;
+    key_case v[10];
+    for (size_t i = 0; i < 10; i++) v[i] = base;
     v[0].col = 2;
     v[1].span = 2;
     v[2].style.fg = RED;
@@ -954,8 +957,10 @@ TEST row_key_follows_every_input(void) {
     v[5].background = BLUE;
     v[6].other_font = true;
     v[7].text = "B";
+    v[8].style.flags |= SHR_STYLE_BOLD;
+    v[9].style.flags |= SHR_STYLE_ITALIC;
     XXH128_hash_t k0 = row_key(l, f2, base);
-    for (size_t i = 0; i < 8; i++) {
+    for (size_t i = 0; i < 10; i++) {
         ASSERT(!XXH128_isEqual(row_key(l, f2, v[i]), k0));
         ASSERT(XXH128_isEqual(row_key(l, f2, base), k0));
     }
@@ -1023,6 +1028,25 @@ TEST frames_show_backgrounds_glyphs_and_lines(void) {
     ASSERT_EQ_LL(px(s, 2 * CW + 2, CH + lm.strike_y), 0xFFFFFF);
     for (int y = 2 * CH; y < 3 * CH; y++)
         for (int x = 0; x < CW; x++) ASSERT_EQ_LL(px(s, x, y), 0xFF0000);
+    close_grid(l);
+    PASS();
+}
+
+/* A wide glyph drawn BOLD and ITALIC through the software driver: its footprint stays in its two cells. */
+TEST styled_wide_glyph_stays_in_its_cells(void) {
+    shr_lyr *l = open_grid(2, 6, NULL);
+    ASSERT_EQ_LL(set_cell(l, 0, 1, "\xEA\xB0\x80", 2, plain), SHR_OK);
+    ASSERT_EQ_LL(set_cell(l, 1, 1, "\xEA\xB0\x80", 2, (shr_text_style){WHITE, 0, SHR_STYLE_BOLD | SHR_STYLE_ITALIC}),
+                 SHR_OK);
+    ASSERT_EQ_LL(shr_submit(H.ctx), SHR_OK);
+    settle(H.ctx);
+    const uint8_t *s = H.out.shown;
+    ASSERT(cell_lit(s, 1, 1) && cell_lit(s, 1, 2));
+    ASSERT(!cell_lit(s, 1, 0) && !cell_lit(s, 1, 3));
+    bool differ = false;
+    for (int y = 0; y < CH; y++)
+        for (int x = CW; x < 3 * CW; x++) differ |= px(s, x, y) != px(s, x, CH + y);
+    ASSERT(differ);
     close_grid(l);
     PASS();
 }
@@ -1164,6 +1188,7 @@ int main(int argc, char **argv) {
     RUN_TEST(row_key_follows_every_input);
     RUN_TEST(only_changed_rows_are_rebuilt);
     RUN_TEST(frames_show_backgrounds_glyphs_and_lines);
+    RUN_TEST(styled_wide_glyph_stays_in_its_cells);
     RUN_TEST(calls_are_refused_while_shutting_down);
     RUN_TEST(out_of_memory_is_recoverable);
     GREATEST_MAIN_END();

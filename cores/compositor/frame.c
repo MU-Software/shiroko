@@ -1,4 +1,5 @@
 #include "compositor.h"
+#include "shr_glyph.h"
 
 static void discard(shr_context *ctx, const shr_surface *s) {
     SHR_HOST(ctx, ctx->output.discard(ctx->output.user, s));
@@ -142,19 +143,24 @@ static shr_status emit_resolved(shr_context *ctx, shr__frame *f, const shr_lyr *
         return SHR_E_NO_MEMORY;
     }
     if (slot) *slot = lc->res;
+    bool glyph = lc->kind == SHR__LCMD_GLYPH;
+    uint32_t syn = glyph ? lc->flags & r.synth & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC) : 0;
+    int32_t x0 = 0, x1 = r.image.width;
+    if (syn) shr__glyph_footprint(r.image.width, r.image.height, syn, r.slant_axis, &x0, &x1);
     int64_t x = (int64_t)l->rect.x0 + lc->anchor.x + r.offset.x, y = (int64_t)l->rect.y0 + lc->anchor.y + r.offset.y;
-    shr_rect full = {shr__clamp32(x), shr__clamp32(y), shr__clamp32(x + r.image.width), shr__clamp32(y + r.image.height)};
+    shr_rect full = {shr__clamp32(x + x0), shr__clamp32(y), shr__clamp32(x + x1), shr__clamp32(y + r.image.height)};
     shr_rect d = shr__rect_intersect(full, clip);
     if (shr__rect_empty(d)) return SHR_OK;
     *provisional = r.provisional;
     shr_draw_cmd *c = push_cmd(ctx, f, &st);
     if (!c) return st;
-    *c = (shr_draw_cmd){.kind = lc->kind == SHR__LCMD_GLYPH ? SHR_CMD_GLYPH : SHR_CMD_IMAGE,
-                        .flags = lc->kind == SHR__LCMD_GLYPH ? lc->flags & SHR_GLYPH_DIM : 0,
+    *c = (shr_draw_cmd){.kind = glyph ? SHR_CMD_GLYPH : SHR_CMD_IMAGE,
+                        .flags = glyph ? (lc->flags & SHR_GLYPH_DIM) | syn : 0,
                         .dst = d,
                         .color = lc->color,
                         .src = r.image,
-                        .src_origin = {(int32_t)(d.x0 - x), (int32_t)(d.y0 - y)}};
+                        .src_origin = {(int32_t)(d.x0 - x), (int32_t)(d.y0 - y)},
+                        .slant_axis = syn & SHR_GLYPH_ITALIC ? r.slant_axis : 0};
     return SHR_OK;
 }
 

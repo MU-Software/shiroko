@@ -164,7 +164,7 @@ static int64_t seq_find(const shr__pkg *pkg, const uint32_t *cps, size_t n) {
 typedef struct hit {
     const uint8_t *data, *entry; /* page payload, 16-byte glyph header inside it */
     shr__page *pin;              /* read pages are pinned by the frame */
-    int32_t baseline;
+    const shr__pkg *pkg;
 } hit;
 
 /* A page the frame needs: loaded by the next pump unless it failed or cools down. */
@@ -193,8 +193,8 @@ static int want_page(shr_pl_res_bitmap_font *f, shr__pkg *pkg, uint32_t index, u
     return GLYPH_PENDING;
 }
 
-static int try_package(shr_pl_res_bitmap_font *f, int role, unsigned style, const uint32_t *cps, size_t n,
-                       uint64_t frame, hit *out) {
+static int try_package(shr_pl_res_bitmap_font *f, int role, const uint32_t *cps, size_t n, uint64_t frame,
+                       hit *out) {
     shr__pkg *pkg = &f->pkg[role];
     if (pkg->state == PKG_UNOPENED) {
         if (f->shutting_down) return GLYPH_MISSING;
@@ -206,11 +206,10 @@ static int try_package(shr_pl_res_bitmap_font *f, int role, unsigned style, cons
     if (pkg->state != PKG_READY) return GLYPH_MISSING;
     int64_t slot = n == 1 ? cmap_find(pkg, cps[0]) : seq_find(pkg, cps, n);
     if (slot < 0) return GLYPH_MISSING;
-    uint64_t glyph = (uint64_t)pkg->style_inst[style] * pkg->nglyphs + (uint64_t)slot;
     uint32_t lo = 0, hi = pkg->npages;
     while (hi - lo > 1) {
         uint32_t mid = lo + (hi - lo) / 2;
-        if (shr__rd32(pkg->page_recs + SHR_PKG_ENTRY * (uint64_t)mid + 20) <= glyph)
+        if (shr__rd32(pkg->page_recs + SHR_PKG_ENTRY * (uint64_t)mid + 20) <= slot)
             lo = mid;
         else
             hi = mid;
@@ -224,13 +223,11 @@ static int try_package(shr_pl_res_bitmap_font *f, int role, unsigned style, cons
         if (!p || p->state != PAGE_READY) return want_page(f, pkg, lo, frame);
         data = p->data;
     }
-    *out = (hit){data, data + 4 + 16 * (glyph - shr__rd32(rec + 20)), pkg->mapped ? NULL : p,
-                 pkg->style_baseline[style]};
+    *out = (hit){data, data + 4 + 16 * (slot - shr__rd32(rec + 20)), pkg->mapped ? NULL : p, pkg};
     return GLYPH_READY;
 }
 
-static int text_chain(shr_pl_res_bitmap_font *f, unsigned style, const uint32_t *cps, size_t n, uint64_t frame,
-                      hit *out) {
+static int text_chain(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t n, uint64_t frame, hit *out) {
     int order[5], k = 0;
     uint32_t props = shr__uprops(cps[0]);
     if (n == 1 && (props & SHR_UP_NERD)) order[k++] = ROLE_NERD;
@@ -241,14 +238,13 @@ static int text_chain(shr_pl_res_bitmap_font *f, unsigned style, const uint32_t 
     order[k++] = ROLE_SYMBOLS;
     order[k++] = ROLE_BUILTIN;
     for (int i = 0; i < k; i++) {
-        int r = try_package(f, order[i], style, cps, n, frame, out);
+        int r = try_package(f, order[i], cps, n, frame, out);
         if (r != GLYPH_MISSING) return r;
     }
     return GLYPH_MISSING;
 }
 
 shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t frame, shr__resolved *out) {
-    unsigned style = (unsigned)(id >> SHR_ID_STYLE_SHIFT) & 3;
     uint32_t one = (uint32_t)(id & SHR_ID_VALUE), fffd = 0xFFFD, base = one;
     const uint32_t *cps = &one;
     size_t n = 1;
@@ -263,20 +259,20 @@ shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t fr
     hit h = {0};
     int r;
     if (id & SHR_ID_EMOJI) { /* the emoji glyph, else the text glyph of a single visible scalar */
-        r = try_package(f, ROLE_EMOJI, style, cps, n, frame, &h);
+        r = try_package(f, ROLE_EMOJI, cps, n, frame, &h);
         if (r == GLYPH_MISSING && n > 1 && kind == SHR_GLYPH_SCALAR)
-            r = try_package(f, ROLE_EMOJI, style, &base, 1, frame, &h);
-        if (r == GLYPH_MISSING && kind == SHR_GLYPH_SCALAR) r = text_chain(f, style, &base, 1, frame, &h);
+            r = try_package(f, ROLE_EMOJI, &base, 1, frame, &h);
+        if (r == GLYPH_MISSING && kind == SHR_GLYPH_SCALAR) r = text_chain(f, &base, 1, frame, &h);
     } else {
-        r = text_chain(f, style, cps, n, frame, &h);
-        if (r == GLYPH_MISSING && n > 1 && kind == SHR_GLYPH_SCALAR) r = text_chain(f, style, &base, 1, frame, &h);
+        r = text_chain(f, cps, n, frame, &h);
+        if (r == GLYPH_MISSING && n > 1 && kind == SHR_GLYPH_SCALAR) r = text_chain(f, &base, 1, frame, &h);
     }
-    if (r == GLYPH_MISSING) r = text_chain(f, style, &fffd, 1, frame, &h);
+    if (r == GLYPH_MISSING) r = text_chain(f, &fffd, 1, frame, &h);
     if (r == GLYPH_NO_MEMORY) return SHR_E_NO_MEMORY;
     out->provisional = r == GLYPH_PENDING;
     if (r == GLYPH_PENDING) {
-        r = n == 1 ? try_package(f, ROLE_BUILTIN, style, cps, 1, frame, &h) : GLYPH_MISSING;
-        if (r != GLYPH_READY) try_package(f, ROLE_BUILTIN, style, &fffd, 1, frame, &h);
+        r = n == 1 ? try_package(f, ROLE_BUILTIN, cps, 1, frame, &h) : GLYPH_MISSING;
+        if (r != GLYPH_READY) try_package(f, ROLE_BUILTIN, &fffd, 1, frame, &h);
     }
     const uint8_t *e = h.entry; /* found: the built-in package always has U+FFFD */
     uint8_t fmt = e[11] & 3;
@@ -292,7 +288,12 @@ shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t fr
     }
     out->image = (shr_image){h.data + shr__rd32(e), e[6], e[7], e[10], shr__rd16(e + 4),
                              fmt == 1 ? SHR_FORMAT_A4 : SHR_FORMAT_A8, SHR_MEMORY_CPU};
-    out->offset = (shr_point){(int8_t)e[8], h.baseline - (int8_t)e[9]};
+    out->offset = (shr_point){(int8_t)e[8], h.pkg->baseline - (int8_t)e[9]};
+    /* Emoji and Nerd glyphs, and box drawing and block characters (which join their neighbours), stay as drawn. */
+    bool plain = h.pkg->role == ROLE_EMOJI || h.pkg->role == ROLE_NERD || (base >= 0x2500 && base < 0x25A0) ||
+                 (base >= 0x1FB00 && base < 0x1FC00);
+    out->synth = plain ? 0 : SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC;
+    out->slant_axis = SHR_CELL_HEIGHT - 2 * out->offset.y;
     return SHR_OK;
 }
 

@@ -12,14 +12,7 @@
       "role": "latin",
       "license": "meslo",
       "faces": {
-        "regular": "meslo-lgs-regular",
-        "bold": "meslo-lgs-bold"
-      },
-      "styles": {
-        "regular": "regular",
-        "bold": "bold",
-        "italic": "regular",
-        "bold_italic": "bold"
+        "regular": "meslo-lgs-regular"
       }
     },
     "cjk-ko": {
@@ -27,14 +20,7 @@
       "locale": "ko",
       "license": "noto-cjk",
       "faces": {
-        "regular": "noto-cjk-kr-regular",
-        "bold": "noto-cjk-kr-bold"
-      },
-      "styles": {
-        "regular": "regular",
-        "bold": "bold",
-        "italic": "regular",
-        "bold_italic": "bold"
+        "regular": "noto-cjk-kr-regular"
       }
     },
     "symbols": {
@@ -42,12 +28,6 @@
       "license": "noto-symbols2",
       "faces": {
         "regular": "noto-symbols2-regular"
-      },
-      "styles": {
-        "regular": "regular",
-        "bold": "regular",
-        "italic": "regular",
-        "bold_italic": "regular"
       }
     },
     "emoji": {
@@ -55,12 +35,6 @@
       "license": "noto-emoji",
       "faces": {
         "regular": "noto-emoji-400"
-      },
-      "styles": {
-        "regular": "regular",
-        "bold": "regular",
-        "italic": "regular",
-        "bold_italic": "regular"
       }
     },
     "nerd": {
@@ -68,12 +42,6 @@
       "license": "nerd",
       "faces": {
         "regular": "nerd-mono-regular"
-      },
-      "styles": {
-        "regular": "regular",
-        "bold": "regular",
-        "italic": "regular",
-        "bold_italic": "regular"
       }
     },
     "cjk-ja": {
@@ -81,14 +49,7 @@
       "locale": "ja",
       "license": "noto-cjk",
       "faces": {
-        "regular": "noto-cjk-jp-regular",
-        "bold": "noto-cjk-jp-bold"
-      },
-      "styles": {
-        "regular": "regular",
-        "bold": "bold",
-        "italic": "regular",
-        "bold_italic": "bold"
+        "regular": "noto-cjk-jp-regular"
       }
     },
     "cjk-zh-Hans": {
@@ -96,14 +57,7 @@
       "locale": "zh-Hans",
       "license": "noto-cjk",
       "faces": {
-        "regular": "noto-cjk-sc-regular",
-        "bold": "noto-cjk-sc-bold"
-      },
-      "styles": {
-        "regular": "regular",
-        "bold": "bold",
-        "italic": "regular",
-        "bold_italic": "bold"
+        "regular": "noto-cjk-sc-regular"
       }
     },
     "cjk-zh-Hant": {
@@ -111,14 +65,7 @@
       "locale": "zh-Hant",
       "license": "noto-cjk",
       "faces": {
-        "regular": "noto-cjk-tc-regular",
-        "bold": "noto-cjk-tc-bold"
-      },
-      "styles": {
-        "regular": "regular",
-        "bold": "bold",
-        "italic": "regular",
-        "bold_italic": "bold"
+        "regular": "noto-cjk-tc-regular"
       }
     },
     "cjk-zh-HK": {
@@ -126,14 +73,7 @@
       "locale": "zh-HK",
       "license": "noto-cjk",
       "faces": {
-        "regular": "noto-cjk-hk-regular",
-        "bold": "noto-cjk-hk-bold"
-      },
-      "styles": {
-        "regular": "regular",
-        "bold": "bold",
-        "italic": "regular",
-        "bold_italic": "bold"
+        "regular": "noto-cjk-hk-regular"
       }
     }
   },

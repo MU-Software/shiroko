@@ -70,16 +70,18 @@ static void op_batch(void *arg) {
                             : shr_software_execute(&b->dst, b->cmds, b->n));
 }
 
-static uint8_t a8[CW * CH], a4[(CW + 1) / 2 * CH], rgba[64 * 64 * 4];
+static uint8_t a8[CW * CH], a4[(CW + 1) / 2 * CH], sparse[CW * CH], rgba[64 * 64 * 4];
+static const shr_image a8_src = {a8, CW, CH, CW, sizeof(a8), SHR_FORMAT_A8, SHR_MEMORY_CPU},
+                       a4_src = {a4, CW, CH, (CW + 1) / 2, sizeof(a4), SHR_FORMAT_A4, SHR_MEMORY_CPU},
+                       sparse_src = {sparse, CW, CH, CW, sizeof(sparse), SHR_FORMAT_A8, SHR_MEMORY_CPU};
 
-static shr_draw_cmd *cell_cmds(shr_cmd_kind kind, shr_pixel_format glyph, size_t *n) {
+/* `flags`: BOLD and ITALIC turning about the cell's middle, which the cell-sized source fits. */
+static shr_draw_cmd *cell_cmds(shr_cmd_kind kind, const shr_image *g, uint32_t flags, size_t *n) {
     shr_draw_cmd *c = calloc((size_t)ROWS * COLS, sizeof(*c));
-    shr_image g = glyph == SHR_FORMAT_A8 ? (shr_image){a8, CW, CH, CW, sizeof(a8), SHR_FORMAT_A8, SHR_MEMORY_CPU}
-                                         : (shr_image){a4, CW, CH, (CW + 1) / 2, sizeof(a4), SHR_FORMAT_A4, SHR_MEMORY_CPU};
     for (int r = 0, i = 0; r < ROWS; r++)
         for (int k = 0; k < COLS; k++, i++)
             c[i] = (shr_draw_cmd){.kind = kind, .dst = {k * CW, r * CH, (k + 1) * CW, (r + 1) * CH},
-                                  .color = SHR_RGB(200, 180 + r, k), .src = g};
+                                  .color = SHR_RGB(200, 180 + r, k), .src = *g, .flags = flags, .slant_axis = CH};
     *n = (size_t)ROWS * COLS;
     return c;
 }
@@ -87,6 +89,10 @@ static shr_draw_cmd *cell_cmds(shr_cmd_kind kind, shr_pixel_format glyph, size_t
 static void bench_software(void) {
     for (size_t i = 0; i < sizeof(a8); i++) a8[i] = (uint8_t)(i * 37 % 3 ? i * 53 : 0);
     for (size_t i = 0; i < sizeof(a4); i++) a4[i] = (uint8_t)(i * 29);
+    for (int y = CH / 4; y < CH * 3 / 4; y++) /* a stem with soft edges and a bar: mostly zeros, like a glyph */
+        for (int x = CW / 2 - 2; x <= CW / 2 + 1; x++)
+            sparse[y * CW + x] = x == CW / 2 - 2 || x == CW / 2 + 1 ? 90 : 255;
+    for (int x = 1; x < CW - 1; x++) sparse[CH / 2 * CW + x] = 255;
     for (size_t i = 0; i < sizeof(rgba); i++) rgba[i] = (uint8_t)(i % 4 == 3 ? (i * 7 % 3 ? 255 : 90) : i);
     const double screen_px = (double)W * H;
     shr_surface dst = screen_surface(pixels, W, H, SHR_PIXEL_FORMAT);
@@ -95,15 +101,27 @@ static void bench_software(void) {
     full.flags = SHR_GLYPH_DIM;
     run("software/fill-screen-dim", op_batch, &(batch){NULL, dst, &full, 1}, screen_px, "px");
     size_t n;
-    shr_draw_cmd *cells = cell_cmds(SHR_CMD_FILL, SHR_FORMAT_A8, &n);
+    shr_draw_cmd *cells = cell_cmds(SHR_CMD_FILL, &a8_src, 0, &n);
     run("software/fill-cells", op_batch, &(batch){NULL, dst, cells, n}, screen_px, "px");
     free(cells);
-    cells = cell_cmds(SHR_CMD_GLYPH, SHR_FORMAT_A8, &n);
-    run("software/glyph-a8-cells", op_batch, &(batch){NULL, dst, cells, n}, screen_px, "px");
-    free(cells);
-    cells = cell_cmds(SHR_CMD_GLYPH, SHR_FORMAT_A4, &n);
-    run("software/glyph-a4-cells", op_batch, &(batch){NULL, dst, cells, n}, screen_px, "px");
-    free(cells);
+    static const struct {
+        const char *name;
+        const shr_image *src;
+        uint32_t flags;
+    } glyphs[] = {
+        {"software/glyph-a8-cells", &a8_src, 0},
+        {"software/glyph-a4-cells", &a4_src, 0},
+        {"software/glyph-a8-cells-bold", &a8_src, SHR_GLYPH_BOLD},
+        {"software/glyph-a8-cells-italic", &a8_src, SHR_GLYPH_ITALIC},
+        {"software/glyph-a8-cells-bold-italic", &a8_src, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC},
+        {"software/glyph-a4-cells-bold-italic", &a4_src, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC},
+        {"software/glyph-a8-sparse-bold-italic", &sparse_src, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC},
+    };
+    for (size_t i = 0; i < sizeof(glyphs) / sizeof(glyphs[0]); i++) {
+        cells = cell_cmds(SHR_CMD_GLYPH, glyphs[i].src, glyphs[i].flags, &n);
+        run(glyphs[i].name, op_batch, &(batch){NULL, dst, cells, n}, screen_px, "px");
+        free(cells);
+    }
 
     shr_draw_cmd tiles[(W / 64) * (H / 64)];
     size_t nt = 0;
@@ -130,8 +148,7 @@ static void bench_software(void) {
         for (int k = 0; k < COLS; k++) {
             shr_rect cell = {k * CW, r * CH, (k + 1) * CW, (r + 1) * CH};
             rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_FILL, .dst = cell, .color = SHR_RGB(20, 20, r)};
-            rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_GLYPH, .dst = cell, .color = SHR_RGB(220, 220, 220),
-                                       .src = {a8, CW, CH, CW, sizeof(a8), SHR_FORMAT_A8, SHR_MEMORY_CPU}};
+            rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_GLYPH, .dst = cell, .color = SHR_RGB(220, 220, 220), .src = a8_src};
         }
         rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_CACHE_END};
     }

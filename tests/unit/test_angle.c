@@ -9,6 +9,7 @@
 #include <GLES3/gl3.h>
 
 #include "harness.h"
+#include "shr_glyph.h"
 
 /* Metal blends RGB565 targets at reduced precision; RGBX8888 blends match exactly. */
 #define MAX_BLEND(f) ((f) == SHR_FORMAT_RGB565 ? 1 : 0)
@@ -17,8 +18,8 @@ static const shr_pixel_format FMTS[2] = {SHR_FORMAT_RGB565, SHR_FORMAT_RGBX8888}
 
 static shr_framebuffer_driver gl;
 
-enum { K_FILL, K_DIM, K_GLYPH, K_IMAGE, K_COPY, K_ROTATE, K_GROUP, K_SCENE, KINDS };
-static const char *const kind_names[KINDS] = {"fill", "fill dim", "glyph", "image", "copy", "rotate", "group", "scene"};
+enum { K_FILL, K_DIM, K_GLYPH, K_SYNTH, K_IMAGE, K_COPY, K_ROTATE, K_GROUP, K_SCENE, KINDS };
+static const char *const kind_names[KINDS] = {"fill", "fill dim", "glyph", "styled", "image", "copy", "rotate", "group", "scene"};
 static int max_diff[KINDS][2]; /* by destination format: RGB565, RGBX8888 */
 static void (*pre_execute)(void); /* runs right before the driver's execute() in compare_with() */
 
@@ -571,6 +572,103 @@ TEST glyphs_match(void) {
     PASS();
 }
 
+/* Coverage bytes with runs of 0 and 255, so the BOLD gap rule meets every case. */
+static void coverage_noise(uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t v = rnd();
+        p[i] = (uint8_t)(v % 4 == 0 ? 0 : v % 4 == 1 ? 0xFF : v >> 8);
+    }
+}
+
+/* Every BOLD/ITALIC/DIM mix of `m` with an axis above, inside and below it, each over its whole footprint and
+ * again clipped with src_origin moved by (1, 1) (negative x when the footprint starts left of -1), then a group
+ * drawing the first row under a smaller cache_clip. `white`: white glyphs after an opaque black FILL, so every
+ * RGBX8888 pixel is the coverage itself. */
+static size_t styled_batch(shr_draw_cmd *c, shr_image m, bool white, int32_t *w, int32_t *h) {
+    const uint32_t B = SHR_GLYPH_BOLD, I = SHR_GLYPH_ITALIC, D = SHR_GLYPH_DIM;
+    const uint32_t flags[6] = {B, I, B | I, B | D, I | D, B | I | D};
+    const int32_t axes[3] = {-30, m.height, 2 * m.height + 9};
+    int32_t colw = 0, x0, x1;
+    for (int a = 0; a < 3; a++)
+        for (int f = 0; f < 6; f++) {
+            shr__glyph_footprint(m.width, m.height, flags[f], axes[a], &x0, &x1);
+            colw = x1 - x0 + 1 > colw ? x1 - x0 + 1 : colw;
+        }
+    int32_t rowh = m.height + 1;
+    *w = 6 * colw, *h = 6 * rowh;
+    size_t n = 0;
+    c[n++] = (shr_draw_cmd){.kind = SHR_CMD_FILL, .dst = {0, 0, *w, *h}, .color = white ? 0 : rnd_color()};
+    for (int clipped = 0; clipped < 2; clipped++)
+        for (int a = 0; a < 3; a++)
+            for (int f = 0; f < 6; f++) {
+                shr__glyph_footprint(m.width, m.height, flags[f], axes[a], &x0, &x1);
+                int32_t x = f * colw, y = (clipped * 3 + a) * rowh, k = clipped;
+                c[n++] = (shr_draw_cmd){.kind = SHR_CMD_GLYPH, .flags = flags[f],
+                                        .dst = {x + k, y + k, x + x1 - x0 - k, y + m.height},
+                                        .color = white ? SHR_RGB(255, 255, 255) : rnd_color(), .src = m,
+                                        .src_origin = {x0 + k, k}, .slant_axis = axes[a]};
+            }
+    shr_rect g = {0, 0, 3 * colw, rowh};
+    c[n++] = (shr_draw_cmd){.kind = SHR_CMD_CACHE_BEGIN, .dst = g, .key = {9, 9}, .cache_clip = {2, 1, 2 * colw + 1, rowh - 1}};
+    c[n++] = (shr_draw_cmd){.kind = SHR_CMD_FILL, .dst = g, .color = white ? 0 : rnd_color()};
+    for (int f = 0; f < 3; f++) c[n++] = c[1 + f];
+    c[n++] = (shr_draw_cmd){.kind = SHR_CMD_CACHE_END};
+    return n;
+}
+
+TEST styled_glyphs_match(void) {
+    uint8_t a8[9 * 7], a4[5 * 6], a4s[3 * 3], wide[40 * 4];
+    coverage_noise(a8, sizeof(a8)), coverage_noise(a4, sizeof(a4)), coverage_noise(a4s, sizeof(a4s));
+    noise(wide, sizeof(wide));
+    const shr_image srcs[3] = {{a8, 9, 7, 9, sizeof(a8), SHR_FORMAT_A8, 0},
+                               {a4, 7, 6, 5, sizeof(a4), SHR_FORMAT_A4, 0}, /* odd width, noisy padding */
+                               {a4s, 5, 3, 3, sizeof(a4s), SHR_FORMAT_A4, 0}};
+    shr_framebuffer_driver none;
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, &none), SHR_OK);
+    shr_draw_cmd c[48];
+    int32_t w, h;
+    for (int i = 0; i < 3; i++) {
+        size_t n = styled_batch(c, srcs[i], true, &w, &h);
+        for (int dev = 0; dev < 2; dev++) ASSERT_EQ_LL(compare(c, n, SHR_FORMAT_RGBX8888, w, h, dev, K_SYNTH), 0);
+        /* Uncached: each source is uploaded whole, after a wider one left texels beyond its width. */
+        memmove(c + 2, c + 1, (n - 1) * sizeof(c[0]));
+        c[1] = (shr_draw_cmd){.kind = SHR_CMD_GLYPH, .dst = {0, 0, 40, 4}, .color = SHR_RGB(255, 255, 255),
+                              .src = {wide, 40, 4, 40, sizeof(wide), SHR_FORMAT_A8, 0}};
+        for (int dev = 0; dev < 2; dev++)
+            ASSERT_EQ_LL(compare_with(&none, c, n + 1, SHR_FORMAT_RGBX8888, w, h, dev, K_SYNTH), 0);
+        n = styled_batch(c, srcs[i], false, &w, &h);
+        EACH_TARGET(f, dev) {
+            ASSERT(compare(c, n, f, w, h, dev, K_SYNTH) <= MAX_BLEND(f));
+            ASSERT(compare_with(&none, c, n, f, w, h, dev, K_SYNTH) <= MAX_BLEND(f));
+        }
+    }
+    ASSERT_EQ_LL(shr_angle_driver_destroy(&none), SHR_OK);
+    PASS();
+}
+
+/* The axis bounds, which the int16 attribute must carry exactly. */
+TEST styled_glyphs_match_at_the_axis_bounds(void) {
+    uint8_t a8[6 * 5];
+    coverage_noise(a8, sizeof(a8));
+    shr_image m = {a8, 6, 5, 6, sizeof(a8), SHR_FORMAT_A8, 0};
+    for (int white = 0; white < 2; white++) {
+        shr_draw_cmd c[5] = {{.kind = SHR_CMD_FILL, .dst = {0, 0, 40, 5}, .color = white ? 0 : rnd_color()}};
+        for (int i = 0; i < 4; i++) {
+            int32_t x0, x1, axis = i / 2 ? 4 * SHR_GLYPH_SYNTH_MAX : -4 * SHR_GLYPH_SYNTH_MAX;
+            uint32_t flags = SHR_GLYPH_ITALIC | (i % 2 ? SHR_GLYPH_BOLD : 0);
+            shr__glyph_footprint(6, 5, flags, axis, &x0, &x1);
+            c[1 + i] = (shr_draw_cmd){.kind = SHR_CMD_GLYPH, .flags = flags, .dst = {10 * i, 0, 10 * i + x1 - x0, 5},
+                                      .color = white ? SHR_RGB(255, 255, 255) : rnd_color(), .src = m,
+                                      .src_origin = {x0, 0}, .slant_axis = axis};
+        }
+        if (white)
+            for (int dev = 0; dev < 2; dev++) ASSERT_EQ_LL(compare(c, 5, SHR_FORMAT_RGBX8888, 40, 5, dev, K_SYNTH), 0);
+        else
+            EACH_TARGET(f, dev) ASSERT(compare(c, 5, f, 40, 5, dev, K_SYNTH) <= MAX_BLEND(f));
+    }
+    PASS();
+}
+
 TEST images_match(void) {
     const int32_t w = 33, h = 21;
     enum { IW = 13, IH = 9 };
@@ -863,6 +961,45 @@ TEST invalid_batches_match_the_software_port(void) {
     same_status(&d, &rot_bad, 1, SHR_E_INVALID_ARG);
     static const shr_rect outside[] = {{-1, 0, 2, 2}, {0, -1, 2, 2}, {0, 3, 2, 2}, {0, 0, 2, H + 1}};
     for (int k = 0; k < 4; k++) same_status(&d, &(shr_draw_cmd){.kind = SHR_CMD_FILL, .dst = outside[k]}, 1, SHR_E_INVALID_ARG);
+
+    /* Styled glyphs (of zero coverage, so accepted ones leave the pixels): footprint, sizes, axis bounds. */
+    static uint8_t blank[1025];
+    const uint32_t B = SHR_GLYPH_BOLD, I = SHR_GLYPH_ITALIC;
+    shr_image b4 = {blank, 4, 4, 4, 16, SHR_FORMAT_A8, 0}, none = {NULL, 0, 4, 0, 0, SHR_FORMAT_A8, 0};
+    int32_t x0, x1;
+    shr__glyph_footprint(4, 4, B | I, 3, &x0, &x1);
+    same_status(&d, &(shr_draw_cmd){.kind = SHR_CMD_GLYPH, .flags = B | I, .dst = {0, 0, x1 - x0, 4}, .src = b4,
+                                    .src_origin = {x0, 0}, .slant_axis = 3}, 1, SHR_OK);
+    const shr_draw_cmd paint = {.kind = SHR_CMD_FILL, .dst = r, .color = SHR_RGB(200, 9, 9)};
+    const struct {
+        int32_t ox, oy, w, h;
+        uint32_t flags;
+        int32_t axis;
+        shr_image src;
+        shr_status want;
+    } st[] = {
+        {x0 - 1, 0, x1 - x0, 4, B | I, 3, b4, SHR_E_INVALID_ARG},
+        {x0, 0, x1 - x0 + 1, 4, B | I, 3, b4, SHR_E_INVALID_ARG},
+        {x0, 1, x1 - x0, 4, B | I, 3, b4, SHR_E_INVALID_ARG},
+        {0, 0, 1, 1, B, 3, {blank, 1025, 1, 1025, 1025, SHR_FORMAT_A8, 0}, SHR_E_INVALID_ARG},
+        {0, 0, 1, 1, B, 3, {blank, 1, 1025, 1, 1025, SHR_FORMAT_A8, 0}, SHR_E_INVALID_ARG},
+        {0, 0, 5, 4, B, INT32_MIN, b4, SHR_OK},
+        {0, 0, 1, 4, B, 3, none, SHR_OK},
+        {-1, 0, 1, 4, I, 3, none, SHR_OK},
+    };
+    for (size_t k = 0; k < sizeof(st) / sizeof(st[0]); k++) {
+        shr_draw_cmd c = {.kind = SHR_CMD_GLYPH, .flags = st[k].flags, .dst = {0, 0, st[k].w, st[k].h}, .src = st[k].src,
+                          .src_origin = {st[k].ox, st[k].oy}, .slant_axis = st[k].axis};
+        same_status(&d, (shr_draw_cmd[]){st[k].want == SHR_OK ? fill : paint, c}, 2, st[k].want);
+    }
+    for (int32_t axis = -4097; axis <= 4097; axis += 2 * 4097) { /* the footprint holds the origin: only the bound */
+        shr__glyph_footprint(4, 4, I, axis, &x0, &x1);
+        shr_draw_cmd c = {.kind = SHR_CMD_GLYPH, .flags = I, .dst = {0, 0, x1 - x0, 4}, .src = b4,
+                          .src_origin = {x0, 0}, .slant_axis = axis};
+        same_status(&d, (shr_draw_cmd[]){paint, c}, 2, SHR_E_INVALID_ARG);
+    }
+    shr_draw_cmd bad_img = {.kind = SHR_CMD_IMAGE, .flags = B | I, .dst = {0, 0, 2, 2}, .src = img, .src_origin = {-1, 0}};
+    same_status(&d, &bad_img, 1, SHR_E_INVALID_ARG);
     PASS();
 }
 
@@ -1113,6 +1250,8 @@ SUITE(driver) {
     RUN_TEST(fill_matches);
     RUN_TEST(many_quads_flush_in_batches);
     RUN_TEST(glyphs_match);
+    RUN_TEST(styled_glyphs_match);
+    RUN_TEST(styled_glyphs_match_at_the_axis_bounds);
     RUN_TEST(images_match);
     RUN_TEST(copies_convert_exactly);
     RUN_TEST(copy_scrolls_within_a_surface);

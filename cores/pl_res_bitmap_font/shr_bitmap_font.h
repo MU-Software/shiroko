@@ -8,11 +8,11 @@
 extern const uint8_t shr__builtin_package[];
 extern const size_t shr__builtin_package_size;
 
-/* Glyph id of one cluster in `style_flags` (bold/italic select the instance). Single scalars are
- * encoded directly and longer clusters interned, so ids stay valid for the font's lifetime.
+/* Glyph id of one cluster. Single scalars are encoded directly and longer clusters interned, so ids stay valid
+ * for the font's lifetime.
  * `cls` is the cluster's shr__classify() result; SHR_E_NOT_FOUND for invisible clusters (draw nothing). */
 shr_status shr__bitmap_font_glyph(shr_pl_res_bitmap_font *font, const uint32_t *cps, size_t n,
-                                  const shr__cluster_class *cls, uint32_t style_flags, uint64_t *out_id);
+                                  const shr__cluster_class *cls, uint64_t *out_id);
 
 /* The resource GLYPH commands refer to (res->users counts the tilemaps using the font). */
 shr__res *shr__bitmap_font_res(shr_pl_res_bitmap_font *font);

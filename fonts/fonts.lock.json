@@ -20,10 +20,6 @@
       "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf",
       "sha256": "6bcb2a0703aa137e874fc2dffa85f6c21ba9a67fa329e81b8c801663af7e992a"
     },
-    "NotoSansCJKkr-Bold.otf": {
-      "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/Korean/NotoSansCJKkr-Bold.otf",
-      "sha256": "26d0c6748500a0444844280b308f5b62c7ae92ac6c6ac88148e502dd211eb52a"
-    },
     "noto-cjk-LICENSE": {
       "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/LICENSE",
       "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
@@ -128,66 +124,35 @@
       "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf",
       "sha256": "68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5"
     },
-    "NotoSansCJKjp-Bold.otf": {
-      "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/Japanese/NotoSansCJKjp-Bold.otf",
-      "sha256": "e53dcb0dcb2922e45d01aae1ebd2f382bb81d4229b18b6b883bd170678af1f76"
-    },
     "NotoSansCJKsc-Regular.otf": {
       "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
       "sha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b"
-    },
-    "NotoSansCJKsc-Bold.otf": {
-      "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Bold.otf",
-      "sha256": "b5f0d1a190a7f9b43c310a8850630af12553df32c4c050543f9059732d9b4c0a"
     },
     "NotoSansCJKtc-Regular.otf": {
       "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf",
       "sha256": "dce08bd4fd91aa8aa76ed8fea4b694c2dfb8550f67871e326843212ddbeb88b4"
     },
-    "NotoSansCJKtc-Bold.otf": {
-      "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Bold.otf",
-      "sha256": "3ee160e5015106e3ec1a394301df54fa9bbbf8a251519984aec5c0abc50840c0"
-    },
     "NotoSansCJKhk-Regular.otf": {
       "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/TraditionalChineseHK/NotoSansCJKhk-Regular.otf",
       "sha256": "97c937514d645eae90415d30ba025e08a94d5bdffdc627404864f90aa0c7d83b"
-    },
-    "NotoSansCJKhk-Bold.otf": {
-      "url": "https://github.com/notofonts/noto-cjk/raw/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/OTF/TraditionalChineseHK/NotoSansCJKhk-Bold.otf",
-      "sha256": "a9b0265b7beae89767bb952094a1765fb8b4868064974e5f12ec783d8fe97d99"
     }
   },
   "faces": {
     "meslo-lgs-regular": {
       "file": "meslo-lg-v1.2.1.zip",
       "member": "Meslo LG v1.2.1/MesloLGS-Regular.ttf",
-      "style": "regular",
       "sha256": "9f142c57ab4fd32f0af16b750e42fe3421013ac83d384439aff9eed0f89b884a"
-    },
-    "meslo-lgs-bold": {
-      "file": "meslo-lg-v1.2.1.zip",
-      "member": "Meslo LG v1.2.1/MesloLGS-Bold.ttf",
-      "style": "bold",
-      "sha256": "7ff31389389b91d9b7055fd16bb19ae3f27c182adef0a022b30e45d0363faea1"
     },
     "noto-cjk-kr-regular": {
       "file": "NotoSansCJKkr-Regular.otf",
-      "style": "regular",
       "sha256": "6bcb2a0703aa137e874fc2dffa85f6c21ba9a67fa329e81b8c801663af7e992a"
-    },
-    "noto-cjk-kr-bold": {
-      "file": "NotoSansCJKkr-Bold.otf",
-      "style": "bold",
-      "sha256": "26d0c6748500a0444844280b308f5b62c7ae92ac6c6ac88148e502dd211eb52a"
     },
     "noto-symbols2-regular": {
       "file": "NotoSansSymbols2-Regular.ttf",
-      "style": "regular",
       "sha256": "7d5fb73b7ca67a6798101741f5d280a3d016a56a197afcd4199dbb57b4b82a21"
     },
     "noto-emoji-400": {
       "file": "NotoEmoji-wght.ttf",
-      "style": "regular",
       "axes": {
         "wght": 400
       },
@@ -196,48 +161,23 @@
     "nerd-mono-regular": {
       "file": "NerdFontsSymbolsOnly-v3.4.0.zip",
       "member": "SymbolsNerdFontMono-Regular.ttf",
-      "style": "regular",
       "sha256": "f0f624d9b474bea1662cf7e862d44aebe1ae1f6c7f9cb7a0ca5d0e5ac9561c60"
     },
     "noto-cjk-jp-regular": {
       "file": "NotoSansCJKjp-Regular.otf",
-      "style": "regular",
       "sha256": "68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5"
-    },
-    "noto-cjk-jp-bold": {
-      "file": "NotoSansCJKjp-Bold.otf",
-      "style": "bold",
-      "sha256": "e53dcb0dcb2922e45d01aae1ebd2f382bb81d4229b18b6b883bd170678af1f76"
     },
     "noto-cjk-sc-regular": {
       "file": "NotoSansCJKsc-Regular.otf",
-      "style": "regular",
       "sha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b"
-    },
-    "noto-cjk-sc-bold": {
-      "file": "NotoSansCJKsc-Bold.otf",
-      "style": "bold",
-      "sha256": "b5f0d1a190a7f9b43c310a8850630af12553df32c4c050543f9059732d9b4c0a"
     },
     "noto-cjk-tc-regular": {
       "file": "NotoSansCJKtc-Regular.otf",
-      "style": "regular",
       "sha256": "dce08bd4fd91aa8aa76ed8fea4b694c2dfb8550f67871e326843212ddbeb88b4"
-    },
-    "noto-cjk-tc-bold": {
-      "file": "NotoSansCJKtc-Bold.otf",
-      "style": "bold",
-      "sha256": "3ee160e5015106e3ec1a394301df54fa9bbbf8a251519984aec5c0abc50840c0"
     },
     "noto-cjk-hk-regular": {
       "file": "NotoSansCJKhk-Regular.otf",
-      "style": "regular",
       "sha256": "97c937514d645eae90415d30ba025e08a94d5bdffdc627404864f90aa0c7d83b"
-    },
-    "noto-cjk-hk-bold": {
-      "file": "NotoSansCJKhk-Bold.otf",
-      "style": "bold",
-      "sha256": "a9b0265b7beae89767bb952094a1765fb8b4868064974e5f12ec783d8fe97d99"
     }
   },
   "licenses": {

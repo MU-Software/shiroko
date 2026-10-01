@@ -60,7 +60,7 @@ static shr_status cell_glyph(shr_pl_res_bitmap_font *font, shr__cell *e, const u
                              const shr__cluster_class *cls) {
     e->has_glyph = false;
     if (!n) return SHR_OK;
-    shr_status st = shr__bitmap_font_glyph(font, cps, n, cls, e->style.flags, &e->glyph);
+    shr_status st = shr__bitmap_font_glyph(font, cps, n, cls, &e->glyph);
     e->has_glyph = st == SHR_OK;
     return st == SHR_E_NOT_FOUND ? SHR_OK : st;
 }
@@ -139,6 +139,8 @@ static shr_status build_row(shr__tilemap *t, int32_t r) {
         if (e->kind != CELL_HEAD) continue;
         uint32_t f = e->style.flags, blink = (f & SHR_STYLE_BLINK) ? SHR__LCMD_BLINK : 0;
         uint32_t fx = ((f & SHR_STYLE_DIM) ? SHR__LCMD_DIM : 0) | blink;
+        uint32_t gx = fx | ((f & SHR_STYLE_BOLD) ? SHR__LCMD_BOLD : 0) |
+                      ((f & SHR_STYLE_ITALIC) ? SHR__LCMD_ITALIC : 0); /* glyph styles: not on the lines */
         uint64_t h[4] = {(uint64_t)c << 32 | e->span, (uint64_t)e->style.fg << 32 | e->style.bg,
                          (uint64_t)f << 1 | e->has_glyph, e->glyph};
         XXH3_128bits_update(&key, h, sizeof h);
@@ -149,7 +151,7 @@ static shr_status build_row(shr__tilemap *t, int32_t r) {
         }
         if (!(f & SHR_STYLE_CONCEAL)) {
             if (e->has_glyph)
-                ok &= push(t, (shr__lcmd){SHR__LCMD_GLYPH, fx, dst,
+                ok &= push(t, (shr__lcmd){SHR__LCMD_GLYPH, gx, dst,
                                           {dst.x0, dst.y0}, e->style.fg, res, e->glyph, {0}});
             if (f & SHR_STYLE_UNDERLINE)
                 ok &= push(t, (shr__lcmd){SHR__LCMD_FILL, fx, {dst.x0, y + lm.underline_y, dst.x1, y + lm.underline_y + 1},

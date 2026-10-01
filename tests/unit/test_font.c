@@ -119,15 +119,21 @@ static void font_free_now(shr_context *ctx, shr_pl_res_bitmap_font *f) {
 
 /* ===== Glyphs ===== */
 
-static uint64_t glyph(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t n, uint32_t style) {
+static uint64_t glyph(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t n) {
     shr__cluster_class cls;
     shr__classify(cps, n, &cls);
     uint64_t id = 0;
-    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, cps, n, &cls, style, &id), SHR_OK);
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, cps, n, &cls, &id), SHR_OK);
     return id;
 }
 
-static uint64_t glyph1(shr_pl_res_bitmap_font *f, uint32_t cp, uint32_t style) { return glyph(f, &cp, 1, style); }
+static uint64_t glyph1(shr_pl_res_bitmap_font *f, uint32_t cp) { return glyph(f, &cp, 1); }
+
+/* A+U+0301: the glyph on a synthetic package's second page. */
+static uint64_t glyph2(shr_pl_res_bitmap_font *f) {
+    const uint32_t s[2] = {'A', 0x301};
+    return glyph(f, s, 2);
+}
 
 static uint64_t frame_no = 1000;
 
@@ -194,16 +200,18 @@ static shr_status last_failure(shr_context *ctx) {
 }
 
 /* ===== Synthetic packages =====
- * Two CWxCH instances (A4 regular, A8 bold), glyph slots cp0, 'B' (empty) and one shared by the sequences
- * A+U+0301 and B+U+0301 (and cp1 other than 'B'), one page per instance. The table lists STRINGS first. */
+ * One CWxCH instance (A4 or A8), glyph slots cp0, 'B' (empty) and one shared by the sequences A+U+0301 and
+ * B+U+0301 (and cp1 other than 'B'): slots 0 and 1 on the first page, slot 2 on the second. The table lists
+ * STRINGS first. */
 enum {
-    SY_NSEC = 9,
+    SY_NSEC = 8,
     SY_MAN = 128 + 32 * SY_NSEC, SY_STR = SY_MAN + 36, SY_SRC = SY_STR + 8, SY_INS = SY_SRC + 48,
-    SY_STY = SY_INS + 96, SY_CMAP = SY_STY + 32, SY_SEQ = SY_CMAP + 16, SY_POOL = SY_SEQ + 24,
-    SY_PGS = SY_POOL + 16, SY_PAGE0 = SY_PGS + 64, SY_PAGE1 = SY_PAGE0 + 68, SY_SIZE = SY_PAGE1 + 84,
-    SY_G0 = SY_PAGE0 + 4, SY_G1 = SY_G0 + 16, SY_BASE = CH - 4
+    SY_CMAP = SY_INS + 48, SY_SEQ = SY_CMAP + 16, SY_POOL = SY_SEQ + 24, SY_PGS = SY_POOL + 16,
+    SY_PAGE0 = SY_PGS + 64, SY_PAGE1 = SY_PAGE0 + 52, SY_SIZE = SY_PAGE1 + 36,
+    SY_G0 = SY_PAGE0 + 4, SY_G1 = SY_G0 + 16, SY_BM0 = SY_PAGE0 + 36, SY_BM2 = SY_PAGE1 + 20,
+    SY_BASE = CH - 4, SY_A4 = 1, SY_A8 = 2
 };
-#define SY_TE(type) (128 + 32 * ((type) == 1 ? 1 : (type) == 2 ? 0 : (type) - 1))
+#define SY_TE(type) (128 + 32 * ((type) == 1 ? 1 : (type) == 2 ? 0 : (type) < 5 ? (type) - 1 : (type) - 2))
 #define SY_PG(i) (SY_PGS + 32 * (i)) /* page record: offset, hash +8, length +16, first +20, count +24 */
 
 static void put(uint8_t *p, uint64_t v, int n) {
@@ -228,87 +236,57 @@ static void seal_n(uint8_t *d, uint64_t size) {
 
 static void seal(uint8_t *d) { seal_n(d, SY_SIZE); }
 
-static void synth_as(uint8_t *d, uint8_t role, const char *locale, uint32_t cp0, uint32_t cp1) {
-    static const uint32_t offs[11] = {0, SY_MAN, SY_STR, SY_SRC, SY_INS, SY_STY, SY_CMAP, SY_SEQ, SY_POOL, SY_PGS, SY_PAGE0};
-    static const uint32_t counts[10] = {0, 1, 8, 1, 2, 4, 2, 2, 4, 2};
+static void synth_as(uint8_t *d, uint8_t role, const char *locale, uint32_t cp0, uint32_t cp1, uint8_t fmt) {
+    static const uint32_t offs[10] = {0, SY_MAN, SY_STR, SY_SRC, SY_INS, 0, SY_CMAP, SY_SEQ, SY_POOL, SY_PGS};
+    static const uint32_t lens[10] = {0, 36, 8, 48, 48, 0, 16, 24, 16, 64};
+    static const uint32_t counts[10] = {0, 1, 8, 1, 1, 0, 2, 2, 4, 2};
     static const uint32_t pool[4] = {'A', 0x301, 'B', 0x301};
     memset(d, 0, SY_SIZE);
     memcpy(d, "SHRFPKG1", 8);
-    put(d + 8, 2, 2), put(d + 10, 128, 2), put(d + 12, 7, 4), put(d + 16, SY_NSEC, 4), put(d + 24, 128, 8);
+    put(d + 8, 3, 2), put(d + 10, 128, 2), put(d + 12, fmt | 4u, 4), put(d + 16, SY_NSEC, 4), put(d + 24, 128, 8);
     put(d + 32, SY_SIZE, 8);
     memcpy(d + 40, shr__text_profile_id, 32);
     for (uint32_t t = 1; t <= 9; t++)
-        put(d + SY_TE(t), t, 4), put(d + SY_TE(t) + 4, counts[t], 4), put(d + SY_TE(t) + 8, offs[t], 8),
-            put(d + SY_TE(t) + 16, offs[t + 1] - offs[t], 4);
+        if (t != 5)
+            put(d + SY_TE(t), t, 4), put(d + SY_TE(t) + 4, counts[t], 4), put(d + SY_TE(t) + 8, offs[t], 8),
+                put(d + SY_TE(t) + 16, lens[t], 4);
     d[SY_MAN] = role;
     memcpy(d + SY_MAN + 4, locale, strlen(locale));
     put(d + SY_MAN + 16, 4, 4), put(d + SY_MAN + 20, 4, 4), put(d + SY_MAN + 24, 4, 4);
-    put(d + SY_MAN + 28, 3, 4), put(d + SY_MAN + 32, 2, 4);
+    put(d + SY_MAN + 28, 3, 4), put(d + SY_MAN + 32, 1, 4);
     memcpy(d + SY_STR, "synthpkg", 8);
-    for (int i = 0; i < 2; i++) {
-        uint8_t *r = d + SY_INS + 48 * i;
-        r[2] = (uint8_t)i, r[3] = (uint8_t)(i + 1);
-        put(r + 4, CH, 2), put(r + 6, CW, 2), put(r + 12, SY_BASE, 2), put(r + 14, CH - 2, 2), put(r + 16, CH / 2, 2);
-    }
-    for (int req = 0; req < 4; req++) {
-        uint8_t *r = d + SY_STY + 8 * req;
-        put(r, CH, 2), r[2] = (uint8_t)req, r[4] = (uint8_t)(req & 1);
-    }
+    d[SY_INS + 3] = fmt;
+    put(d + SY_INS + 4, CH, 2), put(d + SY_INS + 6, CW, 2), put(d + SY_INS + 12, SY_BASE, 2);
+    put(d + SY_INS + 14, CH - 2, 2), put(d + SY_INS + 16, CH / 2, 2);
     put(d + SY_CMAP, cp0, 4), put(d + SY_CMAP + 8, cp1, 4), put(d + SY_CMAP + 12, cp1 == 'B' ? 1 : 2, 4);
     for (int i = 0; i < 4; i++) put(d + SY_POOL + 4 * i, pool[i], 4);
     for (int i = 0; i < 2; i++) {
         uint8_t *r = d + SY_SEQ + 12 * i;
         r[0] = 2, r[1] = 1, put(r + 4, 2 * (uint64_t)i, 4), put(r + 8, 2, 4);
     }
-    for (int i = 0; i < 2; i++) {
-        uint32_t at = i ? SY_PAGE1 : SY_PAGE0, stride = i ? 4 : 2, len = 4 * stride;
-        uint8_t *rec = d + SY_PG(i), *pg = d + at, fmt = (uint8_t)(i + 1);
-        put(rec, at, 8), put(rec + 16, 52 + 2 * len, 4), put(rec + 20, 3 * (uint64_t)i, 4), put(rec + 24, 3, 4);
-        put(pg, 3, 4);
-        for (int g = 0; g < 3; g += 2) {
-            uint8_t *e = pg + 4 + 16 * g;
-            put(e, 52 + (g / 2) * len, 4), put(e + 4, len, 2);
-            e[6] = 4, e[7] = 4, e[8] = (uint8_t)(g ? 0 : 1), e[9] = SY_BASE, e[10] = (uint8_t)stride;
-            e[11] = (uint8_t)(fmt | (g ? 8 : 4));
-        }
-        pg[4 + 16 + 11] = 4;
-        memset(pg + 52, 0xFF, 2 * len);
+    uint8_t stride = fmt == SY_A4 ? 2 : 4;
+    for (int i = 0; i < 2; i++) { /* slot 0 at x 1 on the baseline; slot 2 two cells wide, 3 rows lower */
+        uint32_t at = i ? SY_PAGE1 : SY_PAGE0, count = i ? 1 : 2, table = 4 + 16 * count;
+        uint8_t *rec = d + SY_PG(i), *pg = d + at, *e = pg + 4;
+        put(rec, at, 8), put(rec + 16, table + 16, 4), put(rec + 20, 2 * (uint64_t)i, 4), put(rec + 24, count, 4);
+        put(pg, count, 4);
+        put(e, table, 4), put(e + 4, 4u * stride, 2);
+        e[6] = 4, e[7] = 4, e[8] = (uint8_t)(i ? 0 : 1), e[9] = (uint8_t)(i ? SY_BASE - 3 : SY_BASE), e[10] = stride;
+        e[11] = (uint8_t)(fmt | (i ? 8 : 4));
+        if (!i) pg[4 + 16 + 11] = 4;
+        memset(pg + table, 0xFF, 16);
     }
     seal(d);
 }
 
-static void synth(uint8_t *d) { synth_as(d, ROLE_LATIN, "", 'A', 'B'); }
-
-static void put_style(uint8_t *r, uint16_t line_height, uint8_t req, uint16_t instance) {
-    put(r, line_height, 2), r[2] = req, put(r + 4, instance, 2);
-}
-
-/* The synthetic package with the Bold instance at line height CH + 8, so STYLES holds two groups (32 bytes more).
- * bad 1: the second group repeats line height CH; bad 2: the first group switches line height. */
-static void synth_tall(uint8_t *t, int bad) {
-    uint8_t d[SY_SIZE];
-    synth(d);
-    memset(t, 0, SY_SIZE + 32);
-    memcpy(t, d, SY_CMAP);
-    memcpy(t + SY_CMAP + 32, d + SY_CMAP, SY_SIZE - SY_CMAP);
-    for (uint32_t type = 6; type <= 9; type++) put(t + SY_TE(type) + 8, shr__rd64(t + SY_TE(type) + 8) + 32, 8);
-    for (int i = 0; i < 2; i++) put(t + SY_PG(i) + 32, shr__rd64(t + SY_PG(i) + 32) + 32, 8);
-    put(t + SY_TE(5) + 4, 8, 4), put(t + SY_TE(5) + 16, 64, 4), put(t + 32, SY_SIZE + 32, 8);
-    put(t + SY_INS + 48 + 4, CH + 8, 2);
-    for (uint8_t req = 0; req < 4; req++) {
-        put_style(t + SY_STY + 8 * req, CH, req, 0);
-        put_style(t + SY_STY + 32 + 8 * req, bad == 1 ? CH : CH + 8, req, bad == 1 ? 0 : 1);
-    }
-    if (bad == 2) put_style(t + SY_STY + 8, CH + 8, 1, 1);
-    seal_n(t, SY_SIZE + 32);
-}
+static void synth(uint8_t *d) { synth_as(d, ROLE_LATIN, "", 'A', 'B', SY_A4); }
 
 /* How a latin package ends: the RESOURCE_FAILED status, SHR_OK when 'A' resolves from it. */
 static shr_status pkg_status(shr_context *ctx, tsrc *s) {
     lib l = {.src = {[ROLE_LATIN] = s}};
     shr_pl_res_bitmap_font *f = font_new(ctx, &l, NULL);
     shr__resolved r;
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', 0), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &r), SHR_OK);
     shr_status st = last_failure(ctx);
     ASSERT_EQ_LL(r.provisional, st == SHR_E_IO); /* a package cooling down after I/O errors is retried */
     if (st == SHR_OK && r.image.height != 4) st = SHR_E_NOT_FOUND;
@@ -354,7 +332,7 @@ TEST test_create_and_destroy_rules(void) {
     ASSERT_EQ_LL(shr_pl_res_bitmap_font_destroy(f), SHR_E_STATE);
     ASSERT_EQ_LL(shr_lyr_destroy(layer), SHR_OK);
     shr__resolved r;
-    load(ctx, f, glyph1(f, 0xAC00, 0), &r); /* open() runs as a host callback */
+    load(ctx, f, glyph1(f, 0xAC00), &r); /* open() runs as a host callback */
     ASSERT_EQ_LL(l.opens, 3);
     ASSERT_EQ_LL(l.refused, 6);
     ASSERT_EQ_LL(shr_pl_res_bitmap_font_destroy(f), SHR_OK);
@@ -399,7 +377,7 @@ TEST test_out_of_memory(void) {
                 shr__cluster_class cls;
                 shr__classify(seq, 2, &cls);
                 uint64_t id;
-                st = shr__bitmap_font_glyph(f, seq, 2, &cls, 0, &id);
+                st = shr__bitmap_font_glyph(f, seq, 2, &cls, &id);
                 shr__resolved r = {0};
                 if (st == SHR_OK) st = load(ctx, f, id, &r);
                 done = st == SHR_OK && inside(&r, d, SY_SIZE) == (mode == SRC_MAP) && r.image.height == 4;
@@ -425,14 +403,25 @@ TEST test_builtin_without_packages(void) {
     shr_pl_res_bitmap_font *fonts[2] = {font_new(ctx, NULL, NULL), font_new(ctx, &l, NULL)};
     for (int i = 0; i < 2; i++) {
         shr_pl_res_bitmap_font *f = fonts[i];
-        shr__resolved a, bold, fffd, hangul;
-        ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', 0), &a), SHR_OK);
+        shr__resolved a, fffd, hangul;
+        ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &a), SHR_OK);
         ASSERT(!a.provisional && a.image.height > 4 && inside(&a, shr__builtin_package, shr__builtin_package_size));
-        ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', SHR_STYLE_BOLD | SHR_STYLE_ITALIC), &bold), SHR_OK);
-        ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xFFFD, 0), &fffd), SHR_OK);
-        ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00, 0), &hangul), SHR_OK);
+        ASSERT_EQ_LL(a.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC);
+        ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xFFFD), &fffd), SHR_OK);
+        ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00), &hangul), SHR_OK);
         ASSERT(!hangul.provisional && same_image(&hangul, &fffd)); /* not installed: U+FFFD */
-        ASSERT_EQ_LL(load(ctx, f, glyph1(f, ' ', 0), &a), SHR_E_NOT_FOUND); /* empty glyph: nothing to draw */
+        ASSERT_EQ_LL(hangul.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC);
+        static const uint32_t box[4] = {0x2500, 0x259F, 0x1FB00, 0x1FBFF}, text[4] = {0x24FF, 0x25A0, 0x1FAFF, 0x1FC00};
+        for (int k = 0; k < 4; k++) { /* box drawing and blocks join their neighbours, whatever draws them */
+            ASSERT_EQ_LL(load(ctx, f, box[k], &a), SHR_OK);
+            ASSERT_EQ_LL(a.synth, 0);
+            ASSERT_EQ_LL(load(ctx, f, text[k], &a), SHR_OK);
+            ASSERT_EQ_LL(a.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC);
+        }
+        uint32_t cluster[2] = {0x2500, 0xFE0E};
+        ASSERT_EQ_LL(load(ctx, f, glyph(f, cluster, 2), &a), SHR_OK); /* by the cluster's base */
+        ASSERT_EQ_LL(a.synth, 0);
+        ASSERT_EQ_LL(load(ctx, f, glyph1(f, ' '), &a), SHR_E_NOT_FOUND); /* empty glyph: nothing to draw */
     }
     ASSERT_EQ_LL(l.opens, 3); /* latin, CJK and symbols, each asked once */
     shr__line_metrics lm = shr__bitmap_font_line_metrics();
@@ -452,41 +441,41 @@ TEST test_glyph_ids(void) {
     shr__cluster_class cls;
     shr__classify(&a, 1, &cls);
     uint64_t id;
-    ASSERT_EQ_LL(shr__bitmap_font_glyph(NULL, &a, 1, &cls, 0, &id), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, NULL, 1, &cls, 0, &id), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &a, 0, &cls, 0, &id), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &a, 1, NULL, 0, &id), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &a, 1, &cls, 0, NULL), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &big, 1, &cls, 0, &id), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(NULL, &a, 1, &cls, &id), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, NULL, 1, &cls, &id), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &a, 0, &cls, &id), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &a, 1, NULL, &id), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &a, 1, &cls, NULL), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &big, 1, &cls, &id), SHR_E_INVALID_ARG);
     shr__classify(&zw, 1, &cls);
-    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &zw, 1, &cls, 0, &id), SHR_E_NOT_FOUND); /* invisible */
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &zw, 1, &cls, &id), SHR_E_NOT_FOUND); /* invisible */
     uint32_t mark = 0x301;
-    ASSERT_EQ_LL(glyph(f, &mark, 1, SHR_STYLE_BOLD), 0xFFFD | 1ull << SHR_ID_STYLE_SHIFT); /* replacement */
-    ASSERT_EQ_LL(glyph1(f, 'A', SHR_STYLE_ITALIC | SHR_STYLE_DIM), 'A' | 2ull << SHR_ID_STYLE_SHIFT);
-    ASSERT_EQ_LL(glyph1(f, 0x1F600, 0), 0x1F600 | SHR_ID_EMOJI);
+    ASSERT_EQ_LL(glyph(f, &mark, 1), 0xFFFD); /* replacement */
+    ASSERT_EQ_LL(glyph1(f, 'A'), 'A');
+    ASSERT_EQ_LL(glyph1(f, 0x1F600), 0x1F600 | SHR_ID_EMOJI);
 
     uint32_t s1[2] = {'e', 0x301}, s2[2] = {'a', 0x301};
-    uint64_t i1 = glyph(f, s1, 2, 0), i2 = glyph(f, s2, 2, 0);
+    uint64_t i1 = glyph(f, s1, 2), i2 = glyph(f, s2, 2);
     ASSERT_EQ_LL(i1, SHR_ID_CLUSTER);
     ASSERT_EQ_LL(i2, SHR_ID_CLUSTER | 1);
-    ASSERT_EQ_LL(glyph(f, s1, 2, SHR_STYLE_BOLD), i1 | 1ull << SHR_ID_STYLE_SHIFT); /* interned once */
+    ASSERT_EQ_LL(glyph(f, s1, 2), i1); /* interned once */
     static uint32_t many[256];
     for (int i = 0; i < 256; i++) many[i] = i ? 0x301 : 'a';
     shr__classify(many, 256, &cls);
-    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, many, 256, &cls, 0, &id), SHR_OK); /* too long to intern */
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, many, 256, &cls, &id), SHR_OK); /* too long to intern */
     ASSERT_EQ_LL(id, 0xFFFD);
     for (int i = 1; i < 256; i++) many[i] = 0x200B;
-    ASSERT_EQ_LL(glyph(f, many, 256, 0), 'a'); /* one visible scalar: its base */
+    ASSERT_EQ_LL(glyph(f, many, 256), 'a'); /* one visible scalar: its base */
     for (uint32_t i = 2; i < SHR_FONT_MAX_CLUSTERS; i++) {
         uint32_t s[2] = {0x4E00 + i % 20000, 0x301 + i / 20000};
-        glyph(f, s, 2, 0);
+        glyph(f, s, 2);
     }
-    ASSERT_EQ_LL(glyph(f, s1, 2, 0), i1); /* found even when the table is full */
+    ASSERT_EQ_LL(glyph(f, s1, 2), i1); /* found even when the table is full */
     uint32_t s3[2] = {'o', 0x301}, s4[3] = {'o', 0x301, 0x302}, text[2] = {'A', 0xFE0E}, smile[2] = {0x1F600, 0xFE0F};
-    ASSERT_EQ_LL(glyph(f, s3, 2, SHR_STYLE_BOLD), 0xFFFD | 1ull << SHR_ID_STYLE_SHIFT);
-    ASSERT_EQ_LL(glyph(f, s4, 3, 0), 0xFFFD);
-    ASSERT_EQ_LL(glyph(f, text, 2, SHR_STYLE_BOLD), 'A' | 1ull << SHR_ID_STYLE_SHIFT); /* full: the visible base */
-    ASSERT_EQ_LL(glyph(f, smile, 2, 0), 0x1F600 | SHR_ID_EMOJI);
+    ASSERT_EQ_LL(glyph(f, s3, 2), 0xFFFD);
+    ASSERT_EQ_LL(glyph(f, s4, 3), 0xFFFD);
+    ASSERT_EQ_LL(glyph(f, text, 2), 'A'); /* full: the visible base */
+    ASSERT_EQ_LL(glyph(f, smile, 2), 0x1F600 | SHR_ID_EMOJI);
     shr__resolved r;
     ASSERT_EQ_LL(resolve(f, SHR_ID_CLUSTER | SHR_FONT_MAX_CLUSTERS, &r), SHR_E_INVALID_ARG);
     harness_close(&h);
@@ -505,7 +494,7 @@ typedef struct mutation {
 TEST test_package_validation(void) {
     static const mutation cases[] = {
         {0, 1, 'X', SHR_E_FORMAT},                 /* magic */
-        {8, 2, 1, SHR_E_FORMAT},                   /* version */
+        {8, 2, 2, SHR_E_FORMAT},                   /* version 2 */
         {10, 2, 64, SHR_E_FORMAT},                 /* header size */
         {12, 4, 15, SHR_E_UNSUPPORTED},            /* unknown required feature */
         {120, 1, 1, SHR_E_FORMAT},                 /* reserved header bytes */
@@ -522,12 +511,12 @@ TEST test_package_validation(void) {
         {SY_TE(2), 4, 0, SHR_E_FORMAT},               /* unknown section type */
         {SY_TE(2), 4, 11, SHR_E_FORMAT},
         {SY_TE(2), 4, 1, SHR_E_FORMAT},               /* duplicate */
+        {SY_TE(3), 4, 5, SHR_E_FORMAT},               /* section type 5 */
         {SY_TE(2) + 20, 4, 1, SHR_E_FORMAT},          /* reserved entry field */
         {SY_TE(2) + 8, 8, SY_MAN + 4, SHR_E_FORMAT},  /* overlapping */
         {SY_TE(2) + 4, 4, 5000000, SHR_E_FORMAT},     /* record count */
         {SY_TE(1), 4, 10, SHR_E_FORMAT},              /* missing required sections */
         {SY_TE(4), 4, 10, SHR_E_FORMAT},
-        {SY_TE(5), 4, 10, SHR_E_FORMAT},
         {SY_TE(6), 4, 10, SHR_E_FORMAT},
         {SY_TE(9), 4, 10, SHR_E_FORMAT},
         {SY_TE(1) + 4, 4, 2, SHR_E_FORMAT},           /* MANIFEST */
@@ -543,22 +532,23 @@ TEST test_package_validation(void) {
         {SY_MAN + 28, 4, 5000000, SHR_E_FORMAT},      /* glyph and instance counts */
         {SY_MAN + 28, 4, 0, SHR_E_FORMAT},
         {SY_MAN + 32, 4, 0, SHR_E_FORMAT},
-        {SY_MAN + 32, 4, 65, SHR_E_FORMAT},
-        {SY_MAN + 32, 4, 1, SHR_E_FORMAT},            /* INSTANCES */
-        {SY_TE(4) + 16, 4, 95, SHR_E_FORMAT},
+        {SY_MAN + 32, 4, 2, SHR_E_FORMAT},            /* one instance only */
+        {SY_TE(4) + 4, 4, 2, SHR_E_FORMAT},           /* INSTANCES */
+        {SY_TE(4) + 16, 4, 47, SHR_E_FORMAT},
         {SY_TE(3) + 4, 4, 2, SHR_E_FORMAT},           /* SOURCES */
         {SY_SRC, 4, 9, SHR_E_FORMAT},                 /* source name past STRINGS */
         {SY_SRC + 44, 4, 9, SHR_E_FORMAT},            /* source license past STRINGS */
         {SY_INS, 2, 1, SHR_E_FORMAT},
-        {SY_INS + 2, 1, 2, SHR_E_FORMAT},
+        {SY_INS + 2, 1, 1, SHR_E_FORMAT},             /* a style other than regular */
         {SY_INS + 3, 1, 3, SHR_E_FORMAT},
+        {SY_INS + 3, 1, 0, SHR_E_FORMAT},
         {12, 4, 6, SHR_E_FORMAT},                     /* A4 instance without the feature */
-        {12, 4, 5, SHR_E_FORMAT},                     /* A8 instance without the feature */
         {SY_INS + 4, 2, 0, SHR_E_FORMAT},
         {SY_INS + 4, 2, 1025, SHR_E_FORMAT},
         {SY_INS + 6, 2, 0, SHR_E_FORMAT},
         {SY_INS + 6, 2, 1025, SHR_E_FORMAT},
-        {SY_INS + 6, 2, CW + 1, SHR_E_UNSUPPORTED},   /* another cell width */
+        {SY_INS + 6, 2, CW + 1, SHR_E_UNSUPPORTED},   /* another cell size */
+        {SY_INS + 4, 2, CH + 1, SHR_E_UNSUPPORTED},
         {SY_INS + 12, 2, 0xFFFF, SHR_E_FORMAT},       /* line metrics */
         {SY_INS + 12, 2, CH + 1, SHR_E_FORMAT},
         {SY_INS + 14, 2, 0xFFFF, SHR_E_FORMAT},
@@ -569,14 +559,6 @@ TEST test_package_validation(void) {
         {SY_INS + 36, 1, 1, SHR_E_FORMAT},            /* reserved bytes start after the instance id */
         {SY_INS + 18, 2, 2, SHR_E_FORMAT},            /* unknown raster flag */
         {SY_INS + 18, 2, 1, SHR_OK},
-        {SY_TE(5) + 4, 4, 3, SHR_E_FORMAT},           /* a line height without all four styles */
-        {SY_STY + 8 + 2, 1, 0, SHR_E_FORMAT},         /* requested styles out of order */
-        {SY_TE(5) + 16, 4, 31, SHR_E_FORMAT},         /* STYLES */
-        {SY_STY + 2, 1, 4, SHR_E_FORMAT},
-        {SY_STY + 3, 1, 1, SHR_E_FORMAT},
-        {SY_STY + 4, 2, 2, SHR_E_FORMAT},
-        {SY_STY, 2, CH + 1, SHR_E_FORMAT},
-        {SY_STY + 6, 2, 1, SHR_E_FORMAT},
         {SY_TE(6) + 16, 4, 15, SHR_E_FORMAT},         /* CMAP */
         {SY_CMAP + 8, 4, 0x110000, SHR_E_FORMAT},
         {SY_CMAP + 8, 4, 0xD800, SHR_E_FORMAT},
@@ -615,7 +597,7 @@ TEST test_package_validation(void) {
     };
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
-    uint8_t d[SY_SIZE], t[SY_SIZE + 32];
+    uint8_t d[SY_SIZE];
     for (int mode = SRC_READ; mode <= SRC_MAP; mode++) {
         tsrc s = {d, SY_SIZE, .mode = mode};
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -649,11 +631,11 @@ TEST test_package_validation(void) {
         put(d + SY_TE(8) + 4, 1, 4), put(d + SY_TE(8) + 8, SY_SEQ + 36, 8), put(d + SY_TE(8) + 16, 4, 4);
         seal(d);
         ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_OK);
-        synth(d); /* no instance for the cell size */
-        put(d + SY_INS + 4, CH + 1, 2), put(d + SY_INS + 48 + 4, CH + 1, 2);
-        for (int req = 0; req < 4; req++) put(d + SY_STY + 8 * req, CH + 1, 2);
+        synth_as(d, ROLE_LATIN, "", 'A', 'B', SY_A8);
+        ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_OK);
+        put(d + 12, 5, 4); /* A8 instance without the feature */
         seal(d);
-        ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_E_UNSUPPORTED);
+        ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_E_FORMAT);
         synth(d);
         d[40] ^= 1;
         seal(d);
@@ -669,13 +651,6 @@ TEST test_package_validation(void) {
         s.claim = 100;
         ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_E_FORMAT); /* shorter than a header */
         s.claim = 0;
-        tsrc ts = {t, sizeof(t), .mode = mode};
-        synth_tall(t, 0);
-        ASSERT_EQ_LL(pkg_status(ctx, &ts), SHR_OK);
-        synth_tall(t, 1);
-        ASSERT_EQ_LL(pkg_status(ctx, &ts), SHR_E_FORMAT); /* line height CH listed twice */
-        synth_tall(t, 2);
-        ASSERT_EQ_LL(pkg_status(ctx, &ts), SHR_E_FORMAT); /* line height changes inside a group */
     }
     harness_close(&h);
     PASS();
@@ -712,24 +687,25 @@ TEST test_table_changed_between_reads(void) {
 
 TEST test_page_validation(void) {
     static const mutation cases[] = {
-        {SY_PAGE0, 4, 2, 0},       /* glyph count */
+        {SY_PAGE0, 4, 3, 0},       /* glyph count */
         {SY_G0 + 11, 1, 0x07, 0},  /* format 3 */
         {SY_G0 + 11, 1, 0x01, 0},  /* 0 cells */
         {SY_G0 + 11, 1, 0x0D, 0},  /* 3 cells */
         {SY_G0 + 11, 1, 0x25, 0},  /* reserved flag */
+        {SY_G0 + 11, 1, 0x15, 0},  /* flag bit 4 */
         {SY_G0 + 14, 2, 1, 0},
         {SY_G0 + 6, 1, 0, 0},      /* width */
         {SY_G0 + 7, 1, 0, 0},      /* height */
         {SY_G0 + 10, 1, 1, 0},     /* stride */
         {SY_G0 + 4, 2, 7, 0},      /* bitmap length */
         {SY_G0, 4, 8, 0},          /* inside the glyph table */
-        {SY_G0, 4, 62, 0},         /* past the page */
+        {SY_G0, 4, 48, 0},         /* past the page */
         {SY_G1 + 4, 2, 1, 0},      /* empty glyph with data */
         {SY_G1 + 6, 1, 1, 0},
         {SY_G1 + 7, 1, 1, 0},
         {SY_G0 + 11, 1, 0x06, 0},  /* A8 bitmap in an A4 instance */
         {SY_G0 + 6, 1, 3, 0},      /* odd A4 width: the padding nibble is not zero */
-        {SY_PAGE0 + 60, 1, 0, 0},  /* payload: page checksum */
+        {SY_BM0 + 4, 1, 0, 0},     /* payload: page checksum */
     };
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
@@ -745,9 +721,14 @@ TEST test_page_validation(void) {
             ASSERT_EQ_LL(st, SHR_E_CHECKSUM);
             ASSERT_EQ_LL(s.calls, mode == SRC_READ ? 3 + 4 : 0); /* the page is read once, then retried 3 times */
         }
+        synth_as(d, ROLE_LATIN, "", 'A', 'B', SY_A8);
+        d[SY_G0 + 11] = 0x05; /* A4 bitmap in an A8 instance */
+        seal(d);
+        tsrc a8 = {d, SY_SIZE, .mode = mode};
+        ASSERT_EQ_LL(pkg_status(ctx, &a8), SHR_E_CHECKSUM);
         synth(d);
         d[SY_G0 + 6] = 3;
-        for (int y = 0; y < 4; y++) d[SY_PAGE0 + 52 + 2 * y + 1] = 0xF0; /* odd A4 width, zero padding */
+        for (int y = 0; y < 4; y++) d[SY_BM0 + 2 * y + 1] = 0xF0; /* odd A4 width, zero padding */
         seal(d);
         tsrc s = {d, SY_SIZE, .mode = mode};
         ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_OK);
@@ -764,32 +745,49 @@ TEST test_synthetic_glyphs(void) {
     tsrc s = {d, SY_SIZE, .mode = SRC_MAP};
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
-    shr__resolved r, italic, other;
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', 0), &r), SHR_OK);
-    ASSERT(!r.provisional);
-    ASSERT(r.image.pixels == d + SY_PAGE0 + 52); /* mapped: used in place */
-    ASSERT_EQ_LL(r.image.width, 4);
-    ASSERT_EQ_LL(r.image.stride, 2);
-    ASSERT_EQ_LL(r.image.format, SHR_FORMAT_A4);
-    ASSERT_EQ_LL(r.offset.x, 1);
-    ASSERT_EQ_LL(r.offset.y, 0);
+    shr__resolved r, a, other;
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &a), SHR_OK);
+    ASSERT(!a.provisional);
+    ASSERT(a.image.pixels == d + SY_BM0); /* mapped: used in place */
+    ASSERT_EQ_LL(a.image.width, 4);
+    ASSERT_EQ_LL(a.image.stride, 2);
+    ASSERT_EQ_LL(a.image.format, SHR_FORMAT_A4);
+    ASSERT_EQ_LL(a.offset.x, 1);
+    ASSERT_EQ_LL(a.offset.y, 0);
+    ASSERT_EQ_LL(a.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC);
+    ASSERT_EQ_LL(a.slant_axis, CH); /* twice the line centre's row in the bitmap */
     ASSERT(!f->pinned && !f->lru); /* mapped pages are never pinned or cached */
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', SHR_STYLE_ITALIC), &italic), SHR_OK);
-    ASSERT(italic.image.pixels == r.image.pixels); /* Italic -> Regular instance */
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', SHR_STYLE_BOLD), &r), SHR_OK);
-    ASSERT(r.image.pixels == d + SY_PAGE1 + 52);
-    ASSERT_EQ_LL(r.image.format, SHR_FORMAT_A8);
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'B', 0), &r), SHR_E_NOT_FOUND); /* empty glyph */
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'B'), &r), SHR_E_NOT_FOUND); /* empty glyph */
     uint32_t sa[2] = {'A', 0x301}, sb[2] = {'B', 0x301}, sc[2] = {'C', 0x301}, sel[2] = {'A', 0xFE0E};
-    ASSERT_EQ_LL(load(ctx, f, glyph(f, sa, 2, 0), &r), SHR_OK);
-    ASSERT_EQ_LL(load(ctx, f, glyph(f, sb, 2, 0), &other), SHR_OK);
-    ASSERT(r.image.pixels == d + SY_PAGE0 + 60 && other.image.pixels == r.image.pixels); /* shared slot */
+    ASSERT_EQ_LL(load(ctx, f, glyph(f, sa, 2), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph(f, sb, 2), &other), SHR_OK);
+    ASSERT(r.image.pixels == d + SY_BM2 && other.image.pixels == r.image.pixels); /* shared slot, second page */
     ASSERT_EQ_LL(r.offset.x, 0);
-    ASSERT_EQ_LL(load(ctx, f, glyph(f, sc, 2, 0), &r), SHR_OK); /* no such sequence: U+FFFD */
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xFFFD, 0), &other), SHR_OK);
+    ASSERT_EQ_LL(r.offset.y, 3);
+    ASSERT_EQ_LL(r.slant_axis, CH - 6);
+    ASSERT_EQ_LL(load(ctx, f, glyph(f, sc, 2), &r), SHR_OK); /* no such sequence: U+FFFD */
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xFFFD), &other), SHR_OK);
     ASSERT(same_image(&r, &other));
-    ASSERT_EQ_LL(load(ctx, f, glyph(f, sel, 2, 0), &r), SHR_OK); /* one visible scalar: its base glyph */
-    ASSERT(r.image.pixels == italic.image.pixels);
+    ASSERT_EQ_LL(load(ctx, f, glyph(f, sel, 2), &r), SHR_OK); /* one visible scalar: its base glyph */
+    ASSERT(r.image.pixels == a.image.pixels);
+    font_free_now(ctx, f);
+
+    synth_as(d, ROLE_LATIN, "", 'A', 'B', SY_A8);
+    f = h.font = font_new(ctx, &l, NULL);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &r), SHR_OK);
+    ASSERT(r.image.pixels == d + SY_BM0);
+    ASSERT_EQ_LL(r.image.stride, 4);
+    ASSERT_EQ_LL(r.image.format, SHR_FORMAT_A8);
+    for (int i = 0; i < 2; i++) { /* rows above the line, then a bitmap wholly below the baseline */
+        font_free_now(ctx, f);
+        synth(d);
+        d[SY_G0 + 9] = (uint8_t)(i ? -1 : SY_BASE + 2);
+        seal(d);
+        f = h.font = font_new(ctx, &l, NULL);
+        ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &r), SHR_OK);
+        ASSERT_EQ_LL(r.offset.y, i ? SY_BASE + 1 : -2);
+        ASSERT_EQ_LL(r.slant_axis, i ? CH - 2 * (SY_BASE + 1) : CH + 4);
+    }
     harness_close(&h);
     PASS();
 }
@@ -805,12 +803,12 @@ TEST test_deferred_reads(void) {
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__res *res = shr__bitmap_font_res(f);
-    uint64_t id = glyph1(f, 'A', 0);
+    uint64_t id = glyph1(f, 'A');
     shr__resolved r, fffd;
     ASSERT_EQ_LL(resolve(f, id, &r), SHR_OK);
     ASSERT(r.provisional && inside(&r, shr__builtin_package, shr__builtin_package_size)); /* the built-in 'A' */
-    ASSERT_EQ_LL(resolve(f, glyph1(f, 0x2630, 0), &r), SHR_OK);
-    ASSERT_EQ_LL(resolve(f, glyph1(f, 0xFFFD, 0), &fffd), SHR_OK);
+    ASSERT_EQ_LL(resolve(f, glyph1(f, 0x2630), &r), SHR_OK);
+    ASSERT_EQ_LL(resolve(f, glyph1(f, 0xFFFD), &fffd), SHR_OK);
     ASSERT(r.provisional && same_image(&r, &fffd)); /* not in the built-in package either: its U+FFFD */
     ASSERT(res->ops->has_work(res));
     shr_pump(ctx);
@@ -841,7 +839,7 @@ TEST test_read_retries_and_limit(void) {
     tsrc s = {d, SY_SIZE, .script = {0, SHR_E_IO, SHR_E_IO, 0, SHR_E_IO, 0, SHR_E_IO}};
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = font_new(ctx, &l, NULL);
-    uint64_t id = glyph1(f, 'A', 0);
+    uint64_t id = glyph1(f, 'A');
     shr__resolved r;
     resolve(f, id, &r);
     settle(ctx);
@@ -860,7 +858,7 @@ TEST test_read_retries_and_limit(void) {
     tsrc bad = {d, SY_SIZE, .script = {SHR_E_IO, SHR_E_IO, SHR_E_IO, SHR_E_IO}};
     l.src[ROLE_LATIN] = &bad;
     f = h.font = font_new(ctx, &l, NULL);
-    resolve(f, id = glyph1(f, 'A', 0), &r);
+    resolve(f, id = glyph1(f, 'A'), &r);
     for (int i = 0; i < 8; i++) {
         settle(ctx);
         if (bad.calls == 4) break;
@@ -885,7 +883,7 @@ TEST test_read_retries_and_limit(void) {
     tsrc page = {d, SY_SIZE, .script = {0, 0, 0, SHR_E_IO, SHR_E_IO, SHR_E_IO, SHR_E_IO}};
     l.src[ROLE_LATIN] = &page;
     shr_pl_res_bitmap_font *g = font_new(ctx, &l, NULL);
-    resolve(g, id = glyph1(g, 'A', 0), &r);
+    resolve(g, id = glyph1(g, 'A'), &r);
     for (int i = 0; i < 8; i++) {
         settle(ctx);
         if (page.calls == 7) break;
@@ -923,7 +921,7 @@ TEST test_would_block_backs_off(void) {
     tsrc s = {d, SY_SIZE, .script = {SHR_E_WOULD_BLOCK, 0, 0, 0, SHR_E_WOULD_BLOCK}};
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
-    uint64_t id = glyph1(f, 'A', 0);
+    uint64_t id = glyph1(f, 'A');
     shr__resolved r;
     resolve(f, id, &r);
     shr_pump(ctx);
@@ -985,7 +983,7 @@ TEST test_ready_signal_before_cooling_frame(void) {
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__res *res = shr__bitmap_font_res(f);
-    uint64_t id = glyph1(f, 'A', 0);
+    uint64_t id = glyph1(f, 'A');
     shr__resolved r;
     resolve(f, id, &r);
     settle(ctx);
@@ -1011,7 +1009,7 @@ TEST test_failing_source_given_up(void) {
     for (int i = 0; i < 32; i++) s.script[i] = SHR_E_IO;
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
-    uint64_t id = glyph1(f, 'A', 0);
+    uint64_t id = glyph1(f, 'A');
     shr__resolved r;
     for (int i = 0; i < 64; i++) {
         resolve(f, id, &r);
@@ -1052,7 +1050,7 @@ TEST test_retry_time_saturates(void) {
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__resolved r;
     fake_now = 1;
-    resolve(f, glyph1(f, 'A', 0), &r);
+    resolve(f, glyph1(f, 'A'), &r);
     shr_pump(ctx);
     ASSERT_EQ_LL(s.calls, 1);
     shr_deadline dl;
@@ -1071,7 +1069,7 @@ TEST test_second_cooldown_after_signal(void) {
         shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, clock ? NULL : tweak_no_clock);
         uint8_t dl[SY_SIZE], dc[SY_SIZE];
         synth(dl);
-        synth_as(dc, ROLE_CJK, "ko", 0x4E00, 0x4E01);
+        synth_as(dc, ROLE_CJK, "ko", 0x4E00, 0x4E01, SY_A4);
         tsrc sl = {dl, SY_SIZE, .script = {SHR_E_IO, SHR_E_IO, SHR_E_IO, SHR_E_IO}};
         tsrc sc = {dc, SY_SIZE, .mode = SRC_READ};
         int given_up = clock ? 16 : 4; /* with a clock, only a given-up package waits for the signal */
@@ -1079,7 +1077,7 @@ TEST test_second_cooldown_after_signal(void) {
         lib l = {.src = {[ROLE_LATIN] = &sl, [ROLE_CJK] = &sc}};
         shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
         shr__res *res = shr__bitmap_font_res(f);
-        uint64_t ida = glyph1(f, 'A', 0), idc = glyph1(f, 0x4E00, 0);
+        uint64_t ida = glyph1(f, 'A'), idc = glyph1(f, 0x4E00);
         shr__resolved r;
         for (int i = 0; i < 64 && sc.calls < given_up; i++) {
             resolve(f, idc, &r);
@@ -1128,7 +1126,7 @@ TEST test_signal_only_has_no_deadline(void) {
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__res *res = shr__bitmap_font_res(f);
-    uint64_t id = glyph1(f, 'A', 0);
+    uint64_t id = glyph1(f, 'A');
     shr__resolved r;
     resolve(f, id, &r);
     settle(ctx);
@@ -1164,12 +1162,12 @@ TEST test_package_failures_count_until_ready(void) {
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__resolved r;
-    resolve(f, glyph1(f, 'A', 0), &r);
+    resolve(f, glyph1(f, 'A'), &r);
     drain(ctx);
     ASSERT_EQ_LL(s.calls, 5);
     ASSERT(f->pkg[ROLE_LATIN].retry.cooling);
     ASSERT_EQ_LL(last_failure(ctx), SHR_E_IO);
-    resolve(f, glyph1(f, 'A', 0), &r);
+    resolve(f, glyph1(f, 'A'), &r);
     ASSERT(r.provisional && inside(&r, shr__builtin_package, shr__builtin_package_size));
     harness_close(&h);
     PASS();
@@ -1185,7 +1183,7 @@ TEST test_absent_package_stays_absent(void) {
     lib l = {0};
     shr_pl_res_bitmap_font *f = font_new(ctx, &l, NULL);
     shr__res *res = shr__bitmap_font_res(f);
-    uint64_t id = glyph1(f, 'A', 0);
+    uint64_t id = glyph1(f, 'A');
     shr__resolved r;
     ASSERT_EQ_LL(load(ctx, f, id, &r), SHR_OK);
     ASSERT(!r.provisional && inside(&r, shr__builtin_package, shr__builtin_package_size));
@@ -1199,7 +1197,7 @@ TEST test_absent_package_stays_absent(void) {
     ASSERT(!r.provisional && inside(&r, shr__builtin_package, shr__builtin_package_size));
     font_free_now(ctx, f);
     f = h.font = font_new(ctx, &l, NULL);
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', 0), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &r), SHR_OK);
     ASSERT(!r.provisional && r.image.height == 4);
     harness_close(&h);
     PASS();
@@ -1216,32 +1214,32 @@ TEST test_read_slots_exhausted(void) {
     uint8_t d[SY_SIZE];
     synth(d);
     uint8_t k[SY_SIZE];
-    synth_as(k, ROLE_CJK, "ko", 'A', 0xAC00);
+    synth_as(k, ROLE_CJK, "ko", 'A', 0xAC00, SY_A4);
     tsrc a = {k, SY_SIZE, .script = {SHR_IN_PROGRESS}}, c = {d, SY_SIZE, .script = {[3] = SHR_IN_PROGRESS}};
     lib l = {.src = {[ROLE_LATIN] = &c, [ROLE_CJK] = &a}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__res *res = shr__bitmap_font_res(f);
     shr__resolved r;
-    resolve(f, glyph1(f, 'A', 0), &r);
+    resolve(f, glyph1(f, 'A'), &r);
     settle(ctx);
-    resolve(f, glyph1(f, 'A', 0), &r);
+    resolve(f, glyph1(f, 'A'), &r);
     settle(ctx);
     ASSERT_EQ_LL(c.pending, 1); /* the latin page read holds the only slot */
-    resolve(f, glyph1(f, 0xAC00, 0), &r);
+    resolve(f, glyph1(f, 0xAC00), &r);
     shr_pump(ctx);
     ASSERT_EQ_LL(a.calls, 0);
     ASSERT(!res->ops->has_work(res)); /* blocked until a read ends */
     ts_complete(ctx, &c, SHR_OK);
     shr_pump(ctx);
     ASSERT_EQ_LL(a.pending, 1);
-    resolve(f, glyph1(f, 'A', SHR_STYLE_BOLD), &r); /* a page read finds no free slot */
+    resolve(f, glyph2(f), &r); /* a page read finds no free slot */
     shr_pump(ctx);
     ASSERT_EQ_LL(c.calls, 4);
     ASSERT(!res->ops->has_work(res));
     ts_complete(ctx, &a, SHR_OK);
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', SHR_STYLE_BOLD), &r), SHR_OK);
-    ASSERT_EQ_LL(r.image.format, SHR_FORMAT_A8);
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00, 0), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph2(f), &r), SHR_OK);
+    ASSERT(!r.provisional && r.image.height == 4);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00), &r), SHR_OK);
     ASSERT_EQ_LL(r.image.height, 4);
     harness_close(&h);
     PASS();
@@ -1257,7 +1255,7 @@ TEST test_read_timeout(void) {
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__resolved r;
-    resolve(f, glyph1(f, 'A', 0), &r);
+    resolve(f, glyph1(f, 'A'), &r);
     shr_pump(ctx);
     shr_deadline dl;
     shr_next_deadline(ctx, &dl);
@@ -1265,7 +1263,7 @@ TEST test_read_timeout(void) {
     drain(ctx);
     ASSERT_EQ_LL(s.cancels, 4); /* the first read and three retries */
     ASSERT_EQ_LL(last_failure(ctx), SHR_E_TIMEOUT);
-    ASSERT_EQ_LL(resolve(f, glyph1(f, 'A', 0), &r), SHR_OK);
+    ASSERT_EQ_LL(resolve(f, glyph1(f, 'A'), &r), SHR_OK);
     ASSERT(r.provisional && inside(&r, shr__builtin_package, shr__builtin_package_size)); /* cooling down */
     harness_close(&h);
     PASS();
@@ -1298,13 +1296,13 @@ TEST test_failed_package_released(void) {
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__resolved r;
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', 0), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &r), SHR_OK);
     ASSERT_EQ_LL(last_failure(ctx), SHR_E_FORMAT);
     shr__pkg *pkg = &f->pkg[ROLE_LATIN];
     ASSERT(pkg->state == PKG_FAILED && !pkg->buf && !pkg->pages && !pkg->src.read);
     ASSERT_EQ_LL(s.closes, 1);
     int opens = l.opens;
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', 0), &r), SHR_OK); /* never reopened */
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &r), SHR_OK); /* never reopened */
     ASSERT_EQ_LL(l.opens, opens);
     harness_close(&h);
     ASSERT_EQ_LL(s.closes, 1);
@@ -1317,12 +1315,12 @@ TEST test_resolve_defers_open_and_checks(void) {
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
     uint8_t d[SY_SIZE];
     synth(d);
-    d[SY_PAGE0 + 60] ^= 0xFF; /* the Regular page is damaged */
+    d[SY_BM0 + 4] ^= 0xFF; /* the first page is damaged */
     tsrc s = {d, SY_SIZE, .mode = SRC_MAP};
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__resolved r;
-    uint64_t id = glyph1(f, 'A', 0);
+    uint64_t id = glyph1(f, 'A');
     ASSERT_EQ_LL(resolve(f, id, &r), SHR_OK);
     ASSERT(r.provisional && l.opens == 0);
     shr_pump(ctx);
@@ -1334,8 +1332,8 @@ TEST test_resolve_defers_open_and_checks(void) {
     ASSERT_EQ_LL(last_failure(ctx), SHR_E_CHECKSUM);
     ASSERT_EQ_LL(load(ctx, f, id, &r), SHR_OK);
     ASSERT(!r.provisional && inside(&r, shr__builtin_package, shr__builtin_package_size));
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', SHR_STYLE_BOLD), &r), SHR_OK);
-    ASSERT(inside(&r, d, SY_SIZE)); /* the Bold page is fine */
+    ASSERT_EQ_LL(load(ctx, f, glyph2(f), &r), SHR_OK);
+    ASSERT(inside(&r, d, SY_SIZE)); /* the second page is fine */
     harness_close(&h);
     PASS();
 }
@@ -1344,26 +1342,26 @@ TEST test_cjk_locale(void) {
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
     uint8_t ko[SY_SIZE], ja[SY_SIZE];
-    synth_as(ko, ROLE_CJK, "ko", 'A', 0xAC00);
-    synth_as(ja, ROLE_CJK, "ja", 'A', 0xAC00);
+    synth_as(ko, ROLE_CJK, "ko", 'A', 0xAC00, SY_A4);
+    synth_as(ja, ROLE_CJK, "ja", 'A', 0xAC00, SY_A4);
     tsrc sko = {ko, SY_SIZE, .mode = SRC_MAP}, sja = {ja, SY_SIZE, .mode = SRC_MAP};
     lib l = {.src = {[ROLE_CJK] = &sko}};
     shr_pl_res_bitmap_font *f = font_new(ctx, &l, "ja");
     shr__resolved r;
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00, 0), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00), &r), SHR_OK);
     ASSERT_STR_EQ(l.first, "shiroko-cjk-ja.shrf");
     ASSERT(!inside(&r, ko, SY_SIZE));
     ASSERT_EQ_LL(last_failure(ctx), SHR_E_FORMAT); /* a Korean package under the Japanese name */
     font_free_now(ctx, f);
     l.src[ROLE_CJK] = &sja;
     f = font_new(ctx, &l, "ja");
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00, 0), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00), &r), SHR_OK);
     ASSERT(inside(&r, ja, SY_SIZE));
     font_free_now(ctx, f);
     l.src[ROLE_CJK] = &sko;
     l.opens = 0;
     f = h.font = font_new(ctx, &l, NULL); /* Korean by default */
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00, 0), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xAC00), &r), SHR_OK);
     ASSERT_STR_EQ(l.first, "shiroko-cjk-ko.shrf");
     ASSERT(inside(&r, ko, SY_SIZE));
     harness_close(&h);
@@ -1376,32 +1374,35 @@ TEST test_routing(void) {
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
     uint8_t latin[SY_SIZE], cjk[SY_SIZE], latin2[SY_SIZE], nerd[SY_SIZE], sym[SY_SIZE];
-    synth_as(latin, ROLE_LATIN, "", 'A', 0xAC00);
-    synth_as(cjk, ROLE_CJK, "ko", 'A', 0xAC00);
-    synth_as(latin2, ROLE_LATIN, "", 'A', 0xE0B0);
-    synth_as(nerd, ROLE_NERD, "", 0xE0B0, 0xE0B1);
-    synth_as(sym, ROLE_SYMBOLS, "", 0x2630, 0xAC01);
+    synth_as(latin, ROLE_LATIN, "", 'A', 0xAC00, SY_A4);
+    synth_as(cjk, ROLE_CJK, "ko", 'A', 0xAC00, SY_A4);
+    synth_as(latin2, ROLE_LATIN, "", 'A', 0xE0B0, SY_A4);
+    synth_as(nerd, ROLE_NERD, "", 0xE0B0, 0xE0B1, SY_A4);
+    synth_as(sym, ROLE_SYMBOLS, "", 0x2630, 0xAC01, SY_A4);
     tsrc s[5];
     uint8_t *data[5] = {latin, cjk, latin2, nerd, sym};
     for (int i = 0; i < 5; i++) s[i] = (tsrc){data[i], SY_SIZE, .mode = SRC_MAP};
     lib l = {.src = {[ROLE_LATIN] = &s[0], [ROLE_CJK] = &s[1]}};
     shr_pl_res_bitmap_font *f = font_new(ctx, &l, NULL);
     shr__resolved r;
-    load(ctx, f, glyph1(f, 'A', 0), &r);
+    load(ctx, f, glyph1(f, 'A'), &r);
     ASSERT(inside(&r, latin, SY_SIZE)); /* latin first */
-    load(ctx, f, glyph1(f, 0xAC00, 0), &r);
+    load(ctx, f, glyph1(f, 0xAC00), &r);
     ASSERT(inside(&r, cjk, SY_SIZE)); /* CJK scalars: CJK first */
+    ASSERT_EQ_LL(r.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC); /* text: bold and italic are drawn */
     font_free_now(ctx, f);
 
     lib l2 = {.src = {[ROLE_LATIN] = &s[2], [ROLE_NERD] = &s[3], [ROLE_SYMBOLS] = &s[4]}};
     f = h.font = font_new(ctx, &l2, NULL);
-    load(ctx, f, glyph1(f, 0xE0B0, 0), &r);
+    load(ctx, f, glyph1(f, 0xE0B0), &r);
     ASSERT(inside(&r, nerd, SY_SIZE)); /* Nerd private use: the Nerd package first */
-    load(ctx, f, glyph1(f, 0x2630, 0), &r);
+    ASSERT_EQ_LL(r.synth, 0); /* icons are drawn as they are */
+    load(ctx, f, glyph1(f, 0x2630), &r);
     ASSERT(inside(&r, sym, SY_SIZE));
-    load(ctx, f, glyph1(f, 0xAC01, 0), &r);
+    ASSERT_EQ_LL(r.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC);
+    load(ctx, f, glyph1(f, 0xAC01), &r);
     ASSERT(inside(&r, sym, SY_SIZE)); /* after CJK and latin */
-    load(ctx, f, glyph1(f, 'A', 0), &r);
+    load(ctx, f, glyph1(f, 'A'), &r);
     ASSERT(inside(&r, latin2, SY_SIZE));
     harness_close(&h);
     PASS();
@@ -1411,9 +1412,9 @@ TEST test_emoji_fallbacks(void) {
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
     uint8_t latin[SY_SIZE], emoji[SY_SIZE], sym[SY_SIZE];
-    synth_as(latin, ROLE_LATIN, "", 0x2764, 0x2765);
-    synth_as(emoji, ROLE_EMOJI, "", 0x1F600, 0x1F601);
-    synth_as(sym, ROLE_SYMBOLS, "", 0x1F600, 0x1F602);
+    synth_as(latin, ROLE_LATIN, "", 0x2764, 0x2765, SY_A4);
+    synth_as(emoji, ROLE_EMOJI, "", 0x1F600, 0x1F601, SY_A4);
+    synth_as(sym, ROLE_SYMBOLS, "", 0x1F600, 0x1F602, SY_A4);
     tsrc sl = {latin, SY_SIZE, .mode = SRC_MAP}, se = {emoji, SY_SIZE, .mode = SRC_MAP},
          ss = {sym, SY_SIZE, .mode = SRC_MAP};
     lib l = {.src = {[ROLE_LATIN] = &sl, [ROLE_EMOJI] = &se}};
@@ -1421,48 +1422,52 @@ TEST test_emoji_fallbacks(void) {
     shr__resolved r, fffd;
     uint32_t heart[2] = {0x2764, 0xFE0F}, smile_zw[2] = {0x1F600, 0x200B}, smile_vs[2] = {0x1F600, 0xFE0F},
              zwj[3] = {0x1F469, 0x200D, 0x1F4BB};
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xFFFD, 0), &fffd), SHR_OK);
-    load(ctx, f, glyph1(f, 0x1F600, 0), &r);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xFFFD), &fffd), SHR_OK);
+    load(ctx, f, glyph1(f, 0x1F600), &r);
     ASSERT(inside(&r, emoji, SY_SIZE));
-    load(ctx, f, glyph(f, heart, 2, 0), &r);
+    ASSERT_EQ_LL(r.synth, 0);
+    load(ctx, f, glyph(f, heart, 2), &r);
     ASSERT(inside(&r, latin, SY_SIZE)); /* registered VS16 base without an emoji glyph: its text glyph */
-    load(ctx, f, glyph(f, smile_zw, 2, 0), &r);
+    ASSERT_EQ_LL(r.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC); /* styled like text */
+    load(ctx, f, glyph(f, smile_zw, 2), &r);
     ASSERT(inside(&r, emoji, SY_SIZE)); /* one visible emoji scalar: its emoji glyph */
-    load(ctx, f, glyph(f, smile_vs, 2, 0), &r);
+    load(ctx, f, glyph(f, smile_vs, 2), &r);
     ASSERT(inside(&r, emoji, SY_SIZE)); /* VS16 on a base without variation sequences: the same */
-    load(ctx, f, glyph(f, zwj, 3, 0), &r);
+    load(ctx, f, glyph(f, zwj, 3), &r);
     ASSERT(same_image(&r, &fffd)); /* unknown sequence */
-    load(ctx, f, glyph1(f, 0x1F602, 0), &r);
+    load(ctx, f, glyph1(f, 0x1F602), &r);
     ASSERT(!r.provisional && same_image(&r, &fffd)); /* in no package */
     font_free_now(ctx, f);
 
     l.src[ROLE_SYMBOLS] = &ss; /* an emoji scalar the emoji package lacks: the text chain */
     f = font_new(ctx, &l, NULL);
-    load(ctx, f, glyph1(f, 0x1F602, 0), &r);
+    load(ctx, f, glyph1(f, 0x1F602), &r);
     ASSERT(!r.provisional && inside(&r, sym, SY_SIZE));
-    load(ctx, f, glyph1(f, 0x1F600, 0), &r);
+    ASSERT_EQ_LL(r.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC);
+    load(ctx, f, glyph1(f, 0x1F600), &r);
     ASSERT(inside(&r, emoji, SY_SIZE));
     font_free_now(ctx, f);
 
     l.src[ROLE_EMOJI] = NULL; /* not installed */
     f = font_new(ctx, &l, NULL);
-    load(ctx, f, glyph1(f, 0x1F600, 0), &r);
+    load(ctx, f, glyph1(f, 0x1F600), &r);
     ASSERT(!r.provisional && inside(&r, sym, SY_SIZE));
-    load(ctx, f, glyph(f, smile_vs, 2, 0), &r);
+    load(ctx, f, glyph(f, smile_vs, 2), &r);
     ASSERT(!r.provisional && inside(&r, sym, SY_SIZE));
-    load(ctx, f, glyph1(f, 0x1F601, 0), &r);
+    load(ctx, f, glyph1(f, 0x1F601), &r);
     ASSERT(!r.provisional && same_image(&r, &fffd));
     font_free_now(ctx, f);
 
     tsrc pending = {emoji, SY_SIZE, .script = {SHR_IN_PROGRESS}};
     l.src[ROLE_EMOJI] = &pending;
     f = h.font = font_new(ctx, &l, NULL);
-    resolve(f, glyph1(f, 0x1F600, 0), &r);
+    resolve(f, glyph1(f, 0x1F600), &r);
     shr_pump(ctx);
-    resolve(f, glyph(f, heart, 2, 0), &r);
+    resolve(f, glyph(f, heart, 2), &r);
     ASSERT(r.provisional && same_image(&r, &fffd)); /* loading emoji: provisional U+FFFD, not a text fallback */
+    ASSERT_EQ_LL(r.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC); /* the built-in fallback is text */
     ts_complete(ctx, &pending, SHR_OK);
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0x1F600, 0), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0x1F600), &r), SHR_OK);
     ASSERT(!r.provisional && r.image.height == 4);
     harness_close(&h);
     PASS();
@@ -1473,8 +1478,8 @@ TEST test_deadline_is_the_earliest_retry(void) {
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
     uint8_t latin[SY_SIZE], cjk[SY_SIZE], emoji[SY_SIZE];
     synth(latin);
-    synth_as(cjk, ROLE_CJK, "ko", 'A', 0xAC00);
-    synth_as(emoji, ROLE_EMOJI, "", 0x1F600, 0x1F601);
+    synth_as(cjk, ROLE_CJK, "ko", 'A', 0xAC00, SY_A4);
+    synth_as(emoji, ROLE_EMOJI, "", 0x1F600, 0x1F601, SY_A4);
     const shr_status wb = SHR_E_WOULD_BLOCK;
     tsrc sl = {latin, SY_SIZE, .script = {wb, 0, 0, 0, wb, wb}}, sc = {cjk, SY_SIZE, .script = {wb, 0, 0, 0, wb}},
          se = {emoji, SY_SIZE, .script = {wb}};
@@ -1485,13 +1490,13 @@ TEST test_deadline_is_the_earliest_retry(void) {
     shr__resolved r;
     for (int i = 0; i < 3; i++) {
         fake_now = 10 * MS * (uint64_t)i;
-        resolve(f, glyph1(f, cps[i], 0), &r);
+        resolve(f, glyph1(f, cps[i]), &r);
         shr_pump(ctx);
     }
     ASSERT_EQ_LL(res->ops->deadline(res), 50 * MS);
     fake_now = 100 * MS;
     settle(ctx);
-    const uint64_t ids[3] = {glyph1(f, 'A', SHR_STYLE_BOLD), glyph1(f, 'A', 0), glyph1(f, 0xAC00, 0)};
+    const uint64_t ids[3] = {glyph2(f), glyph1(f, 'A'), glyph1(f, 0xAC00)};
     for (int i = 0; i < 3; i++) { /* pages of one frame back off until 150, 160 and 170 ms */
         fake_now = 100 * MS + 10 * MS * (uint64_t)i;
         res->ops->resolve(res, ids[i], frame_no + 1, &r);
@@ -1508,42 +1513,42 @@ TEST test_deadline_is_the_earliest_retry(void) {
 
 TEST test_page_cache_budget(void) {
     uint8_t d[SY_SIZE];
-    synth(d); /* pages: Regular 68 bytes, Bold 84 bytes */
+    synth(d); /* pages of 52 and 36 bytes */
     harness h;
-    cache_limit = 150;
+    cache_limit = 80;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_cache);
     tsrc s = {d, SY_SIZE, .mode = SRC_READ};
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__res *res = shr__bitmap_font_res(f);
-    uint64_t regular = glyph1(f, 'A', 0), bold = glyph1(f, 'A', SHR_STYLE_BOLD);
+    uint64_t first = glyph1(f, 'A'), second = glyph2(f);
     shr__resolved r;
-    ASSERT_EQ_LL(load(ctx, f, regular, &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, first, &r), SHR_OK);
     uint64_t frame = ++frame_no;
-    ASSERT_EQ_LL(res->ops->resolve(res, regular, frame, &r), SHR_OK); /* pinned by the frame */
-    ASSERT_EQ_LL(res->ops->resolve(res, bold, frame, &r), SHR_OK);
+    ASSERT_EQ_LL(res->ops->resolve(res, first, frame, &r), SHR_OK); /* pinned by the frame */
+    ASSERT_EQ_LL(res->ops->resolve(res, second, frame, &r), SHR_OK);
     ASSERT(r.provisional);
     settle(ctx);
-    ASSERT_EQ_LL(f->page_bytes, 68); /* no room while the Regular page is pinned */
+    ASSERT_EQ_LL(f->page_bytes, 52); /* no room while the first page is pinned */
     shr_deadline dl;
     shr_next_deadline(ctx, &dl);
     ASSERT_EQ_LL(dl.kind, SHR_DEADLINE_NONE); /* waits for the unpin, no polling */
     res->ops->frame_end(res, frame);
     ASSERT(res->ops->has_work(res));
     settle(ctx);
-    ASSERT_EQ_LL(f->page_bytes, 84); /* the Regular page was evicted, its descriptor freed */
+    ASSERT_EQ_LL(f->page_bytes, 36); /* the first page was evicted, its descriptor freed */
     ASSERT(f->pkg[ROLE_LATIN].pages[0] == NULL);
-    ASSERT_EQ_LL(load(ctx, f, bold, &r), SHR_OK);
-    ASSERT_EQ_LL(r.image.format, SHR_FORMAT_A8);
-    ASSERT_EQ_LL(load(ctx, f, regular, &r), SHR_OK); /* loaded again */
-    ASSERT_EQ_LL(r.image.format, SHR_FORMAT_A4);
-    ASSERT_EQ_LL(f->page_bytes, 68);
+    ASSERT_EQ_LL(load(ctx, f, second, &r), SHR_OK);
+    ASSERT_EQ_LL(r.offset.y, 3);
+    ASSERT_EQ_LL(load(ctx, f, first, &r), SHR_OK); /* loaded again */
+    ASSERT_EQ_LL(r.offset.y, 0);
+    ASSERT_EQ_LL(f->page_bytes, 52);
     harness_close(&h);
 
     cache_limit = 50; /* a page larger than the whole cache fails */
     ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_cache);
     f = h.font = font_new(ctx, &l, NULL);
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A', 0), &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &r), SHR_OK);
     ASSERT(!r.provisional && r.image.height != 4);
     ASSERT_EQ_LL(last_failure(ctx), SHR_E_LIMIT);
     harness_close(&h);
@@ -1553,25 +1558,25 @@ TEST test_page_cache_budget(void) {
 TEST test_page_lru_order(void) {
     uint8_t latin[SY_SIZE], cjk[SY_SIZE];
     synth(latin);
-    synth_as(cjk, ROLE_CJK, "ko", 'A', 0xAC00);
+    synth_as(cjk, ROLE_CJK, "ko", 'A', 0xAC00, SY_A4);
     harness h;
-    cache_limit = 68 + 84 + 67;
+    cache_limit = 52 + 36 + 35;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_cache);
     tsrc sl = {latin, SY_SIZE, .mode = SRC_READ}, sc = {cjk, SY_SIZE, .mode = SRC_READ};
     lib l = {.src = {[ROLE_LATIN] = &sl, [ROLE_CJK] = &sc}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__resolved r;
-    uint64_t regular = glyph1(f, 'A', 0);
-    load(ctx, f, regular, &r);
-    load(ctx, f, glyph1(f, 'A', SHR_STYLE_BOLD), &r);
-    resolve(f, regular, &r); /* used again: now the newest */
-    ASSERT_EQ_LL(f->page_bytes, 68 + 84);
-    load(ctx, f, glyph1(f, 0xAC00, 0), &r);
+    uint64_t first = glyph1(f, 'A');
+    load(ctx, f, first, &r);
+    load(ctx, f, glyph2(f), &r);
+    resolve(f, first, &r); /* used again: now the newest */
+    ASSERT_EQ_LL(f->page_bytes, 52 + 36);
+    load(ctx, f, glyph1(f, 0xAC00), &r);
     ASSERT(r.image.height == 4);
     shr__page **pages = f->pkg[ROLE_LATIN].pages;
     ASSERT_EQ_LL(pages[0]->state, PAGE_READY);
     ASSERT(pages[1] == NULL); /* the least recently used */
-    ASSERT_EQ_LL(f->page_bytes, 68 + 68);
+    ASSERT_EQ_LL(f->page_bytes, 52 + 36);
     harness_close(&h);
     PASS();
 }
@@ -1586,13 +1591,13 @@ TEST test_stale_wants_dropped(void) {
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__res *res = shr__bitmap_font_res(f);
-    uint64_t regular = glyph1(f, 'A', 0), bold = glyph1(f, 'A', SHR_STYLE_BOLD);
+    uint64_t first = glyph1(f, 'A'), second = glyph2(f);
     shr__resolved r;
-    resolve(f, regular, &r);
+    resolve(f, first, &r);
     settle(ctx);
     ASSERT_EQ_LL(s.calls, 3);
-    resolve(f, regular, &r);
-    resolve(f, bold, &r); /* the next frame no longer shows the Regular glyph */
+    resolve(f, first, &r);
+    resolve(f, second, &r); /* the next frame no longer shows the first glyph */
     ASSERT_EQ_LL(f->wants.len, 2);
     ASSERT(res->ops->has_work(res));
     settle(ctx);
@@ -1603,16 +1608,16 @@ TEST test_stale_wants_dropped(void) {
 
     /* A page whose read failed is not retried once no frame wants it, and forgotten. */
     s.script[4] = SHR_E_IO;
-    resolve(f, regular, &r);
+    resolve(f, first, &r);
     settle(ctx);
     ASSERT_EQ_LL(s.calls, 5);
     ASSERT_EQ_LL(f->pkg[ROLE_LATIN].pages[0]->retry.count, 1);
-    resolve(f, bold, &r);
+    resolve(f, second, &r);
     fake_now += 50 * MS;
     settle(ctx);
     ASSERT_EQ_LL(s.calls, 5);
     ASSERT(f->pkg[ROLE_LATIN].pages[0] == NULL);
-    ASSERT_EQ_LL(load(ctx, f, regular, &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, first, &r), SHR_OK);
     ASSERT_EQ_LL(r.image.height, 4);
     harness_close(&h);
     PASS();
@@ -1623,21 +1628,21 @@ TEST test_evict_wanted_page(void) {
     uint8_t d[SY_SIZE];
     synth(d);
     harness h;
-    cache_limit = 150;
+    cache_limit = 80;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_cache);
     tsrc s = {d, SY_SIZE, .script = {[3] = SHR_E_WOULD_BLOCK, [4] = SHR_IN_PROGRESS}};
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
-    const uint64_t ids[2] = {glyph1(f, 'A', 0), glyph1(f, 'A', SHR_STYLE_BOLD)};
+    const uint64_t ids[2] = {glyph1(f, 'A'), glyph2(f)};
     shr__resolved r;
     resolve(f, ids[0], &r);
     settle(ctx);
     resolve_all(f, ids, 2);
-    shr_pump(ctx); /* Regular backs off, Bold is read */
+    shr_pump(ctx); /* the first page backs off, the second is read */
     ASSERT_EQ_LL(s.pending, 1);
     fake_now = 50 * MS;
     ts_complete(ctx, &s, SHR_OK);
-    shr_pump(ctx); /* Bold becomes ready, Regular evicts it, then the reverse: each is read once */
+    shr_pump(ctx); /* the second becomes ready, the first evicts it, then the reverse: each is read once */
     shr__page **pages = f->pkg[ROLE_LATIN].pages;
     ASSERT_EQ_LL(s.calls, 7);
     ASSERT(!pages[0] && pages[1]->state == PAGE_READY && f->wants.len == 0);
@@ -1651,12 +1656,12 @@ TEST test_open_while_blocked(void) {
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_one_read);
     uint8_t d[SY_SIZE], k[SY_SIZE], n[SY_SIZE];
     synth(d);
-    synth_as(k, ROLE_CJK, "ko", 'A', 0xAC00);
-    synth_as(n, ROLE_NERD, "", 0xE0B0, 0xE0B1);
+    synth_as(k, ROLE_CJK, "ko", 'A', 0xAC00, SY_A4);
+    synth_as(n, ROLE_NERD, "", 0xE0B0, 0xE0B1, SY_A4);
     tsrc sl = {d, SY_SIZE, .script = {SHR_IN_PROGRESS}}, sc = {k, SY_SIZE, .mode = SRC_READ}, sn = {n, SY_SIZE, .mode = SRC_READ};
     lib l = {.src = {[ROLE_LATIN] = &sl, [ROLE_CJK] = &sc, [ROLE_NERD] = &sn}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
-    const uint64_t ids[3] = {glyph1(f, 'A', 0), glyph1(f, 0xAC00, 0), glyph1(f, 0xE0B0, 0)};
+    const uint64_t ids[3] = {glyph1(f, 'A'), glyph1(f, 0xAC00), glyph1(f, 0xE0B0)};
     resolve_all(f, ids, 3);
     shr_pump(ctx);
     ASSERT_EQ_LL(l.opens, 3);
@@ -1681,17 +1686,18 @@ TEST test_pins_per_frame(void) {
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__res *res = shr__bitmap_font_res(f);
-    uint64_t a = glyph1(f, 'A', 0);
-    uint32_t seq[2] = {'A', 0x301};
-    uint64_t sa = glyph(f, seq, 2, 0);
-    uint64_t bold = glyph1(f, 'A', SHR_STYLE_BOLD);
+    uint64_t a = glyph1(f, 'A'), second = glyph2(f);
+    uint32_t sel[2] = {'A', 0xFE0E};
+    uint64_t sa = glyph(f, sel, 2); /* another id for the same glyph */
     shr__resolved r;
     load(ctx, f, a, &r);
-    load(ctx, f, bold, &r);
+    load(ctx, f, second, &r);
+    ASSERT_EQ_LL(load(ctx, f, sa, &r), SHR_OK); /* once the other packages are known to be absent */
+    ASSERT(!r.provisional && r.image.height == 4);
     shr__page *p = f->pkg[ROLE_LATIN].pages[0], *q = f->pkg[ROLE_LATIN].pages[1];
     for (int i = 0; i < 4; i++) res->ops->resolve(res, i % 2 ? sa : a, 5, &r); /* one stamp per frame */
     res->ops->resolve(res, a, 6, &r);
-    res->ops->resolve(res, bold, 6, &r);
+    res->ops->resolve(res, second, 6, &r);
     res->ops->resolve(res, sa, 6, &r);
     ASSERT(p->pin[0] == 5 && p->pin[1] == 6 && q->pin[0] == 6 && q->pin[1] == 0);
     ASSERT_EQ_LL(f->lru_bytes, 0);
@@ -1702,10 +1708,10 @@ TEST test_pins_per_frame(void) {
     ASSERT_EQ_LL(res->ops->resolve(res, a, 7, &r), SHR_OK);
     ASSERT_EQ_LL(p->pin[0], 7);
     res->ops->frame_end(res, 6);
-    ASSERT_EQ_LL(f->lru_bytes, 84);
+    ASSERT_EQ_LL(f->lru_bytes, 36);
     res->ops->frame_end(res, 7);
     ASSERT(f->pinned == NULL);
-    ASSERT_EQ_LL(f->lru_bytes, 68 + 84);
+    ASSERT_EQ_LL(f->lru_bytes, 52 + 36);
     harness_close(&h);
     PASS();
 }
@@ -1723,7 +1729,7 @@ TEST test_destroy_with_outstanding_reads(void) {
         shr_pl_res_bitmap_font *f = font_new(ctx, &l, NULL);
         shr__resolved r;
         for (int i = 0; i < 2; i++) {
-            resolve(f, glyph1(f, 'A', 0), &r);
+            resolve(f, glyph1(f, 'A'), &r);
             settle(ctx);
         }
         ASSERT_EQ_LL(s.pending, 1); /* the page read */
@@ -1754,13 +1760,13 @@ TEST test_shutdown_with_outstanding_reads(void) {
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
     shr__res *res = shr__bitmap_font_res(f);
     shr__resolved r;
-    resolve(f, glyph1(f, 'A', 0), &r);
+    resolve(f, glyph1(f, 'A'), &r);
     settle(ctx);
-    const uint64_t both[2] = {glyph1(f, 'A', 0), glyph1(f, 0xAC00, 0)};
+    const uint64_t both[2] = {glyph1(f, 'A'), glyph1(f, 0xAC00)};
     resolve_all(f, both, 2);
     settle(ctx);
     ASSERT_EQ_LL(u.pending + s.pending, 2); /* a page read and a load step */
-    resolve(f, glyph1(f, 'A', SHR_STYLE_BOLD), &r); /* wanted, never scheduled */
+    resolve(f, glyph2(f), &r); /* wanted, never scheduled */
     s.destroy_on_cancel = f;
     ASSERT_EQ_LL(shr_begin_shutdown(ctx), SHR_OK);
     ASSERT_EQ_LL(s.cancels, 1);
@@ -1769,7 +1775,7 @@ TEST test_shutdown_with_outstanding_reads(void) {
     ASSERT(!res->ops->has_work(res));
     ASSERT_EQ_LL(res->ops->deadline(res), 0);
     ASSERT_EQ_LL(shr_destroy(ctx), SHR_E_WOULD_BLOCK);
-    ASSERT_EQ_LL(resolve(f, glyph1(f, 0xE0B0, 0), &r), SHR_OK); /* no package opens any more */
+    ASSERT_EQ_LL(resolve(f, glyph1(f, 0xE0B0), &r), SHR_OK); /* no package opens any more */
     ASSERT_EQ_LL(l.opens, 2);
     ts_complete(ctx, &u, SHR_OK);
     shr_pump(ctx);
@@ -1877,7 +1883,7 @@ TEST test_failed_page_event_in_frames(void) {
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
     uint8_t d[SY_SIZE];
     synth(d);
-    d[SY_PAGE0 + 60] ^= 0xFF;
+    d[SY_BM0 + 4] ^= 0xFF;
     tsrc s = {d, SY_SIZE, .mode = SRC_MAP};
     lib l = {.src = {[ROLE_LATIN] = &s}};
     shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
@@ -1919,40 +1925,54 @@ static blob read_package(const char *name) {
     return b;
 }
 
-static shr_status real_load(shr_context *ctx, shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t n, uint32_t style,
+static shr_status real_load(shr_context *ctx, shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t n,
                             shr__resolved *out) {
-    return load(ctx, f, glyph(f, cps, n, style), out);
+    return load(ctx, f, glyph(f, cps, n), out);
+}
+
+/* ppem_26_6 of the package's instance */
+static uint32_t package_ppem(const char *name) {
+    blob b = read_package(name);
+    uint32_t ppem = 0;
+    for (uint32_t i = 0; b.size >= 128 && i < shr__rd32(b.data + 16); i++)
+        if (shr__rd32(b.data + 128 + 32 * i) == 4) ppem = shr__rd32(b.data + shr__rd64(b.data + 128 + 32 * i + 8) + 8);
+    free(b.data);
+    return ppem;
 }
 
 TEST test_real_packages(void) {
+    uint32_t cjk = package_ppem("cjk-ko"), latin = package_ppem("latin");
+    ASSERT(latin > 0 && cjk <= latin && 5 * cjk >= 4 * latin); /* CJK at the latin em, or a little smaller */
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
     shr_pl_res_bitmap_font *f = harness_font(&h);
     uint32_t fffd = 0xFFFD, lvt[3] = {0x1100, 0x1161, 0x11A8}, lv_t[2] = {0xAC00, 0x11A8}, gak = 0xAC01,
              nfd[2] = {'e', 0x301}, nfc = 0xE9, unq[3] = {0x1F441, 0x200D, 0x1F5E8},
              full[5] = {0x1F441, 0xFE0F, 0x200D, 0x1F5E8, 0xFE0F}, sel[2] = {0x1F600, 0xFE00}, smile = 0x1F600;
-    const uint32_t singles[] = {0xAC00, 0x1F600, 0xE0B0, 0x2630, 0x6F22};
+    const uint32_t singles[] = {0xAC00, 0x1F600, 0xE0B0, 0x2630, 0x6F22, 0x2588};
+    const uint32_t synth[] = {SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC, 0, 0, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC, 0};
     shr__resolved a, b;
-    ASSERT_EQ_LL(real_load(ctx, f, &fffd, 1, 0, &a), SHR_OK);
+    ASSERT_EQ_LL(real_load(ctx, f, &fffd, 1, &a), SHR_OK);
     for (size_t i = 0; i < sizeof(singles) / sizeof(singles[0]); i++) {
-        ASSERT_EQ_LL(real_load(ctx, f, &singles[i], 1, 0, &b), SHR_OK);
-        ASSERT(!b.provisional && !same_image(&a, &b)); /* Hangul, emoji, Nerd, symbols, Han */
+        ASSERT_EQ_LL(real_load(ctx, f, &singles[i], 1, &b), SHR_OK);
+        ASSERT(!b.provisional && !same_image(&a, &b)); /* Hangul, emoji, Nerd, symbols, Han, a block */
+        ASSERT_EQ_LL(b.synth, synth[i]);
+        if (singles[i] == 0xAC00 || singles[i] == 0x6F22) /* inside their two cells */
+            ASSERT(b.offset.x >= 0 && b.offset.x + b.image.width <= 2 * CW && b.offset.y >= 0 &&
+                   b.offset.y + b.image.height <= CH);
     }
     const struct {
         const uint32_t *a, *b;
         size_t an, bn;
     } alias[] = {{lvt, &gak, 3, 1}, {lv_t, &gak, 2, 1}, {nfd, &nfc, 2, 1}, {unq, full, 3, 5}, {sel, &smile, 2, 1}};
     for (size_t i = 0; i < sizeof(alias) / sizeof(alias[0]); i++) {
-        ASSERT_EQ_LL(real_load(ctx, f, alias[i].a, alias[i].an, 0, &a), SHR_OK);
-        ASSERT_EQ_LL(real_load(ctx, f, alias[i].b, alias[i].bn, 0, &b), SHR_OK);
+        ASSERT_EQ_LL(real_load(ctx, f, alias[i].a, alias[i].an, &a), SHR_OK);
+        ASSERT_EQ_LL(real_load(ctx, f, alias[i].b, alias[i].bn, &b), SHR_OK);
         ASSERT(same_image(&a, &b));
     }
     uint32_t cap = 'A';
-    ASSERT_EQ_LL(real_load(ctx, f, &cap, 1, 0, &a), SHR_OK);
-    ASSERT_EQ_LL(real_load(ctx, f, &cap, 1, SHR_STYLE_ITALIC, &b), SHR_OK);
-    ASSERT(same_image(&a, &b)); /* Italic -> Regular */
-    ASSERT_EQ_LL(real_load(ctx, f, &cap, 1, SHR_STYLE_BOLD, &b), SHR_OK);
-    ASSERT(!same_image(&a, &b)); /* a real Bold face */
+    ASSERT_EQ_LL(real_load(ctx, f, &cap, 1, &a), SHR_OK);
+    ASSERT_EQ_LL(a.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC);
     harness_close(&h);
 
     /* Not installed: every glyph falls back to the built-in package. */
@@ -1961,8 +1981,8 @@ TEST test_real_packages(void) {
     shr_pl_res_bitmap_font_desc_init(&fd);
     fd.open = font_dir_open, fd.user = (void *)"/nonexistent";
     ASSERT_EQ_LL(shr_pl_res_bitmap_font_create(ctx, &fd, &h.font), SHR_OK);
-    ASSERT_EQ_LL(real_load(ctx, h.font, &fffd, 1, 0, &a), SHR_OK);
-    ASSERT_EQ_LL(real_load(ctx, h.font, singles, 1, 0, &b), SHR_OK);
+    ASSERT_EQ_LL(real_load(ctx, h.font, &fffd, 1, &a), SHR_OK);
+    ASSERT_EQ_LL(real_load(ctx, h.font, singles, 1, &b), SHR_OK);
     ASSERT(!b.provisional && same_image(&a, &b) && inside(&b, shr__builtin_package, shr__builtin_package_size));
     ASSERT_EQ_LL(last_failure(ctx), SHR_OK);
     harness_close(&h);
@@ -1983,10 +2003,10 @@ TEST test_real_emoji_sequences(void) {
         size_t n;
     } seqs[] = {{{0x2764, 0xFE0F}, 2}, {{0x1F469, 0x200D, 0x1F4BB}, 3}, {{0x1F1F0, 0x1F1F7}, 2}};
     shr__resolved fffd, woman, r;
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xFFFD, 0), &fffd), SHR_OK);
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0x1F469, 0), &woman), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0xFFFD), &fffd), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 0x1F469), &woman), SHR_OK);
     for (size_t i = 0; i < sizeof(seqs) / sizeof(seqs[0]); i++) {
-        uint64_t id = glyph(f, seqs[i].cps, seqs[i].n, 0);
+        uint64_t id = glyph(f, seqs[i].cps, seqs[i].n);
         ASSERT(id & SHR_ID_EMOJI);
         ASSERT_EQ_LL(load(ctx, f, id, &r), SHR_OK);
         ASSERT(!r.provisional && inside(&r, e.data, e.size) && !same_image(&r, &fffd) && !same_image(&r, &woman));
