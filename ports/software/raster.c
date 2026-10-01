@@ -151,35 +151,57 @@ shr_status shr__raster_check(const shr_surface *dst, const shr_draw_cmd *cmds, s
     return group ? SHR_E_INVALID_ARG : SHR_OK;
 }
 
-static void do_fill(const shr_surface *dst, shr_rect r, shr_color color, bool dim) {
-    size_t bpp = shr__px_bytes(dst->format);
-    rgb fg = color_rgb(color);
+/* Formats are passed as constants so each format compiles to its own loop. */
+static inline void fill_rows(const shr_surface *dst, shr_rect r, rgb fg, bool dim, shr_pixel_format f) {
+    size_t bpp = shr__px_bytes(f);
     uint8_t px[4];
-    write_px(dst->format, px, fg);
+    write_px(f, px, fg);
     for (int32_t y = r.y0; y < r.y1; y++) {
         uint8_t *p = pixel_at(dst, r.x0, y);
         for (int32_t x = r.x0; x < r.x1; x++, p += bpp) {
             if (dim)
-                write_px(dst->format, p, blend(fg, read_px(dst->format, p), 128));
+                write_px(f, p, blend(fg, read_px(f, p), 128));
             else
                 memcpy(p, px, bpp);
         }
     }
 }
 
-static void do_glyph(const shr_surface *dst, const shr_draw_cmd *c, shr_rect r, shr_point s) {
+static void do_fill(const shr_surface *dst, shr_rect r, shr_color color, bool dim) {
+    if (dst->format == SHR_FORMAT_RGB565)
+        fill_rows(dst, r, color_rgb(color), dim, SHR_FORMAT_RGB565);
+    else
+        fill_rows(dst, r, color_rgb(color), dim, SHR_FORMAT_RGBX8888);
+}
+
+static inline void glyph_rows(const shr_surface *dst, const shr_draw_cmd *c, shr_rect r, shr_point s, shr_pixel_format f,
+                              shr_pixel_format g) {
     rgb fg = color_rgb(c->color);
-    size_t bpp = shr__px_bytes(dst->format);
+    size_t bpp = shr__px_bytes(f);
+    uint32_t dim = (c->flags & SHR_GLYPH_DIM) != 0;
+    shr_image src = c->src;
+    src.format = g;
     for (int32_t y = r.y0; y < r.y1; y++) {
         int32_t sy = s.y + (y - r.y0);
         uint8_t *p = pixel_at(dst, r.x0, y);
         for (int32_t x = r.x0; x < r.x1; x++, p += bpp) {
-            uint32_t a = coverage_at(&c->src, s.x + (x - r.x0), sy);
-            if (c->flags & SHR_GLYPH_DIM) a = (a + 1) / 2;
+            uint32_t a = (coverage_at(&src, s.x + (x - r.x0), sy) + dim) >> dim;
             if (a == 0) continue;
-            write_px(dst->format, p, blend(fg, read_px(dst->format, p), a));
+            write_px(f, p, blend(fg, read_px(f, p), a));
         }
     }
+}
+
+static void do_glyph(const shr_surface *dst, const shr_draw_cmd *c, shr_rect r, shr_point s) {
+    bool rgb565 = dst->format == SHR_FORMAT_RGB565, a8 = c->src.format == SHR_FORMAT_A8;
+    if (rgb565 && a8)
+        glyph_rows(dst, c, r, s, SHR_FORMAT_RGB565, SHR_FORMAT_A8);
+    else if (rgb565)
+        glyph_rows(dst, c, r, s, SHR_FORMAT_RGB565, SHR_FORMAT_A4);
+    else if (a8)
+        glyph_rows(dst, c, r, s, SHR_FORMAT_RGBX8888, SHR_FORMAT_A8);
+    else
+        glyph_rows(dst, c, r, s, SHR_FORMAT_RGBX8888, SHR_FORMAT_A4);
 }
 
 static void do_image(const shr_surface *dst, const shr_draw_cmd *c, shr_rect r, shr_point s) {

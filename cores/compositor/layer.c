@@ -94,12 +94,18 @@ static void pending_clear(shr_lyr *l) {
     l->pending.len = 0;
 }
 
+static size_t group_bytes(size_t n) { return n * sizeof(shr__lcmd) + (n + SHR__BLOCK - 1) / SHR__BLOCK * sizeof(shr_rect); }
+
+static void group_free(const shr__alloc *al, shr__group *g) {
+    shr__free(al, g->cmds, group_bytes(g->n), SHR_ALIGNOF(shr__lcmd), SHR_ALLOC_PAYLOAD);
+}
+
 static void groups_clear(shr_lyr *l) {
     damage(l, content(l));
     for (size_t i = 0; i < l->groups.len; i++) {
         shr__group *g = SHR_VEC_AT(&l->groups, shr__group, i);
         users(g->cmds, g->n, false);
-        SHR_FREE_ARRAY(&l->ctx->al, g->cmds, shr__lcmd, g->n);
+        group_free(&l->ctx->al, g);
     }
     l->groups.len = 0;
 }
@@ -150,34 +156,47 @@ static shr_status group_set(shr_lyr *l, uint32_t id, const shr__lcmd *cmds, size
                         ? SHR_VEC_AT(&l->groups, shr__group, pos)
                         : NULL;
     if (!g && !n) return SHR_OK;
-    shr__lcmd *copy = n ? SHR_NEW_ARRAY(al, shr__lcmd, n) : NULL;
+    shr__lcmd *copy = n ? shr__malloc(al, group_bytes(n), SHR_ALIGNOF(shr__lcmd), SHR_ALLOC_PAYLOAD) : NULL;
     if (n && !copy) return SHR_E_NO_MEMORY;
     if (n) memcpy(copy, cmds, n * sizeof(*copy));
     if (!g) {
         if (!shr__vec_reserve(&l->groups, al, 1)) {
-            SHR_FREE_ARRAY(al, copy, shr__lcmd, n);
+            shr__free(al, copy, group_bytes(n), SHR_ALIGNOF(shr__lcmd), SHR_ALLOC_PAYLOAD);
             return SHR_E_NO_MEMORY;
         }
         g = SHR_VEC_AT(&l->groups, shr__group, pos);
         memmove(g + 1, g, (l->groups.len++ - pos) * sizeof(*g));
         *g = (shr__group){.id = id};
     }
+    const shr_rect none = {0, 0, 0, 0};
+    shr_rect run = none; /* neighbouring changes are recorded together */
     for (size_t i = 0; i < g->n || i < n; i++) {
         const shr__lcmd *a = i < g->n ? &g->cmds[i] : NULL, *b = i < n ? &cmds[i] : NULL;
         if (a && b && lcmd_equal(a, b)) continue;
-        if (a && draws(a)) damage(l, a->dst);
-        if (b && draws(b)) damage(l, b->dst);
+        const shr_rect parts[2] = {a && draws(a) ? a->dst : none, b && draws(b) ? b->dst : none};
+        for (int k = 0; k < 2; k++) {
+            shr_rect u = shr__rect_union(run, parts[k]);
+            if (shr__rect_area(u) > shr__rect_area(run) + shr__rect_area(parts[k])) damage(l, run), u = parts[k];
+            run = u;
+        }
     }
+    damage(l, run);
     users(copy, n, true);
     users(g->cmds, g->n, false);
-    SHR_FREE_ARRAY(al, g->cmds, shr__lcmd, g->n);
+    group_free(al, g);
     if (!n) {
         memmove(g, g + 1, (--l->groups.len - pos) * sizeof(*g));
         return SHR_OK;
     }
-    g->cmds = copy, g->n = n;
-    g->bounds = g->blink = (shr_rect){0, 0, 0, 0};
+    g->cmds = copy, g->blocks = (shr_rect *)(copy + n), g->n = n;
+    g->bounds = g->blink = g->opaque = (shr_rect){0, 0, 0, 0};
     for (size_t i = 0; i < n; i++) {
+        shr_rect *block = &g->blocks[i / SHR__BLOCK];
+        if (i % SHR__BLOCK == 0) *block = (shr_rect){0, 0, 0, 0};
+        if (draws(&copy[i]) || copy[i].kind == SHR__LCMD_CACHE_BEGIN) *block = shr__rect_union(*block, copy[i].dst);
+        bool solid = copy[i].kind == SHR__LCMD_CACHE_BEGIN || /* cache groups are opaque */
+                     (copy[i].kind == SHR__LCMD_FILL && !(copy[i].flags & (SHR__LCMD_DIM | SHR__LCMD_BLINK)));
+        if (solid && shr__rect_area(copy[i].dst) > shr__rect_area(g->opaque)) g->opaque = copy[i].dst;
         if (!draws(&copy[i])) continue;
         g->bounds = shr__rect_union(g->bounds, copy[i].dst);
         if (copy[i].flags & SHR__LCMD_BLINK) g->blink = shr__rect_union(g->blink, copy[i].dst);

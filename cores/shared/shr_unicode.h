@@ -121,6 +121,10 @@ typedef struct shr__cluster_class {
  * recognised emoji 2; Nerd/private use 1; EAW W/F 2 else 1; otherwise the
  * widest base. Marks and hidden selectors never add width. */
 static inline void shr__classify(const uint32_t *cps, size_t n, shr__cluster_class *out) {
+    if (n == 1 && cps[0] - 0x20u < 0x5Fu) { /* printable ASCII: one cell, its own glyph */
+        *out = (shr__cluster_class){1, 0, SHR_GLYPH_SCALAR, cps[0]};
+        return;
+    }
     *out = (shr__cluster_class){0};
     size_t bases = 0, visible = 0;
     uint32_t first_base = 0, first_props = 0;

@@ -50,6 +50,8 @@ make fontpack      # font packages into build/host/fonts
 make fontpack-locales  # all packages, every CJK locale, into build/fonts-locales
 make headless-run  # render examples/headless into a PPM image
 make vt-run        # libghostty-vt consumer example
+make bench         # per-part throughput (BENCH=software|compositor|tilemap|font|image|terminal filters;
+                   #   SHR_BENCH_SECONDS=5 lengthens one case for a profiler)
 make test-asan test-ubsan test-tsan   # host sanitizers (Apple Clang or the host compiler)
 make test-sanitizers fuzz fuzz-msan   # adds the Linux container sanitizers; HWASan needs an arm64 host
 make test-gcc      # x86_64 GCC 13 at -O0, -O2 and ASan+UBSan

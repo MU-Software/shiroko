@@ -85,7 +85,7 @@ coverage: $(FETCHED)
 bench: $(FETCHED)
 	cmake --preset release $(CMAKE_HOST)
 	cmake --build --preset release --target shiroko_bench shiroko_fonts
-	./build/release/tests/shiroko_bench build/release/fonts
+	./build/release/tests/shiroko_bench build/release/fonts $(BENCH)
 
 # Apple Clang on purpose: on macOS 26+ Homebrew LLVM's ASan runtime deadlocks
 # in __asan_init. LSan/MSan/HWASan/RTSan run in the Linux container.

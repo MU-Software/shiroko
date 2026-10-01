@@ -57,11 +57,15 @@ typedef struct shr__io {
     uint64_t deadline;
 } shr__io;
 
+#define SHR__BLOCK 64
+
 typedef struct shr__group {
     uint32_t id;
-    shr__lcmd *cmds;
+    shr__lcmd *cmds; /* followed by `blocks` in the same allocation */
+    shr_rect *blocks; /* bounds of each SHR__BLOCK commands */
     size_t n;
     shr_rect bounds, blink; /* layer coordinates */
+    shr_rect opaque;        /* a part its commands surely cover with opaque pixels */
 } shr__group;
 
 struct shr_lyr {

@@ -35,6 +35,7 @@ target_compile_definitions(test_golden PRIVATE SHR_GOLDEN_DIR="${CMAKE_CURRENT_S
 set_tests_properties(test_golden PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR} SKIP_RETURN_CODE 77)
 add_executable(shiroko_bench bench/bench.c)
 target_link_libraries(shiroko_bench PRIVATE shiroko)
+target_compile_options(shiroko_bench PRIVATE ${SHIROKO_WARNINGS})
 add_test(NAME fontpack_selftest COMMAND ${SHIROKO_FONTPACK} selftest --packages ${CMAKE_BINARY_DIR}/fonts
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 get_property(_tests DIRECTORY PROPERTY TESTS)

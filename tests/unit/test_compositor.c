@@ -2251,8 +2251,8 @@ TEST test_app_layer_diff(void) {
     c[1].color = GREEN;
     paint(l, 3, c);
     frame(ctx);
-    ASSERT(rec.damaged == 64 && rec.commands == 3 && rec.n == 3); /* clear, background, the changed fill */
-    ASSERT(rec.cmds[2].dst.x0 == 0 && rec.cmds[2].dst.x1 == 8 && rec.cmds[2].color == GREEN);
+    ASSERT(rec.damaged == 64 && rec.commands == 2 && rec.n == 2); /* background, the changed fill: no clear below */
+    ASSERT(rec.cmds[1].dst.x0 == 0 && rec.cmds[1].dst.x1 == 8 && rec.cmds[1].color == GREEN);
     ASSERT(px(h.out.shown, 40, 40) == canary && px(h.out.shown, 0, 0) == GREEN);
     shr__lcmd two[2] = {c[0], c[2]}; /* compared by position: both later fills changed */
     paint(l, 2, two);
@@ -2497,6 +2497,98 @@ static bool cache_hint_sent(void) {
 
 static bool rect_eq(shr_rect a, shr_rect b) { return a.x0 == b.x0 && a.y0 == b.y0 && a.x1 == b.x1 && a.y1 == b.y1; }
 
+static bool fill_sent(shr_color color, int32_t x, int32_t y) {
+    for (size_t i = 0; i < rec.n; i++) {
+        const shr_draw_cmd *c = &rec.cmds[i];
+        if (c->kind == SHR_CMD_FILL && c->color == color && x >= c->dst.x0 && x < c->dst.x1 && y >= c->dst.y0 &&
+            y < c->dst.y1)
+            return true;
+    }
+    return false;
+}
+
+/* A damaged area an upper layer surely hides is drawn from that layer up: no clear, nothing below. Fills that
+ * are dim or blink, invisible layers and gaps between groups hide nothing; opaque parts end at the layer. */
+TEST test_hidden_layers_skipped(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    const shr_color black = SHR_RGB(0, 0, 0);
+    shr_lyr *below = solid(ctx, 0, FULL, RED), *top;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 1, (shr_rect){0, 0, 32, 32}, &top), SHR_OK);
+    shr__lcmd rows[2] = {fill((shr_rect){0, 0, 32, 16}, BLUE), fill((shr_rect){0, 16, 32, 32}, GREEN)};
+    ASSERT_EQ_LL(shr__lyr_group_set(top, 0, &rows[0], 1), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_group_set(top, 1, &rows[1], 1), SHR_OK);
+    frame(ctx);
+    ASSERT(!fill_sent(black, 40, 40)); /* the full fill below hides the clear */
+    rows[1].color = RED;
+    ASSERT_EQ_LL(shr__lyr_group_set(top, 1, &rows[1], 1), SHR_OK);
+    frame(ctx); /* inside the two rows: drawn from the top layer only */
+    ASSERT(rec.n == 1 && rec.cmds[0].color == RED && px(h.out.shown, 4, 20) == RED);
+    shr__lcmd under = fill(FULL, WHITE);
+    paint(below, 1, &under);
+    frame(ctx); /* one damaged rect over the whole screen: the top layer hides only part of it */
+    ASSERT(px(h.out.shown, 4, 4) == BLUE && px(h.out.shown, 40, 40) == WHITE);
+
+    static const struct {
+        uint32_t flags;
+        bool visible, gap;
+    } cases[] = {{SHR__LCMD_DIM, true, false}, {SHR__LCMD_BLINK, true, false}, {0, false, false}, {0, true, true}};
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        shr__lcmd a = fill((shr_rect){0, 0, 32, 16}, BLUE), b = fill((shr_rect){0, cases[k].gap ? 20 : 16, 32, 32}, GREEN);
+        a.flags = b.flags = cases[k].flags;
+        ASSERT_EQ_LL(shr__lyr_group_set(top, 0, &a, 1), SHR_OK);
+        ASSERT_EQ_LL(shr__lyr_group_set(top, 1, &b, 1), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_set_visible(top, cases[k].visible), SHR_OK);
+        frame(ctx);
+        shr__lcmd inside[2] = {under, fill((shr_rect){2, 2, 30, 30}, k % 2 ? RED : WHITE)};
+        paint(below, 2, inside);
+        frame(ctx);
+        inside[1].color = k % 2 ? WHITE : RED; /* damage within the top layer's rows */
+        paint(below, 2, inside);
+        frame(ctx);
+        ASSERT(fill_sent(inside[1].color, 4, 17));
+        if (!cases[k].visible || cases[k].gap) ASSERT_EQ_LL(px(h.out.shown, 4, 17), inside[1].color);
+    }
+    ASSERT_EQ_LL(shr_lyr_set_visible(top, true), SHR_OK);
+
+    shr__lcmd wide = fill((shr_rect){-8, 0, 64, 32}, BLUE); /* opaque only inside the layer */
+    ASSERT_EQ_LL(shr__lyr_groups_clear(top), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_group_set(top, 0, &wide, 1), SHR_OK);
+    shr__lcmd spot[2] = {fill(FULL, RED), fill((shr_rect){40, 4, 48, 12}, RED)};
+    paint(below, 2, spot);
+    frame(ctx);
+    spot[1].color = GREEN; /* beside the layer, inside its fill */
+    paint(below, 2, spot);
+    frame(ctx);
+    ASSERT(fill_sent(GREEN, 44, 8) && px(h.out.shown, 44, 8) == GREEN && px(h.out.shown, 4, 4) == BLUE);
+    destroy_layers(&top, 1);
+    destroy_layers(&below, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* A frame skips the blocks of a large group that its damage does not reach; what it draws is unchanged. */
+TEST test_large_group_blocks_skipped(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    shr__lcmd cells[HW / 4 * (HH / 4)]; /* 4x4 cells, row by row: several blocks */
+    size_t n = 0;
+    for (int32_t y = 0; y < HH; y += 4)
+        for (int32_t x = 0; x < HW; x += 4) cells[n++] = fill((shr_rect){x, y, x + 4, y + 4}, (x / 4 + y / 4) % 2 ? RED : BLUE);
+    paint(l, n, cells);
+    frame(ctx);
+    cells[64].color = GREEN; /* the first command of the second block (x 0, y 16) */
+    paint(l, n, cells);
+    frame(ctx);
+    ASSERT(rec.n == 2 && rec.cmds[1].color == GREEN && px(h.out.shown, 0, 16) == GREEN); /* clear, cell */
+    ASSERT(px(h.out.shown, 0, 0) == BLUE && px(h.out.shown, 4, 0) == RED);
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
 /* A hint covers a whole group drawn with final pixels; cache_clip says which part is written. */
 TEST test_cache_hints(void) {
     harness h;
@@ -2517,12 +2609,17 @@ TEST test_cache_hints(void) {
 
     memset(h.out.bufs[0] + (5 * HW + 30) * SCREEN_BPP, 0x5A, SCREEN_BPP);
     uint32_t canary = px(h.out.bufs[0], 30, 5);
-    shr_lyr *m = solid(ctx, 1, (shr_rect){10, 0, 12, 2}, RED);
+    shr_lyr *m;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 1, (shr_rect){10, 0, 12, 2}, &m), SHR_OK);
+    shr__lcmd half = fill((shr_rect){0, 0, 2, 2}, RED);
+    half.flags = SHR__LCMD_DIM; /* not opaque: the group below still draws */
+    paint(m, 1, &half);
     frame(ctx); /* the group is drawn whole, only the damaged part is written */
-    ASSERT_EQ_LL(rec.n, 6);
-    ASSERT(rec.cmds[1].kind == SHR_CMD_CACHE_BEGIN && rect_eq(rec.cmds[1].cache_clip, (shr_rect){10, 0, 12, 2}));
-    ASSERT(rect_eq(rec.cmds[2].dst, group) && rec.cmds[4].kind == SHR_CMD_CACHE_END);
-    ASSERT(px(h.out.shown, 30, 5) == canary && px(h.out.shown, 10, 0) == RED && px(h.out.shown, 9, 0) == BLUE);
+    ASSERT_EQ_LL(rec.n, 5); /* no clear: the cached group hides the damage */
+    ASSERT(rec.cmds[0].kind == SHR_CMD_CACHE_BEGIN && rect_eq(rec.cmds[0].cache_clip, (shr_rect){10, 0, 12, 2}));
+    ASSERT(rect_eq(rec.cmds[1].dst, group) && rec.cmds[3].kind == SHR_CMD_CACHE_END);
+    uint32_t mixed = px(h.out.shown, 10, 0);
+    ASSERT(px(h.out.shown, 30, 5) == canary && mixed != RED && mixed != BLUE && px(h.out.shown, 9, 0) == BLUE);
 
     r.px.provisional = true; /* fallback pixels are not cached */
     shr_request_redraw(ctx);
@@ -2539,7 +2636,7 @@ TEST test_cache_hints(void) {
     ASSERT(cache_hint_sent());
     fake_now = 150 * MS;
     shr_pump(ctx);
-    ASSERT(!cache_hint_sent() && rec.n == 2 && px(h.out.shown, 16, 8) == BLUE);
+    ASSERT(!cache_hint_sent() && rec.n == 1 && px(h.out.shown, 16, 8) == BLUE); /* the layer hides the clear */
 
     const shr_rect moved[2] = {{40, 0, 72, 16}, {8, 0, 24, 16}}; /* partly off the screen, or out of its layer */
     for (int i = 0; i < 2; i++) {
@@ -3141,6 +3238,8 @@ int main(int argc, char **argv) {
     RUN_TEST(test_command_validation);
     RUN_TEST(test_plugin_owned_layers);
     RUN_TEST(test_resource_users_counted);
+    RUN_TEST(test_hidden_layers_skipped);
+    RUN_TEST(test_large_group_blocks_skipped);
     RUN_TEST(test_cache_hints);
     RUN_TEST(test_resource_resolution);
     RUN_TEST(test_provisional_pixels_redrawn);
