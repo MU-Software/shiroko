@@ -5,7 +5,6 @@
 #include "shr_rect.h"
 
 static inline uint32_t expand(uint32_t v, uint32_t m) { return (v * 255 + m / 2) / m; }
-static inline uint32_t quantize(uint32_t c, uint32_t m) { return (c * m + 127) / 255; }
 static inline uint32_t blend8(uint32_t fg, uint32_t bg, uint32_t a) {
     return (fg * a + bg * (255 - a) + 127) / 255;
 }
@@ -17,6 +16,12 @@ typedef struct rgb {
 static inline rgb color_rgb(shr_color c) { return (rgb){(c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF}; }
 static inline rgb blend(rgb fg, rgb bg, uint32_t a) {
     return (rgb){blend8(fg.r, bg.r, a), blend8(fg.g, bg.g, a), blend8(fg.b, bg.b, a)};
+}
+
+/* RGB565 blends round once from the 5/6-bit destination, as a GPU blending unorm values does:
+ * round((m * fg * a + 255 * d * (255 - a)) / 255^2), with w = 255 * (255 - a). */
+static inline uint32_t blend565(uint32_t fg, uint32_t d, uint32_t a, uint32_t w, uint32_t m) {
+    return (uint32_t)((uint64_t)(m * fg * a + d * w + 65025 / 2) / 65025);
 }
 
 static inline uint8_t *pixel_at(const shr_surface *s, int32_t x, int32_t y) {
@@ -38,11 +43,24 @@ static inline rgb read_px(shr_pixel_format f, const uint8_t *p) {
 
 static inline void write_px(shr_pixel_format f, uint8_t *p, rgb c) {
     if (f == SHR_FORMAT_RGB565) {
-        uint16_t v = (uint16_t)((quantize(c.r, 31) << 11) | (quantize(c.g, 63) << 5) | quantize(c.b, 31));
+        uint16_t v = (uint16_t)((shr__quantize(c.r, 31) << 11) | (shr__quantize(c.g, 63) << 5) | shr__quantize(c.b, 31));
         memcpy(p, &v, 2);
     } else {
         p[0] = (uint8_t)c.r, p[1] = (uint8_t)c.g, p[2] = (uint8_t)c.b, p[3] = 255;
     }
+}
+
+static inline void blend_px(shr_pixel_format f, uint8_t *p, rgb fg, uint32_t a) {
+    if (f != SHR_FORMAT_RGB565) {
+        write_px(f, p, blend(fg, read_px(f, p), a));
+        return;
+    }
+    uint16_t v;
+    memcpy(&v, p, 2);
+    uint32_t w = 255 * (255 - a);
+    v = (uint16_t)(blend565(fg.r, v >> 11, a, w, 31) << 11 | blend565(fg.g, (v >> 5) & 63, a, w, 63) << 5 |
+                   blend565(fg.b, v & 31, a, w, 31));
+    memcpy(p, &v, 2);
 }
 
 static inline uint32_t coverage_at(const shr_image *m, int32_t x, int32_t y) {
@@ -59,34 +77,47 @@ static bool rect_inside(shr_rect r, shr_rect b) {
     return r.x0 >= b.x0 && r.y0 >= b.y0 && r.x0 <= r.x1 && r.y0 <= r.y1 && r.x1 <= b.x1 && r.y1 <= b.y1;
 }
 
-/* Bytes spanned by rows [y, y + h) and pixels [x, x + w); addresses compare as integers. */
+/* Bytes a buffer region spans, addresses compared as integers; a DEVICE buffer is its handle alone. */
 typedef struct span {
     uintptr_t begin, end;
+    bool device;
 } span;
 
-static span span_of(const void *pixels, size_t stride, shr_pixel_format f, int32_t x, int32_t y, int32_t w, int32_t h) {
-    size_t bpp = shr__px_bytes(f);
-    uintptr_t begin = (uintptr_t)pixels + (size_t)y * stride + (size_t)x * bpp;
-    return (span){begin, begin + (size_t)(h - 1) * stride + (size_t)w * bpp};
+static span whole(const void *pixels, size_t bytes, shr_memory_domain dom) {
+    bool device = dom == SHR_MEMORY_DEVICE;
+    return (span){(uintptr_t)pixels, (uintptr_t)pixels + (device ? 1 : bytes), device};
 }
 
-static bool spans_overlap(span a, span b) { return a.begin < b.end && b.begin < a.end; }
+/* Rows [y, y + h) and pixels [x, x + w). */
+static span span_of(const void *pixels, shr_memory_domain dom, size_t stride, shr_pixel_format f, int32_t x, int32_t y,
+                    int32_t w, int32_t h) {
+    if (dom == SHR_MEMORY_DEVICE) return whole(pixels, 0, dom);
+    size_t bpp = shr__px_bytes(f);
+    uintptr_t begin = (uintptr_t)pixels + (size_t)y * stride + (size_t)x * bpp;
+    return (span){begin, begin + (size_t)(h - 1) * stride + (size_t)w * bpp, false};
+}
+
+static bool spans_overlap(span a, span b) { return a.device == b.device && a.begin < b.end && b.begin < a.end; }
 
 static span copy_src_span(const shr_image *m, shr_point s, shr_rect r) {
-    return span_of(m->pixels, m->stride, m->format, s.x, s.y, r.x1 - r.x0, r.y1 - r.y0);
+    return span_of(m->pixels, m->domain, m->stride, m->format, s.x, s.y, r.x1 - r.x0, r.y1 - r.y0);
 }
 
 static span dst_span(const shr_surface *dst, shr_rect r) {
-    return span_of(dst->pixels, dst->stride, dst->format, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+    return span_of(dst->pixels, dst->domain, dst->stride, dst->format, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
 }
 
-/* Cached groups render into a separate buffer, so a group must not read its destination. */
-static bool reads_dst(const shr_surface *dst, const shr_image *m) {
-    uintptr_t d = (uintptr_t)dst->pixels, p = (uintptr_t)m->pixels;
-    return p < d + dst->byte_length && d < p + m->byte_length;
+bool shr__raster_reads_dst(const shr_surface *dst, const shr_image *m) SHR_NONBLOCKING {
+    return spans_overlap(whole(dst->pixels, dst->byte_length, dst->domain), whole(m->pixels, m->byte_length, m->domain));
 }
 
-static shr_status src_check(const shr_draw_cmd *c, bool format_ok) {
+static shr_status reach(shr__reach_fn fn, const void *user, const void *pixels, int32_t w, int32_t h, shr_pixel_format f,
+                        shr_memory_domain dom) SHR_NONBLOCKING {
+    if (fn) return fn(user, pixels, w, h, f, dom);
+    return dom == SHR_MEMORY_DEVICE ? SHR_E_UNSUPPORTED : SHR_OK;
+}
+
+static shr_status src_check(const shr_draw_cmd *c, bool format_ok, shr__reach_fn fn, const void *user) {
     if (!format_ok) return SHR_E_UNSUPPORTED;
     const shr_image *m = &c->src;
     shr_status st = shr_image_validate(m);
@@ -94,28 +125,30 @@ static shr_status src_check(const shr_draw_cmd *c, bool format_ok) {
     int64_t sx1 = (int64_t)c->src_origin.x + (c->dst.x1 - c->dst.x0);
     int64_t sy1 = (int64_t)c->src_origin.y + (c->dst.y1 - c->dst.y0);
     if (c->src_origin.x < 0 || c->src_origin.y < 0 || sx1 > m->width || sy1 > m->height) return SHR_E_INVALID_ARG;
-    return m->domain == SHR_MEMORY_DEVICE ? SHR_E_UNSUPPORTED : SHR_OK;
+    return reach(fn, user, m->pixels, m->width, m->height, m->format, m->domain);
 }
 
-static shr_status rotate_check(const shr_surface *dst, const shr_draw_cmd *c) {
+static shr_status rotate_check(const shr_surface *dst, const shr_draw_cmd *c, shr__reach_fn fn, const void *user) {
     const shr_image *m = &c->src;
     shr_status st = shr_image_validate(m);
     if (st != SHR_OK) return st;
-    if (!screen_format(m->format) || m->domain == SHR_MEMORY_DEVICE) return SHR_E_UNSUPPORTED;
+    if (!screen_format(m->format)) return SHR_E_UNSUPPORTED;
+    if ((st = reach(fn, user, m->pixels, m->width, m->height, m->format, m->domain)) != SHR_OK) return st;
     bool quarter = c->rotation == SHR_ROTATE_90_CW || c->rotation == SHR_ROTATE_90_CCW;
     if (c->rotation != SHR_ROTATE_180 && !quarter) return SHR_E_INVALID_ARG;
     if (dst->width != (quarter ? m->height : m->width) || dst->height != (quarter ? m->width : m->height))
         return SHR_E_INVALID_ARG;
     if (shr__rect_empty(c->dst)) return SHR_OK;
-    span s = span_of(m->pixels, m->stride, m->format, 0, 0, m->width, m->height);
+    span s = span_of(m->pixels, m->domain, m->stride, m->format, 0, 0, m->width, m->height);
     return spans_overlap(s, dst_span(dst, c->dst)) ? SHR_E_UNSUPPORTED : SHR_OK;
 }
 
-shr_status shr__raster_check(const shr_surface *dst, const shr_draw_cmd *cmds, size_t count) SHR_NONBLOCKING {
+shr_status shr__raster_check(const shr_surface *dst, const shr_draw_cmd *cmds, size_t count, shr__reach_fn fn,
+                             const void *user) SHR_NONBLOCKING {
     if (count && !cmds) return SHR_E_INVALID_ARG;
     shr_status st = shr_surface_validate(dst);
     if (st != SHR_OK) return st;
-    if (dst->domain == SHR_MEMORY_DEVICE) return SHR_E_UNSUPPORTED;
+    if ((st = reach(fn, user, dst->pixels, dst->width, dst->height, dst->format, dst->domain)) != SHR_OK) return st;
     shr_rect all = {0, 0, dst->width, dst->height};
     const shr_draw_cmd *group = NULL;
     for (size_t i = 0; i < count; i++) {
@@ -133,20 +166,20 @@ shr_status shr__raster_check(const shr_surface *dst, const shr_draw_cmd *cmds, s
         if (!rect_inside(c->dst, group ? group->dst : all)) return SHR_E_INVALID_ARG;
         switch (c->kind) {
         case SHR_CMD_FILL: break;
-        case SHR_CMD_GLYPH: st = src_check(c, c->src.format == SHR_FORMAT_A4 || c->src.format == SHR_FORMAT_A8); break;
-        case SHR_CMD_IMAGE: st = src_check(c, c->src.format == SHR_FORMAT_RGBA8888); break;
+        case SHR_CMD_GLYPH: st = src_check(c, c->src.format == SHR_FORMAT_A4 || c->src.format == SHR_FORMAT_A8, fn, user); break;
+        case SHR_CMD_IMAGE: st = src_check(c, c->src.format == SHR_FORMAT_RGBA8888, fn, user); break;
         case SHR_CMD_COPY:
-            st = src_check(c, screen_format(c->src.format));
+            st = src_check(c, screen_format(c->src.format), fn, user);
             /* Row-wise memmove handles overlap only between identical layouts. */
             if (st == SHR_OK && (c->src.format != dst->format || c->src.stride != dst->stride) &&
                 !shr__rect_empty(c->dst) && spans_overlap(copy_src_span(&c->src, c->src_origin, c->dst), dst_span(dst, c->dst)))
                 st = SHR_E_UNSUPPORTED;
             break;
-        case SHR_CMD_ROTATE: st = group ? SHR_E_INVALID_ARG : rotate_check(dst, c); break;
+        case SHR_CMD_ROTATE: st = group ? SHR_E_INVALID_ARG : rotate_check(dst, c, fn, user); break;
         default: return SHR_E_INVALID_ARG;
         }
         if (st != SHR_OK) return st;
-        if (group && reads_dst(dst, &c->src)) return SHR_E_INVALID_ARG;
+        if (group && shr__raster_reads_dst(dst, &c->src)) return SHR_E_INVALID_ARG;
     }
     return group ? SHR_E_INVALID_ARG : SHR_OK;
 }
@@ -160,7 +193,7 @@ static inline void fill_rows(const shr_surface *dst, shr_rect r, rgb fg, bool di
         uint8_t *p = pixel_at(dst, r.x0, y);
         for (int32_t x = r.x0; x < r.x1; x++, p += bpp) {
             if (dim)
-                write_px(f, p, blend(fg, read_px(f, p), 128));
+                blend_px(f, p, fg, 128);
             else
                 memcpy(p, px, bpp);
         }
@@ -174,8 +207,9 @@ static void do_fill(const shr_surface *dst, shr_rect r, shr_color color, bool di
         fill_rows(dst, r, color_rgb(color), dim, SHR_FORMAT_RGBX8888);
 }
 
-static inline void glyph_rows(const shr_surface *dst, const shr_draw_cmd *c, shr_rect r, shr_point s, shr_pixel_format f,
-                              shr_pixel_format g) {
+/* Inlined by force: clang otherwise keeps one copy and the formats stop being constants. */
+static inline __attribute__((always_inline)) void glyph_rows(const shr_surface *dst, const shr_draw_cmd *c, shr_rect r,
+                                                             shr_point s, shr_pixel_format f, shr_pixel_format g) {
     rgb fg = color_rgb(c->color);
     size_t bpp = shr__px_bytes(f);
     uint32_t dim = (c->flags & SHR_GLYPH_DIM) != 0;
@@ -187,7 +221,7 @@ static inline void glyph_rows(const shr_surface *dst, const shr_draw_cmd *c, shr
         for (int32_t x = r.x0; x < r.x1; x++, p += bpp) {
             uint32_t a = (coverage_at(&src, s.x + (x - r.x0), sy) + dim) >> dim;
             if (a == 0) continue;
-            write_px(f, p, blend(fg, read_px(f, p), a));
+            blend_px(f, p, fg, a);
         }
     }
 }
@@ -212,7 +246,7 @@ static void do_image(const shr_surface *dst, const shr_draw_cmd *c, shr_rect r, 
         for (int32_t x = r.x0; x < r.x1; x++, p += bpp, q += 4) {
             rgb fg = {q[0], q[1], q[2]};
             if (q[3] == 255) write_px(dst->format, p, fg);
-            else if (q[3]) write_px(dst->format, p, blend(fg, read_px(dst->format, p), q[3]));
+            else if (q[3]) blend_px(dst->format, p, fg, q[3]);
         }
     }
 }

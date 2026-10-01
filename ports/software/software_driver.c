@@ -42,7 +42,7 @@ struct sw {
 #include "cache_table.h"
 
 shr_status shr_software_execute(const shr_surface *dst, const shr_draw_cmd *cmds, size_t count) SHR_NONBLOCKING {
-    shr_status st = shr__raster_check(dst, cmds, count);
+    shr_status st = shr__raster_check(dst, cmds, count, NULL, NULL);
     if (st != SHR_OK) return st;
     shr_rect all = {0, 0, dst->width, dst->height}, clip = all;
     for (size_t i = 0; i < count; i++) {
@@ -134,7 +134,7 @@ static void draw_group(sw *s, const shr_surface *dst, const shr_draw_cmd *group,
 static shr_status sw_execute(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t count,
                              shr_fence fence) {
     (void)fence;
-    shr_status st = shr__raster_check(dst, cmds, count);
+    shr_status st = shr__raster_check(dst, cmds, count, NULL, NULL);
     if (st != SHR_OK) return st;
     shr_rect all = {0, 0, dst->width, dst->height};
     for (size_t i = 0; i < count; i++) {

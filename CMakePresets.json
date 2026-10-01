@@ -25,6 +25,15 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "angle",
+      "displayName": "Host debug with the ANGLE driver",
+      "binaryDir": "${sourceDir}/build/angle",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SHIROKO_PORT_ANGLE": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -39,6 +48,10 @@
     {
       "name": "release",
       "configurePreset": "release"
+    },
+    {
+      "name": "angle",
+      "configurePreset": "angle"
     }
   ],
   "testPresets": [
@@ -52,6 +65,13 @@
     {
       "name": "host-rgbx",
       "configurePreset": "host-rgbx",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "angle",
+      "configurePreset": "angle",
       "output": {
         "outputOnFailure": true
       }

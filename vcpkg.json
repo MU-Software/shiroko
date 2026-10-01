@@ -12,6 +12,28 @@
       "dependencies": [
         "greatest"
       ]
+    },
+    "angle": {
+      "description": "OpenGL ES driver on ANGLE (ports/angle)",
+      "dependencies": [
+        {
+          "name": "angle",
+          "features": [
+            "metal"
+          ],
+          "platform": "osx"
+        },
+        {
+          "name": "angle",
+          "platform": "!osx"
+        }
+      ]
+    },
+    "png": {
+      "description": "PNG export for render comparison tests",
+      "dependencies": [
+        "stb"
+      ]
     }
   },
   "license": "MIT"

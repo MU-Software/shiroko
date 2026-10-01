@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "check.h"
+#include "raster.h"
 
 static const shr_pixel_format FMTS[2] = {SHR_FORMAT_RGB565, SHR_FORMAT_RGBX8888};
 
@@ -65,7 +66,15 @@ static uint32_t dec(shr_pixel_format f, uint32_t v) {
     return v >> 8;
 }
 
+/* RGB565 blends round once: fg * a + d * (1 - a) on unorm values, d the raw 5/6-bit level. */
+static uint32_t mix565(uint32_t fg, uint32_t d, uint32_t a, uint32_t m) {
+    return (uint32_t)(m * (fg / 255.0) * (a / 255.0) + d * (1 - a / 255.0) + 0.5);
+}
+
 static uint32_t mix(shr_pixel_format f, uint32_t fg, uint32_t bg_raw, uint32_t a) {
+    if (f == SHR_FORMAT_RGB565)
+        return mix565(fg >> 16 & 255, bg_raw >> 11 & 31, a, 31) << 11 | mix565(fg >> 8 & 255, bg_raw >> 5 & 63, a, 63) << 5 |
+               mix565(fg & 255, bg_raw & 31, a, 31);
     uint32_t bg = dec(f, bg_raw);
     return enc(f, blend8(fg >> 16 & 255, bg >> 16 & 255, a) << 16 | blend8(fg >> 8 & 255, bg >> 8 & 255, a) << 8 |
                       blend8(fg & 255, bg & 255, a));
@@ -173,6 +182,24 @@ TEST glyph_a8_blends_every_coverage(void) {
         for (uint32_t a = 1; a < 256; a++) ASSERT_EQ_LL(raw(&s, (int32_t)a, 0), mix(FMTS[i], 0xFF8007, bg, a));
         ASSERT_EQ_LL(raw(&s, 255, 0), enc(FMTS[i], 0xFF8007));
     }
+    PASS();
+}
+
+TEST rgb565_blends_round_once_for_every_input(void) {
+    uint8_t cov[255];
+    for (int a = 0; a < 255; a++) cov[a] = (uint8_t)(a + 1);
+    uint16_t px[255];
+    shr_surface s = packed(px, SHR_FORMAT_RGB565, 255, 1);
+    shr_draw_cmd c = cmd(SHR_CMD_GLYPH, (shr_rect){0, 0, 255, 1});
+    c.src = (shr_image){cov, 255, 1, 255, 255, SHR_FORMAT_A8, SHR_MEMORY_CPU};
+    for (uint32_t d = 0; d < 64; d++)
+        for (uint32_t fg = 0; fg < 256; fg++) {
+            uint32_t bg = (d & 31) << 11 | d << 5 | (31 - (d & 31));
+            for (int x = 0; x < 255; x++) px[x] = (uint16_t)bg;
+            c.color = SHR_RGB(fg, 255 - fg, fg);
+            ASSERT_EQ_LL(shr_software_execute(&s, &c, 1), SHR_OK);
+            for (uint32_t a = 1; a < 256; a++) ASSERT_EQ_LL(px[a - 1], mix(SHR_FORMAT_RGB565, c.color, bg, a));
+        }
     PASS();
 }
 
@@ -389,6 +416,50 @@ TEST rotate_rejects_bad_geometry_and_sources(void) {
     b = packed(px + 4, SHR_FORMAT_RGB565, 2, 2);
     r.dst = (shr_rect){0, 0, 2, 2};
     ASSERT_EQ_LL(shr_software_execute(&b, &r, 1), SHR_OK);
+    PASS();
+}
+
+/* A device driver's reach: CPU memory and the DEVICE buffer named `user`. */
+static shr_status device_reach(const void *user, const void *pixels, int32_t w, int32_t h, shr_pixel_format f,
+                               shr_memory_domain dom) SHR_NONBLOCKING {
+    (void)w, (void)h, (void)f;
+    return dom != SHR_MEMORY_DEVICE || pixels == user ? SHR_OK : SHR_E_UNSUPPORTED;
+}
+
+TEST check_uses_the_driver_reach(void) {
+    static const char handle = 0, unknown = 0;
+    uint16_t px[16 * 8];
+    shr_surface cpu = packed(px, SHR_FORMAT_RGB565, 16, 8);
+    shr_surface dev = {(void *)&handle, 16, 8, 32, 256, SHR_FORMAT_RGB565, 0, SHR_MEMORY_DEVICE, 1};
+    shr_image self = as_image(&dev), wide = self, gone = self;
+    wide.format = SHR_FORMAT_RGBX8888, wide.stride = 64;
+    gone.pixels = &unknown;
+    shr_rect r = {0, 0, 4, 4};
+    shr_draw_cmd fill = {.kind = SHR_CMD_FILL, .dst = r};
+    ASSERT_EQ_LL(shr__raster_check(&dev, &fill, 1, NULL, NULL), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_check(&dev, &fill, 1, device_reach, &handle), SHR_OK);
+    ASSERT_EQ_LL(shr__raster_check(&dev, &fill, 1, device_reach, &unknown), SHR_E_UNSUPPORTED);
+    /* DEVICE buffers overlap when they are the same one, never with CPU memory. */
+    shr_draw_cmd copy = {.kind = SHR_CMD_COPY, .dst = r, .src = self, .src_origin = {1, 1}};
+    ASSERT_EQ_LL(shr__raster_check(&dev, &copy, 1, device_reach, &handle), SHR_OK);
+    copy.src = wide;
+    ASSERT_EQ_LL(shr__raster_check(&dev, &copy, 1, device_reach, &handle), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_check(&cpu, &copy, 1, device_reach, &handle), SHR_OK);
+    copy.src = gone;
+    ASSERT_EQ_LL(shr__raster_check(&cpu, &copy, 1, device_reach, &handle), SHR_E_UNSUPPORTED);
+    shr_draw_cmd rot = {.kind = SHR_CMD_ROTATE, .dst = r, .src = self, .rotation = SHR_ROTATE_180};
+    ASSERT_EQ_LL(shr__raster_check(&dev, &rot, 1, device_reach, &handle), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr__raster_check(&cpu, &rot, 1, device_reach, &handle), SHR_OK);
+    rot.src = gone;
+    ASSERT_EQ_LL(shr__raster_check(&cpu, &rot, 1, device_reach, &handle), SHR_E_UNSUPPORTED);
+    shr_draw_cmd group[] = {{.kind = SHR_CMD_CACHE_BEGIN, .dst = {0, 0, 8, 8}, .cache_clip = {0, 0, 8, 8}},
+                            {.kind = SHR_CMD_COPY, .dst = r, .src = self, .src_origin = {8, 0}},
+                            {.kind = SHR_CMD_CACHE_END}};
+    ASSERT_EQ_LL(shr__raster_check(&dev, group, 3, device_reach, &handle), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__raster_check(&cpu, group, 3, device_reach, &handle), SHR_OK);
+    group[1].src = as_image(&cpu);
+    ASSERT_EQ_LL(shr__raster_check(&dev, group, 3, device_reach, &handle), SHR_OK);
+    ASSERT_EQ_LL(shr__raster_reads_dst(&cpu, &self), false);
     PASS();
 }
 
@@ -1008,6 +1079,7 @@ int main(int argc, char **argv) {
     RUN_TEST(fill_is_opaque_and_respects_stride);
     RUN_TEST(fill_dim_blends_at_half_strength);
     RUN_TEST(glyph_a8_blends_every_coverage);
+    RUN_TEST(rgb565_blends_round_once_for_every_input);
     RUN_TEST(glyph_a4_nibbles_origin_and_dim);
     RUN_TEST(glyph_a8_dim_keeps_faint_coverage);
     RUN_TEST(image_is_straight_alpha_source_over);
@@ -1016,6 +1088,7 @@ int main(int argc, char **argv) {
     RUN_TEST(copy_overlap_rules);
     RUN_TEST(rotate_maps_every_rotation);
     RUN_TEST(rotate_rejects_bad_geometry_and_sources);
+    RUN_TEST(check_uses_the_driver_reach);
     RUN_TEST(execute_rejects_bad_batches_without_drawing);
     RUN_TEST(cache_hints_are_validated);
     RUN_TEST(execute_clips_groups_to_cache_clip);

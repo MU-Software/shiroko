@@ -8,7 +8,7 @@ SPDX-License-Identifier: MIT (see `LICENSE`; third-party notices in `NOTICE`).
 
 - CMake ≥ 3.21 and a C11 compiler (a C++17 compiler for the header test)
 - [vcpkg](https://vcpkg.io) with `VCPKG_ROOT` set (manifest `vcpkg.json`: `uthash` and `xxhash` for the library,
-  `greatest` for tests)
+  `greatest` and `stb` (PNG output) for tests)
 - [uv](https://docs.astral.sh/uv/) for the Python tools (`pyproject.toml`, `uv.lock`, `.python-version`)
 - Docker for the Linux sanitizer, fuzz and x86_64 GCC targets (`make sanitizer-image gcc-image`)
 - For `make vt-run` only: Zig 0.16.0 (`brew install zig`) and the `third_party/ghostty` submodule
@@ -39,7 +39,13 @@ into `build/fonts-locales`.
 The screen pixel format is `SHIROKO_PIXEL_FORMAT`: `RGB565` (default) or `RGBX8888` (preset `host-rgbx`,
 `make PIXEL_FORMAT=RGBX8888 test`).
 
-The golden image test compares against images drawn at 8x16 and skips (exit code 77) at other cell sizes.
+The render comparison test (`tests/render`, `test_render`) draws a catalog of scenes offscreen through the public
+API: its golden list (`tests/render/golden.txt`, XXH3-128 per scene, cell size and pixel format) holds 8x16 entries
+only, so other cell sizes skip it (exit code 77) after running the reftests (scene pairs that must draw identical
+pixels). `SHR_UPDATE_GOLDEN=1` rewrites this build's entries. Mismatches leave expected/actual/diff PNGs in
+`build/render/failures`. `test_render --frames N` times N full redraws per scene after the first frame; with
+`SHIROKO_PORT_ANGLE`, `--backend angle` (ctest `test_render_angle`) compares the GPU driver against the software
+images within per-scene fuzzy limits.
 
 ## Common targets
 
@@ -48,6 +54,8 @@ make test          # unit/golden tests, fontpack selftest, headless example, fuz
 make core-test     # text measurement tests only
 make fontpack      # font packages into build/host/fonts
 make fontpack-locales  # all packages, every CJK locale, into build/fonts-locales
+make render-test   # render comparison suite (goldens, reftests)
+make render-export # every scene as PNG into build/render (RENDER_ARGS='--frames 100' times them instead)
 make headless-run  # render examples/headless into a PPM image
 make vt-run        # libghostty-vt consumer example
 make bench         # per-part throughput (BENCH=software|compositor|tilemap|font|image|terminal filters;
@@ -82,6 +90,23 @@ committed regression inputs in `tests/fuzz/corpus/<target>`.
   `shr_pl_lyr_tilemap_resize()`.
 - `shr_pl_lyr_tilemap_resize()` takes an optional background colour for cells without `SHR_STYLE_BG`;
   `shr_pl_lyr_tilemap_measure()` lays text out into a caller array of `shr_text_cluster`.
+
+## OpenGL ES driver (ANGLE)
+
+`-DSHIROKO_PORT_ANGLE=ON` (preset `angle`, vcpkg feature `angle`: ANGLE with Metal on macOS) builds the static library
+`shiroko_angle` (`shiroko::shiroko_angle`, header `shiroko/port_angle.h`): a synchronous `shr_framebuffer_driver` on
+OpenGL ES 3.0 for CPU memory and GPU surfaces (`shr_angle_surface_create()`, `SHR_MEMORY_DEVICE` surfaces whose `pixels`
+is a driver handle, so they can also be COPY/ROTATE sources such as a composition;
+`shr_angle_surface_texture(driver, surface, &texture)` gives the GL texture, top row first). Every call needs the EGL
+context the driver was created with current on the calling thread and returns `SHR_E_STATE` otherwise.
+`shr_angle_offscreen_create()` makes an EGL pbuffer context for tests and tools;
+`SHIROKO_ANGLE_BACKEND` picks its backend (`metal`, `opengl`, `vulkan`, `d3d11`, `default`; unset: `metal` on macOS,
+`opengl` elsewhere) and the others are tried when it fails. FILL, COPY, ROTATE and every RGBX8888 command match the
+software port exactly. RGB565 blends (GLYPH, IMAGE, DIM) round once from the 5/6-bit destination in both drivers, as
+GPUs blend; a GPU that blends 16-bit targets at reduced precision (Metal) still leaves under 1 % of the blended pixels
+one level off.
+`test_angle` compares both drivers and skips (exit code 77) without an EGL display. The library is installed but not
+exported in `shirokoConfig.cmake`.
 
 ## Using an installed Shiroko
 

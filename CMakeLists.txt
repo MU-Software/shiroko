@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
+if(POLICY CMP0156)
+  cmake_policy(SET CMP0156 NEW)
+endif()
 # Dependencies come from vcpkg; the toolchain must be known before project().
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   if(NOT CMAKE_TOOLCHAIN_FILE)
@@ -8,13 +11,17 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
   endif()
   if(NOT DEFINED SHIROKO_BUILD_TESTS OR SHIROKO_BUILD_TESTS)
-    set(VCPKG_MANIFEST_FEATURES tests)
+    list(APPEND VCPKG_MANIFEST_FEATURES tests png)
+  endif()
+  if(SHIROKO_PORT_ANGLE)
+    list(APPEND VCPKG_MANIFEST_FEATURES angle)
   endif()
 endif()
 project(shiroko VERSION 0.1.0 LANGUAGES C)
 
 option(SHIROKO_BUILD_TESTS "Build host unit tests" ${PROJECT_IS_TOP_LEVEL})
 option(SHIROKO_BUILD_EXAMPLES "Build examples" ${PROJECT_IS_TOP_LEVEL})
+option(SHIROKO_PORT_ANGLE "Build the OpenGL ES driver on ANGLE (ports/angle, target shiroko_angle)" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -165,6 +172,23 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/shirokoConfigVersion.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shiroko)
 install(FILES LICENSE NOTICE DESTINATION ${CMAKE_INSTALL_DATADIR}/shiroko)
 install(DIRECTORY LICENSES DESTINATION ${CMAKE_INSTALL_DATADIR}/shiroko)
+
+# A separate library: applications without ANGLE link shiroko alone. ANGLE's static libraries are C++.
+if(SHIROKO_PORT_ANGLE)
+  enable_language(CXX)
+  find_package(unofficial-angle CONFIG REQUIRED)
+  file(GLOB SHIROKO_ANGLE_SOURCES CONFIGURE_DEPENDS ports/angle/*.c ports/angle/*.h)
+  add_library(shiroko_angle STATIC ${SHIROKO_ANGLE_SOURCES})
+  add_library(shiroko::shiroko_angle ALIAS shiroko_angle)
+  target_include_directories(shiroko_angle PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/ports/angle/include>
+    PRIVATE ports/angle ports/software cores/shared)
+  target_include_directories(shiroko_angle SYSTEM PRIVATE ${UTHASH_INCLUDE_DIR})
+  target_link_libraries(shiroko_angle PUBLIC shiroko unofficial::angle::libEGL unofficial::angle::libGLESv2)
+  target_compile_options(shiroko_angle PRIVATE ${SHIROKO_WARNINGS})
+  # Not exported: shirokoConfig.cmake does not find ANGLE for its consumers.
+  install(TARGETS shiroko_angle ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  install(DIRECTORY ports/angle/include/shiroko DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
 
 if(SHIROKO_BUILD_TESTS)
   enable_testing()

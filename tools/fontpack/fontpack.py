@@ -219,8 +219,11 @@ class Face:
         self.underline = post.underlinePosition
         self.strike = os2.yStrikeoutPosition
         self.advance = collections.Counter(a for a, _ in self.tt["hmtx"].metrics.values() if a).most_common(1)[0][0]
-        block = self.cmap.get(0x2588)
-        self.cell_box = self.bounds(self.tt.getGlyphID(block)) if block else (0, -self.descent, self.advance, self.ascent)
+        # the design cell: the full block, else the union of the sextants
+        full = [0x2588] if 0x2588 in self.cmap else [c for c in range(0x1FB00, 0x1FB3C) if c in self.cmap]
+        boxes = [self.bounds(self.tt.getGlyphID(self.cmap[c])) for c in full]
+        self.cell_box = ((min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes),
+                          max(b[3] for b in boxes)) if boxes else (0, -self.descent, self.advance, self.ascent))
 
     def bounds(self, gid):
         pen = BoundsPen(self.tt.getGlyphSet())
@@ -369,8 +372,9 @@ def fit_ppem(face, role, size, baseline):
     return min(width_fit, baseline * face.upem / face.ascent, (lh - baseline) * face.upem / face.descent)
 
 
-def raster(face, gid, ppem, box=None, width=0, height=0):
-    """Box glyphs map the design box `box` exactly onto a width x height cell area."""
+def raster(face, gid, ppem, box=None, width=0, height=0, snap=False):
+    """Box glyphs map the design box `box` exactly onto a width x height cell area; `snap` rounds their vertices
+    to whole pixels."""
     ft = face.ft
     if box:
         sx, sy = width / (box[2] - box[0]), height / (box[3] - box[1])
@@ -378,6 +382,10 @@ def raster(face, gid, ppem, box=None, width=0, height=0):
         ft.set_transform(freetype.Matrix(0x10000, 0, 0, 0x10000),
                          freetype.Vector(round(-box[0] * sx * 64), round(-box[1] * sy * 64)))
         ft.load_glyph(gid, freetype.FT_LOAD_NO_HINTING)
+        if snap:
+            o = ft.glyph.outline._FT_Outline
+            for i in range(o.n_points):
+                o.points[i].x, o.points[i].y = (o.points[i].x + 32) & -64, (o.points[i].y + 32) & -64
         ft.set_transform(freetype.Matrix(0x10000, 0, 0, 0x10000), freetype.Vector(0, 0))
     else:
         ft.set_char_size(round(ppem * 64), round(ppem * 64), 72, 72)
@@ -425,6 +433,7 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep):
                   "underline": underline, "strike": strike} for style in real_styles]
 
     sources = [pkg["faces"][s] for s in real_styles]
+    em = fit_ppem(latin_face, "latin", size, baseline)
     glyph_records, bitmaps = [], []
     clipped = fallbacks = notdef = 0
     for inst in instances:
@@ -451,8 +460,16 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep):
             cp = v if kind == "cp" else -1
             box = (src_face.cell_box if 0x2500 <= cp <= 0x259F or 0x1FB00 <= cp <= 0x1FBFF
                    else src_face.bounds(gid) if 0xE0B0 <= cp <= 0xE0D7 and gid else None)
-            rows, left, top, advance = (raster(src_face, gid, inst["ppem"], box, cells * cw, lh) if gid
+            ppem, own = inst["ppem"], role == "symbols" and gid and not box
+            if own:  # each symbol scaled on its own: the latin em, shrunk until its ink fits its cells
+                x0, y0, x1, y1 = src_face.bounds(gid) or (0, 0, 1, 1)
+                ppem = min(em, cells * cw * src_face.upem / max(1, x1 - x0), lh * src_face.upem / max(1, y1 - y0))
+            snap = 0x1FB00 <= cp <= 0x1FB6F  # sextants, wedges and triangles: thirds and halves of the cell
+            rows, left, top, advance = (raster(src_face, gid, ppem, box, cells * cw, lh, snap) if gid
                                         else (None, 0, 0, 0))
+            while own and rows and (len(rows[0]) > cells * cw or len(rows) > lh):
+                ppem *= min(cells * cw / len(rows[0]), lh / len(rows)) * 0.98
+                rows, left, top, advance = raster(src_face, gid, ppem)
             if rows is None:
                 glyph_records.append((0, 0, 0, 0, 0, 0, (cells << 2) | (0x10 if fb else 0), gid, b""))
                 continue
@@ -461,6 +478,8 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep):
                 bx, top = left, inst["baseline"] - (lh - top)
             else:
                 bx = round((cells * cw - advance) / 2) + left
+            if own:
+                bx, top = min(max(bx, 0), cells * cw - w), max(min(top, inst["baseline"]), inst["baseline"] + h - lh)
             if not box and (bx < 0 or bx + w > cells * cw or inst["baseline"] - top < 0
                             or inst["baseline"] - top + h > lh):
                 clipped += 1

@@ -2,7 +2,7 @@
 # from the sources in FONT_CACHE, which Make fetches first together with the uv tools environment.
 # Run `make fontpack-fetch` once before running targets in parallel with -j.
 
-.PHONY: test core-test headless-run bench tools-env fontpack-fetch fontpack fontpack-locales \
+.PHONY: test core-test render-test render-export headless-run bench tools-env fontpack-fetch fontpack fontpack-locales \
         test-asan test-ubsan test-tsan sanitizer-image test-asan-linux test-lsan-linux test-msan-linux \
         test-tsan-linux test-ubsan-linux test-hwasan-linux test-rtsan-linux test-sanitizers \
         fuzz fuzz-msan vt-run coverage test-gcc gcc-image clean
@@ -56,6 +56,18 @@ core-test: $(FETCHED)
 	cmake --preset $(PRESET) $(CMAKE_HOST)
 	cmake --build --preset $(PRESET) --target test_tilemap test_grapheme
 	ctest --preset $(PRESET) -R '^test_(tilemap|grapheme)$$'
+
+# Render comparison (tests/render): goldens and reftests; mismatches leave PNGs in build/render/failures.
+# render-export writes every scene to build/render; RENDER_ARGS adds options (e.g. --frames 100, -t emoji).
+render-test: $(FETCHED)
+	cmake --preset $(PRESET) $(CMAKE_HOST)
+	cmake --build --preset $(PRESET) --target test_render shiroko_fonts
+	ctest --preset $(PRESET) -R '^test_render'
+
+render-export: $(FETCHED)
+	cmake --preset $(PRESET) $(CMAKE_HOST)
+	cmake --build --preset $(PRESET) --target test_render shiroko_fonts
+	./build/$(PRESET)/tests/test_render --export --out build/render $(RENDER_ARGS) || [ $$? -eq 77 ]
 
 headless-run: $(FETCHED)
 	cmake --preset $(PRESET) $(CMAKE_HOST)
