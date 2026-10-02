@@ -13,7 +13,7 @@ tools = [
     "fonttools==4.60.1",
     "freetype-py==2.5.1",
     "uharfbuzz==0.51.1",
-    "pillow==11.3.0",
+    "pillow==12.3.0",
     "pooch==1.9.0",
     "xxhash>=4.0.1",
     "zstandard==0.25.0",
