@@ -346,14 +346,16 @@ static shr_status open_driver(app *a, int driver, int w, int h) {
     }
     shr_status st = SHR_E_DEVICE;
     if (driver == SOFTWARE) {
+        int pw, ph, rw, rh;
+        SDL_GetWindowSizeInPixels(a->win, &pw, &ph);
+        /* Room for the rows of two screens with slack: rows toggled between two states still hit. */
+        uint64_t cache = 3ull * (uint64_t)pw * (uint64_t)ph * (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? 2 : 4);
         a->ren = SDL_CreateRenderer(a->win, NULL);
-        st = a->ren ? shr_software_driver_create(NULL, 1u << 20, 256, &a->drv) : SHR_E_DEVICE;
+        st = a->ren ? shr_software_driver_create(NULL, cache, 256, &a->drv) : SHR_E_DEVICE;
         if (st == SHR_OK) {
-            int pw, ph, rw, rh;
-            SDL_GetWindowSizeInPixels(a->win, &pw, &ph);
             SDL_GetRenderOutputSize(a->ren, &rw, &rh);
-            printf("software driver, presented by SDL_Renderer %s (output %dx%d px, window %dx%d px)\n",
-                   SDL_GetRendererName(a->ren), rw, rh, pw, ph);
+            printf("software driver, presented by SDL_Renderer %s (output %dx%d px, window %dx%d px, cache %.1f MiB)\n",
+                   SDL_GetRendererName(a->ren), rw, rh, pw, ph, (double)cache / (1 << 20));
             snprintf(a->label, sizeof(a->label), "software");
         }
     }

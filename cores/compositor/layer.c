@@ -3,9 +3,19 @@
 static bool draws(const shr__lcmd *c) { return c->kind <= SHR__LCMD_IMAGE; }
 static bool uses_res(const shr__lcmd *c) { return c->kind == SHR__LCMD_GLYPH || c->kind == SHR__LCMD_IMAGE; }
 
+/* Counted per run of one resource: a row's glyphs share a font. */
 static void users(const shr__lcmd *c, size_t n, bool add) {
-    for (size_t i = 0; i < n; i++)
-        if (uses_res(&c[i])) add ? c[i].res->users++ : c[i].res->users--;
+    shr__res *res = NULL;
+    uint32_t k = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i < n && !uses_res(&c[i])) continue;
+        if (i < n && c[i].res == res) {
+            k++;
+            continue;
+        }
+        if (res) res->users = add ? res->users + k : res->users - k;
+        if (i < n) res = c[i].res, k = 1;
+    }
 }
 
 static bool lcmd_equal(const shr__lcmd *a, const shr__lcmd *b) {
@@ -170,14 +180,31 @@ static shr_status group_set(shr_lyr *l, uint32_t id, const shr__lcmd *cmds, size
         *g = (shr__group){.id = id};
     }
     const shr_rect none = {0, 0, 0, 0};
-    shr_rect run = none; /* neighbouring changes are recorded together */
-    for (size_t i = 0; i < g->n || i < n; i++) {
-        const shr__lcmd *a = i < g->n ? &g->cmds[i] : NULL, *b = i < n ? &cmds[i] : NULL;
-        if (a && b && lcmd_equal(a, b)) continue;
+    shr_rect run = none, bounds = none, blink = none, opaque = none;
+    shr_rect *blocks = (shr_rect *)(copy + n);
+    for (size_t i = 0; i < n; i++) {
+        const shr__lcmd *b = &cmds[i];
+        shr_rect *block = &blocks[i / SHR__BLOCK];
+        if (i % SHR__BLOCK == 0) *block = none;
+        if (draws(b) || b->kind == SHR__LCMD_CACHE_BEGIN) *block = shr__rect_union(*block, b->dst);
+        bool solid = b->kind == SHR__LCMD_CACHE_BEGIN || /* cache groups are opaque */
+                     (b->kind == SHR__LCMD_FILL && !(b->flags & (SHR__LCMD_DIM | SHR__LCMD_BLINK)));
+        if (solid && shr__rect_area(b->dst) > shr__rect_area(opaque)) opaque = b->dst;
+        if (draws(b)) bounds = shr__rect_union(bounds, b->dst);
+        if (draws(b) && (b->flags & SHR__LCMD_BLINK)) blink = shr__rect_union(blink, b->dst);
+    }
+    /* Past the equal ends, lists of one length change in place: neighbouring changes are damaged together. A
+     * length change shifts what follows, so the changed middle is damaged as one. */
+    size_t lo = 0, ha = g->n, hb = n;
+    while (lo < ha && lo < hb && lcmd_equal(&g->cmds[lo], &cmds[lo])) lo++;
+    while (ha > lo && hb > lo && lcmd_equal(&g->cmds[ha - 1], &cmds[hb - 1])) ha--, hb--;
+    for (size_t i = lo; i < ha || i < hb; i++) {
+        const shr__lcmd *a = i < ha ? &g->cmds[i] : NULL, *b = i < hb ? &cmds[i] : NULL;
+        if (ha == hb && lcmd_equal(a, b)) continue;
         const shr_rect parts[2] = {a && draws(a) ? a->dst : none, b && draws(b) ? b->dst : none};
         for (int k = 0; k < 2; k++) {
             shr_rect u = shr__rect_union(run, parts[k]);
-            if (shr__rect_area(u) > shr__rect_area(run) + shr__rect_area(parts[k])) damage(l, run), u = parts[k];
+            if (ha == hb && shr__rect_area(u) > shr__rect_area(run) + shr__rect_area(parts[k])) damage(l, run), u = parts[k];
             run = u;
         }
     }
@@ -189,19 +216,7 @@ static shr_status group_set(shr_lyr *l, uint32_t id, const shr__lcmd *cmds, size
         memmove(g, g + 1, (--l->groups.len - pos) * sizeof(*g));
         return SHR_OK;
     }
-    g->cmds = copy, g->blocks = (shr_rect *)(copy + n), g->n = n;
-    g->bounds = g->blink = g->opaque = (shr_rect){0, 0, 0, 0};
-    for (size_t i = 0; i < n; i++) {
-        shr_rect *block = &g->blocks[i / SHR__BLOCK];
-        if (i % SHR__BLOCK == 0) *block = (shr_rect){0, 0, 0, 0};
-        if (draws(&copy[i]) || copy[i].kind == SHR__LCMD_CACHE_BEGIN) *block = shr__rect_union(*block, copy[i].dst);
-        bool solid = copy[i].kind == SHR__LCMD_CACHE_BEGIN || /* cache groups are opaque */
-                     (copy[i].kind == SHR__LCMD_FILL && !(copy[i].flags & (SHR__LCMD_DIM | SHR__LCMD_BLINK)));
-        if (solid && shr__rect_area(copy[i].dst) > shr__rect_area(g->opaque)) g->opaque = copy[i].dst;
-        if (!draws(&copy[i])) continue;
-        g->bounds = shr__rect_union(g->bounds, copy[i].dst);
-        if (copy[i].flags & SHR__LCMD_BLINK) g->blink = shr__rect_union(g->blink, copy[i].dst);
-    }
+    g->cmds = copy, g->blocks = blocks, g->n = n, g->bounds = bounds, g->blink = blink, g->opaque = opaque;
     return SHR_OK;
 }
 

@@ -569,7 +569,8 @@ TEST set_cell_validates_placed_input(void) {
     ASSERT_EQ_LL(set_cell(l, 0, 3, "\xEA\xB0\x80", 1, plain), SHR_OK);                /* kept as given */
     ASSERT_EQ_LL(set_cell(l, 0, 4, "\xF0\x9F\x91\xA9\xE2\x80\x8D", 2, plain), SHR_OK); /* dangling ZWJ */
     ASSERT_STR_EQ(row_text(l, 0), "*..**-..");
-    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_FILL), 3);
+    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_FILL), 1); /* one run of the three blue backgrounds */
+    ASSERT_EQ_LL(cmd(l, 0, 0)->dst.x1, 3 * CW);
     ASSERT_EQ_LL(set_cell(l, 1, 0, "A", 8, plain), SHR_OK);
     ASSERT_STR_EQ(row_text(l, 1), "A-------");
     close_grid(l);
@@ -627,11 +628,13 @@ TEST set_text_tabs_become_background_cells(void) {
     shr_lyr *l = open_grid(2, 8, NULL);
     ASSERT_EQ_LL(set_text(l, 0, 0, "a\tb", on_blue, 0, NULL), SHR_OK);
     ASSERT_STR_EQ(row_text(l, 0), "a...b...");
-    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_FILL), 5);
+    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_FILL), 1);
+    ASSERT_EQ_LL(cmd(l, 0, 0)->dst.x1, 5 * CW);
     ASSERT_EQ_LL(set_text(l, 1, 6, "a\t", on_blue, 0, NULL), SHR_OK); /* the TAB runs past the grid */
-    ASSERT_EQ_LL(count_kind(l, 1, SHR__LCMD_FILL), 2);
+    ASSERT_EQ_LL(count_kind(l, 1, SHR__LCMD_FILL), 1);
+    ASSERT_EQ_LL(cmd(l, 1, 0)->dst.x0, 6 * CW);
+    ASSERT_EQ_LL(cmd(l, 1, 0)->dst.x1, 8 * CW);
     ASSERT_EQ_LL(cmd(l, 1, 1)->kind, SHR__LCMD_GLYPH);
-    ASSERT_EQ_LL(cmd(l, 1, 2)->dst.x0, 7 * CW);
     close_grid(l);
     PASS();
 }
@@ -672,9 +675,9 @@ TEST set_text_style_runs_on_cluster_boundaries(void) {
     run.byte_start = 3, run.byte_end = 6;
     ASSERT_EQ_LL(RUNS(&run, 1), SHR_OK);
     ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_FILL), 1);
-    ASSERT_EQ_LL(cmd(l, 0, 1)->kind, SHR__LCMD_FILL);
-    ASSERT_EQ_LL(cmd(l, 0, 1)->dst.x0, 2 * CW);
-    ASSERT_EQ_LL(cmd(l, 0, 1)->color, RED);
+    ASSERT_EQ_LL(cmd(l, 0, 0)->kind, SHR__LCMD_FILL); /* backgrounds come first */
+    ASSERT_EQ_LL(cmd(l, 0, 0)->dst.x0, 2 * CW);
+    ASSERT_EQ_LL(cmd(l, 0, 0)->color, RED);
     ASSERT_EQ_LL(cmd(l, 0, 3)->color, WHITE); /* B keeps the base style */
     run.style.flags = 1u << 8;
     ASSERT_EQ_LL(RUNS(&run, 1), SHR_E_UNKNOWN_STYLE);
@@ -709,9 +712,10 @@ TEST clear_resets_cells_to_the_background(void) {
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, 0, 2, 1, 3, (shr_text_style){RED, BLUE, SHR_STYLE_BG | SHR_STYLE_UNDERLINE}),
                  SHR_OK);
     ASSERT_STR_EQ(row_text(l, 0), "ab...fgh");
-    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_FILL), 3); /* background only */
-    ASSERT_EQ_LL(cmd(l, 0, 2)->color, BLUE);
-    ASSERT_EQ_LL(cmd(l, 0, 2)->dst.x0, 2 * CW);
+    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_FILL), 1); /* background only */
+    ASSERT_EQ_LL(cmd(l, 0, 0)->color, BLUE);
+    ASSERT_EQ_LL(cmd(l, 0, 0)->dst.x0, 2 * CW);
+    ASSERT_EQ_LL(cmd(l, 0, 0)->dst.x1, 5 * CW);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, 0, 0, 1, 8, plain), SHR_OK);
     ASSERT(group_of(l, 0) == NULL);
     ASSERT_EQ_LL(set_cell(l, 1, 2, "\xEA\xB0\x80", 2, plain), SHR_OK);

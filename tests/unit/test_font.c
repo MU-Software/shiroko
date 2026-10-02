@@ -208,16 +208,18 @@ static shr_status last_failure(shr_context *ctx) {
 }
 
 /* ===== Synthetic packages =====
- * One CWxCH instance (A4 or A8) of SY_NG glyphs on each of two 64x64 pages. Page 0: slot 0 (cp0) a 4x4 glyph at
- * (SY_X0, 1), slot 1 ('B') empty. Page 1, trimmed to SY_H1 rows: slot SY_G2 (cp1 other than 'B', and the sequences
- * A+U+0301 and B+U+0301) a glyph two cells wide at (0, 4). The other slots are empty, mapped from U+F0002 on, so that
- * cmap and the records compress. Atlases hold 0x5A around the glyphs of 0xFF. A package is assembled from these raw
- * contents, stored or with cmap and the pages zstd, then sealed. */
+ * One CWxCH instance (A4 or A8) of SY_NG 4x4 glyphs on each of two 64x64 pages. Page 0: record 0 (cp0) at (SY_X0, 1).
+ * Page 1, trimmed to SY_H1 rows: record 0 (cp1 other than 'B', which is blank, and the sequences A+U+0301 and
+ * B+U+0301) two cells wide at (0, 4). The other records repeat record 0 of their page and are mapped from U+F0002 on,
+ * so that the records compress. Atlases hold 0x5A around the glyphs of 0xFF. A package is assembled from these raw
+ * contents, stored or with ctri and the pages zstd, then sealed. */
 enum {
-    SY_W = 64, SY_H = 64, SY_H1 = 8, SY_NG = 16, SY_G2 = SY_NG, SY_NCMAP = 32, SY_X0 = 2, SY_BASE = CH - 4,
+    SY_W = 64, SY_H = 64, SY_H1 = 8, SY_NG = 16, SY_NMAP = 32, SY_X0 = 2, SY_BASE = CH - 4,
     SY_A4 = 1, SY_A8 = 2,
     SY_SLOT = SY_H * SY_W / 2, SY_RECS = 16 * SY_NG, SY_RES = SY_SLOT + SY_RECS, /* A4: a slot, the records, both */
-    SY_CAP = 16384
+    SY_G2 = 1 << 12, /* page 1, record 0 */
+    SY_D = 2624,     /* the data blocks of the default ctri: 'A' in block 1, U+F0000..F001F in blocks 2 and 3 */
+    SY_BOX = 4608, SY_CAP = 16384
 };
 enum { SY_STORED, SY_ZSTD };
 #ifdef SHR_ZSTD
@@ -227,18 +229,19 @@ enum { SY_STORED, SY_ZSTD };
 #endif
 #define FCC(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
 
-static const char *const sy_types[BOX_COUNT] = {"mani", "strs", "srcs", "inst", "cmap", "seqs", "pool", "ptab", "covr"};
+static const char *const sy_types[BOX_COUNT] = {"mani", "strs", "srcs", "inst", "ctri", "seqs", "pool", "ptab", "covr"};
 
 typedef struct sy_raw {
     uint32_t features;
     int32_t len[BOX_COUNT]; /* payload bytes; -1 = absent */
-    uint8_t box[BOX_COUNT][256];
+    uint8_t box[BOX_COUNT][SY_BOX];
     const uint8_t *payload[BOX_COUNT]; /* instead of `box` */
+    uint32_t map[40][2], nmap;         /* the scalars of ctri and their glyph values */
     uint8_t atlas[2][SY_H * SY_W], recs[2][SY_RECS];
-    const uint8_t *stream[5]; /* zstd streams to use instead: cmap, then the atlas and records of each page */
+    const uint8_t *stream[5]; /* zstd streams to use instead: ctri, then the atlas and records of each page */
     size_t stream_n[5];
-    uint32_t pad, shift; /* bytes after page box 0; added before it when stored */
-    char extra[5];       /* an extra indexed box after the others */
+    uint32_t pad, shift, cshift; /* bytes after page box 0; added before it and before ctri when stored */
+    char extra[5];               /* an extra indexed box after the others */
     uint16_t extra_flags;
 } sy_raw;
 
@@ -258,7 +261,7 @@ static uint8_t *sy_entry(uint8_t *d, const char *type) {
 }
 
 static uint8_t *sy_box(uint8_t *d, const char *type) { return d + shr__rd64(sy_entry(d, type) + 8); }
-static uint8_t *sy_ptab(uint8_t *d, int i) { return sy_box(d, "ptab") + 16 + 32 * i; }
+static uint8_t *sy_ptab(uint8_t *d, int i) { return sy_box(d, "ptab") + 16 + SHR_PKG_PTAB * i; }
 static uint8_t *sy_page(uint8_t *d, int i) { return d + shr__rd64(sy_ptab(d, i)); }
 static uint32_t sy_size(uint8_t *d, int i) { return shr__rd32(sy_ptab(d, i) + 16); } /* of page box i */
 
@@ -271,7 +274,7 @@ static void seal(uint8_t *d, size_t n) {
             uint64_t off = shr__rd64(d + e + 8), len = shr__rd32(d + e + 16);
             if (off > n || n - off < len) continue;
             if (pass) put(d + e + 24, XXH3_64bits(d + off, len), 8);
-            for (uint64_t r = off + 16; !pass && !memcmp(d + e, "ptab", 4) && r + 32 <= off + len; r += 32) {
+            for (uint64_t r = off + 16; !pass && !memcmp(d + e, "ptab", 4) && r + 24 <= off + len; r += 24) {
                 uint64_t po = shr__rd64(d + r), pl = shr__rd32(d + r + 16);
                 if (po <= n && n - po >= pl) put(d + r + 8, XXH3_64bits(d + po, pl), 8);
             }
@@ -280,13 +283,45 @@ static void seal(uint8_t *d, size_t n) {
     put(d + 120, XXH3_64bits(d, 120), 8);
 }
 
+/* A ctri of `n` scalars and their glyph values in `out`: a level-2 block per 1024 scalars and a data block per 16
+ * scalars in use, numbered in order of appearance. Returns its size. */
+static size_t sy_ctri(uint8_t *out, uint32_t (*map)[2], size_t n) {
+    static uint16_t l1[1088], l2[8][64];
+    static uint32_t data[16][16];
+    uint32_t nl2 = 1, nd = 1;
+    memset(l1, 0, sizeof(l1)), memset(l2, 0, sizeof(l2)), memset(data, 0xFF, sizeof(data));
+    for (size_t i = 0; i < n; i++) {
+        uint32_t cp = map[i][0];
+        ASSERT_EQ_LL(nl2 < 8 && nd < 16, 1);
+        if (!l1[cp >> 10]) l1[cp >> 10] = (uint16_t)nl2++;
+        uint16_t *b = &l2[l1[cp >> 10]][cp >> 4 & 63];
+        if (!*b) *b = (uint16_t)nd++;
+        data[*b][cp & 15] = map[i][1];
+    }
+    size_t d = (SHR_PKG_CTRI + 128 * nl2 + 63) / 64 * 64;
+    memset(out, 0, d);
+    put(out, nl2, 4), put(out + 4, nd, 4);
+    for (int i = 0; i < 1088; i++) put(out + 16 + 2 * i, l1[i], 2);
+    for (uint32_t b = 0; b < nl2; b++)
+        for (int k = 0; k < 64; k++) put(out + SHR_PKG_CTRI + 128 * b + 2 * k, l2[b][k], 2);
+    for (uint32_t b = 0; b < nd; b++)
+        for (int k = 0; k < 16; k++) put(out + d + 64 * b + 4 * k, data[b][k], 4);
+    return d + 64 * nd;
+}
+
+/* Maps one more scalar of `r`. */
+static void sy_map(sy_raw *r, uint32_t cp, uint32_t gid) {
+    r->map[r->nmap][0] = cp, r->map[r->nmap++][1] = gid;
+    r->len[BOX_CTRI] = (int32_t)sy_ctri(r->box[BOX_CTRI], r->map, r->nmap);
+}
+
 static void sy_init(sy_raw *r, uint8_t role, const char *locale, uint32_t cp0, uint32_t cp1, uint8_t fmt) {
-    static const int32_t lens[BOX_COUNT] = {36, 8, 48, 48, 8 * SY_NCMAP, 24, 16, 64, -1};
+    static const int32_t lens[BOX_COUNT] = {36, 8, 48, 48, 0, 24, 16, 2 * SHR_PKG_PTAB, -1};
     static const uint32_t pool[4] = {'A', 0x301, 'B', 0x301};
     memset(r, 0, sizeof(*r));
     memcpy(r->len, lens, sizeof(lens));
     r->features = fmt | 4u;
-    uint8_t *m = r->box[BOX_MANI], *in = r->box[BOX_INST], *c = r->box[BOX_CMAP];
+    uint8_t *m = r->box[BOX_MANI], *in = r->box[BOX_INST];
     m[0] = role;
     memcpy(m + 4, locale, strlen(locale));
     put(m + 16, 4, 4), put(m + 20, 4, 4), put(m + 24, 4, 4), put(m + 28, 2 * SY_NG, 4), put(m + 32, 2, 4);
@@ -294,24 +329,27 @@ static void sy_init(sy_raw *r, uint8_t role, const char *locale, uint32_t cp0, u
     in[3] = fmt;
     put(in + 4, CH, 2), put(in + 6, CW, 2), put(in + 12, SY_BASE, 2), put(in + 14, CH - 2, 2), put(in + 16, CH / 2, 2);
     put(in + 36, SY_W, 2), put(in + 38, SY_H, 2);
-    put(c, cp0, 4), put(c + 8, cp1, 4), put(c + 12, cp1 == 'B' ? 1 : SY_G2, 4);
-    for (uint32_t i = 2; i < SY_NCMAP; i++) put(c + 8 * i, 0xF0000 + i, 4), put(c + 8 * i + 4, i, 4);
+    r->map[0][0] = cp0, r->map[1][0] = cp1, r->map[1][1] = cp1 == 'B' ? SHR_GID_BLANK : SY_G2;
+    for (uint32_t i = 2; i < SY_NMAP; i++) r->map[i][0] = 0xF0000 + i, r->map[i][1] = (i / SY_NG) << 12 | i % SY_NG;
+    r->nmap = SY_NMAP;
+    r->len[BOX_CTRI] = (int32_t)sy_ctri(r->box[BOX_CTRI], r->map, r->nmap);
     for (int i = 0; i < 2; i++) {
         uint8_t *q = r->box[BOX_SEQS] + 12 * i;
         q[0] = 2, q[1] = 1, put(q + 4, 2 * (uint64_t)i, 4), put(q + 8, SY_G2, 4);
     }
     for (int i = 0; i < 4; i++) put(r->box[BOX_POOL] + 4 * i, pool[i], 4);
     uint32_t stride = fmt == SY_A4 ? SY_W / 2 : SY_W;
-    for (int i = 0; i < 2; i++) { /* slot 0 at x SY_X0 (A8: 0) on the baseline; slot SY_G2 two cells wide, lower */
+    for (int i = 0; i < 2; i++) { /* record 0 at x SY_X0 (A8: 0) on the baseline; on page 1 two cells wide, lower */
         uint32_t x = i || fmt == SY_A8 ? 0 : SY_X0, y = i ? 4 : 1;
-        uint8_t *e = r->recs[i];
         memset(r->atlas[i], 0x5A, sizeof(r->atlas[i]));
         for (uint32_t k = 0; k < 4; k++)
             memset(r->atlas[i] + (y + k) * stride + (fmt == SY_A4 ? x / 2 : x), 0xFF, fmt == SY_A4 ? 2 : 4);
-        for (int g = 0; g < SY_NG; g++) e[16 * g + 8] = 4;
-        put(e, x, 2), put(e + 2, y, 2);
-        e[4] = 4, e[5] = 4, e[6] = (uint8_t)(i ? 0 : 1), e[7] = (uint8_t)(i ? SY_BASE - 3 : SY_BASE);
-        e[8] = (uint8_t)(fmt | (i ? 8 : 4));
+        for (int g = 0; g < SY_NG; g++) {
+            uint8_t *e = r->recs[i] + 16 * g;
+            put(e, x, 2), put(e + 2, y, 2);
+            e[4] = 4, e[5] = 4, e[6] = (uint8_t)(i ? 0 : 1), e[7] = (uint8_t)(i ? SY_BASE - 3 : SY_BASE);
+            e[8] = (uint8_t)(fmt | (i ? 8 : 4));
+        }
     }
 }
 
@@ -321,6 +359,15 @@ static size_t box_put(uint8_t *d, size_t at, const char *type, uint32_t flags, u
     put(d + at, 16 + n, 4), memcpy(d + at + 4, type, 4), put(d + at + 10, flags, 2), put(d + at + 12, raw, 4);
     memcpy(d + at + 16, data, n);
     return at + 16 + n;
+}
+
+/* A free box before a box whose payload starts at a multiple of `align` bytes, `shift` bytes later; returns its end. */
+static size_t free_put(uint8_t *d, size_t at, size_t head, size_t align, size_t shift) {
+    static const uint8_t zero[512];
+    size_t g = (align - (at + head) % align) % align;
+    if (g && g < 16) g += align;
+    g += shift;
+    return g ? box_put(d, at, "free", 0, (uint32_t)g - 16, zero, g - 16) : at;
 }
 
 #ifdef SHR_ZSTD
@@ -339,7 +386,7 @@ static size_t zpack(const sy_raw *r, int k, uint8_t *out, const uint8_t *src, si
 
 /* The package of `r` in `d` (`cap` bytes); returns its size. */
 static size_t assemble_to(uint8_t *d, size_t cap, const sy_raw *r, int method) {
-    static const uint8_t zero[512];
+    static const uint8_t zero[8];
     uint32_t stride = r->box[BOX_INST][3] == SY_A4 ? SY_W / 2 : SY_W, count = r->extra[0] ? 1 : 0;
     const uint32_t heights[2] = {SY_H, SY_H1};
     size_t ptab = 0;
@@ -355,8 +402,9 @@ static size_t assemble_to(uint8_t *d, size_t cap, const sy_raw *r, int method) {
         uint32_t raw = extra ? 8 : (uint32_t)r->len[k], flags = extra ? r->extra_flags : k == BOX_COVR ? 0 : 1;
         size_t n = raw;
 #ifdef SHR_ZSTD
-        if (k == BOX_CMAP && method) n = zpack(r, 0, zbuf[0], data, raw, &data), flags |= 0x10;
+        if (k == BOX_CTRI && method) n = zpack(r, 0, zbuf[0], data, raw, &data), flags |= 0x10;
 #endif
+        if (k == BOX_CTRI && !(flags >> 4)) at = free_put(d, at, 16, 64, r->cshift); /* stored: data blocks aligned */
         memcpy(e, type, 4), put(e + 4, flags, 2), put(e + 8, at, 8), put(e + 16, 16 + n, 4), put(e + 20, raw, 4);
         e += 32;
         if (k == BOX_PTAB) ptab = at;
@@ -369,21 +417,16 @@ static size_t assemble_to(uint8_t *d, size_t cap, const sy_raw *r, int method) {
 #ifdef SHR_ZSTD
         if (method) an = zpack(r, 1 + 2 * i, zbuf[1], a, an, &a), rn = zpack(r, 2 + 2 * i, zbuf[2], rc, rn, &rc), m = 1;
 #endif
-        if (!m) { /* a stored atlas starts at a multiple of 256 bytes: a free box before the page */
-            size_t g = (256 - (at + 24) % 256) % 256 + (i ? 0 : r->shift);
-            if (g && g < 16) g += 256;
-            if (g) at = box_put(d, at, "free", 0, (uint32_t)g - 16, zero, g - 16);
-        }
+        if (!m) at = free_put(d, at, 24, 256, i ? 0 : r->shift); /* a stored atlas starts at a multiple of 256 bytes */
         size_t size = 24 + an + rn + (i ? 0 : r->pad);
-        uint8_t *b = d + at, *t = d + ptab + 16 + 32 * i;
+        uint8_t *b = d + at, *t = d + ptab + 16 + SHR_PKG_PTAB * i;
         put(b, size, 4), memcpy(b + 4, "page", 4), put(b + 10, 1 | m << 4, 2);
         put(b + 12, 8 + heights[i] * stride + SY_RECS, 4), put(b + 16, (uint64_t)i, 4), put(b + 20, an, 4);
         memcpy(b + 24, a, an), memcpy(b + 24 + an, rc, rn);
-        put(t, at, 8), put(t + 16, size, 4), put(t + 20, (uint64_t)i * SY_NG, 4), put(t + 24, SY_NG, 4);
-        put(t + 28, heights[i], 2);
+        put(t, at, 8), put(t + 16, size, 4), put(t + 20, SY_NG, 2), put(t + 22, heights[i], 2);
         at += size;
     }
-    memcpy(d, "\x80\0\0\0shrf", 8), put(d + 10, 1, 2), put(d + 12, 112, 4), put(d + 16, 5, 2);
+    memcpy(d, "\x80\0\0\0shrf", 8), put(d + 10, 1, 2), put(d + 12, 112, 4), put(d + 16, 6, 2);
     put(d + 20, r->features | (method ? 8u : 0u), 4), put(d + 28, 24 + 32 * (uint64_t)count, 4), put(d + 32, at, 8);
     put(d + 40, 128, 8), memcpy(d + 48, shr__text_profile_id, 32);
     memcpy(d + 128 + 4, "sidx", 4), put(d + 128, 24 + 32 * (uint64_t)count, 4), put(d + 138, 1, 2);
@@ -636,7 +679,7 @@ TEST test_builtin_without_packages(void) {
         uint32_t cluster[2] = {0x2500, 0xFE0E};
         ASSERT_EQ_LL(load(ctx, f, glyph(f, cluster, 2), &a), SHR_OK); /* by the cluster's base */
         ASSERT_EQ_LL(a.synth, 0);
-        ASSERT_EQ_LL(load(ctx, f, glyph1(f, ' '), &a), SHR_E_NOT_FOUND); /* empty glyph: nothing to draw */
+        ASSERT_EQ_LL(load(ctx, f, ' ', &a), SHR_E_NOT_FOUND); /* blank: nothing to draw */
     }
     ASSERT_EQ_LL(l.opens, 3); /* latin, CJK and symbols, each asked once */
     shr__line_metrics lm = shr__bitmap_font_line_metrics();
@@ -662,10 +705,14 @@ TEST test_glyph_ids(void) {
     ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &a, 1, NULL, &id), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &a, 1, &cls, NULL), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &big, 1, &cls, &id), SHR_E_INVALID_ARG);
+    cls.glyph_cp = big; /* the table lookups take scalars only */
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &a, 1, &cls, &id), SHR_E_INVALID_ARG);
     shr__classify(&zw, 1, &cls);
     ASSERT_EQ_LL(shr__bitmap_font_glyph(f, &zw, 1, &cls, &id), SHR_E_NOT_FOUND); /* invisible */
-    uint32_t mark = 0x301;
+    uint32_t mark = 0x301, sp[2] = {' ', 0x301};
     ASSERT_EQ_LL(glyph(f, &mark, 1), 0xFFFD); /* replacement */
+    shr__classify(sp, 1, &cls);
+    ASSERT_EQ_LL(shr__bitmap_font_glyph(f, sp, 1, &cls, &id), SHR_E_NOT_FOUND); /* a space: no glyph command */
     ASSERT_EQ_LL(glyph1(f, 'A'), 'A');
     ASSERT_EQ_LL(glyph1(f, 0x1F600), 0x1F600 | SHR_ID_EMOJI);
 
@@ -673,6 +720,7 @@ TEST test_glyph_ids(void) {
     uint64_t i1 = glyph(f, s1, 2), i2 = glyph(f, s2, 2);
     ASSERT_EQ_LL(i1, SHR_ID_CLUSTER);
     ASSERT_EQ_LL(i2, SHR_ID_CLUSTER | 1);
+    ASSERT_EQ_LL(glyph(f, sp, 2), SHR_ID_CLUSTER | 2); /* a space with a mark is a cluster */
     ASSERT_EQ_LL(glyph(f, s1, 2), i1); /* interned once */
     static uint32_t many[256];
     for (int i = 0; i < 256; i++) many[i] = i ? 0x301 : 'a';
@@ -724,6 +772,7 @@ TEST test_package_validation(void) {
         {AT_FILE, 0, 10, 2, 0, SHR_E_FORMAT},
         {AT_FILE, 0, 12, 4, 113, SHR_E_FORMAT},
         {AT_FILE, 0, 16, 2, 4, SHR_E_FORMAT},                            /* format version */
+        {AT_FILE, 0, 16, 2, 5, SHR_E_FORMAT},
         {AT_FILE, 0, 18, 2, 1, SHR_E_FORMAT},
         {AT_FILE, 0, 20, 4, 0x15, SHR_E_UNSUPPORTED},                    /* unknown required feature */
         {AT_FILE, 0, 24, 4, 0xFFFFFFFF, SHR_OK},                         /* optional features */
@@ -759,13 +808,13 @@ TEST test_package_validation(void) {
         {AT_ENTRY, BOX_MANI, 4, 2, 0x101, SHR_E_FORMAT},
         {AT_ENTRY, BOX_MANI, 4, 2, 0, SHR_E_FORMAT},                     /* not REQUIRED */
         {AT_ENTRY, BOX_MANI, 4, 2, 0x11, SHR_E_FORMAT},                  /* zstd where only stored is allowed */
-        {AT_ENTRY, BOX_CMAP, 4, 2, 0x11, SHR_E_FORMAT},                  /* zstd without required feature bit3 */
+        {AT_ENTRY, BOX_CTRI, 4, 2, 0x11, SHR_E_FORMAT},                  /* zstd without required feature bit3 */
         {AT_ENTRY, BOX_MANI, 6, 2, 1, SHR_E_FORMAT},                     /* version */
         {AT_ENTRY, BOX_MANI, 20, 4, 35, SHR_E_FORMAT},                   /* stored raw_size */
         {AT_ENTRY, BOX_MANI, 20, 4, 37, SHR_E_FORMAT},
         {AT_ENTRY, BOX_MANI, 0, 8, FCC('z', 'z', 'z', 'z'), SHR_E_FORMAT}, /* missing boxes */
         {AT_ENTRY, BOX_INST, 0, 8, FCC('z', 'z', 'z', 'z'), SHR_E_FORMAT},
-        {AT_ENTRY, BOX_CMAP, 0, 8, FCC('z', 'z', 'z', 'z'), SHR_E_FORMAT},
+        {AT_ENTRY, BOX_CTRI, 0, 8, FCC('z', 'z', 'z', 'z'), SHR_E_FORMAT},
         {AT_ENTRY, BOX_PTAB, 0, 8, FCC('z', 'z', 'z', 'z'), SHR_E_FORMAT},
         {AT_BOX, BOX_MANI, 0, 4, 53, SHR_E_FORMAT},                      /* box header unlike its entry */
         {AT_BOX, BOX_MANI, 4, 1, 'X', SHR_E_FORMAT},
@@ -817,11 +866,24 @@ TEST test_package_validation(void) {
         {AT_RAW, BOX_INST, 38, 2, 32, SHR_E_FORMAT},
         {AT_RAW, BOX_INST, 6, 2, CW + 1, SHR_E_UNSUPPORTED},             /* another cell size */
         {AT_RAW, BOX_INST, 4, 2, CH + 1, SHR_E_UNSUPPORTED},
-        {AT_LEN, BOX_CMAP, 0, 0, 255, SHR_E_FORMAT},                     /* cmap */
-        {AT_RAW, BOX_CMAP, 8, 4, 0x110000, SHR_E_FORMAT},
-        {AT_RAW, BOX_CMAP, 8, 4, 0xD800, SHR_E_FORMAT},
-        {AT_RAW, BOX_CMAP, 12, 4, 2 * SY_NG, SHR_E_FORMAT},
-        {AT_RAW, BOX_CMAP, 8, 4, 'A', SHR_E_FORMAT},
+        {AT_LEN, BOX_CTRI, 0, 0, SHR_PKG_CTRI - 1, SHR_E_FORMAT},         /* ctri */
+        {AT_RAW, BOX_CTRI, 0, 4, 0, SHR_E_FORMAT},                        /* level-2 blocks */
+        {AT_RAW, BOX_CTRI, 0, 4, 65537, SHR_E_FORMAT},
+        {AT_RAW, BOX_CTRI, 0, 4, 4, SHR_E_FORMAT},                        /* then the data blocks start later */
+        {AT_RAW, BOX_CTRI, 4, 4, 0, SHR_E_FORMAT},                        /* data blocks */
+        {AT_RAW, BOX_CTRI, 4, 4, 65537, SHR_E_FORMAT},
+        {AT_RAW, BOX_CTRI, 4, 4, 5, SHR_E_FORMAT},
+        {AT_RAW, BOX_CTRI, 8, 4, 1, SHR_E_FORMAT},                        /* reserved */
+        {AT_RAW, BOX_CTRI, 12, 4, 1, SHR_E_FORMAT},
+        {AT_LEN, BOX_CTRI, 0, 0, SY_D + 5 * 64, SHR_E_FORMAT},           /* raw size */
+        {AT_RAW, BOX_CTRI, SY_D - 1, 1, 1, SHR_E_FORMAT},                 /* padding */
+        {AT_RAW, BOX_CTRI, 16 + 2 * 1087, 2, 3, SHR_E_FORMAT},            /* level 1 */
+        {AT_RAW, BOX_CTRI, 16 + 2 * 1087, 2, 2, SHR_OK},                  /* shared level-2 block */
+        {AT_RAW, BOX_CTRI, SHR_PKG_CTRI + 128 + 2 * 63, 2, 4, SHR_E_FORMAT}, /* level 2 */
+        {AT_RAW, BOX_CTRI, SHR_PKG_CTRI + 128 + 2 * 63, 2, 3, SHR_OK},    /* shared data block */
+        {AT_RAW, BOX_CTRI, SHR_PKG_CTRI + 2 * 5, 2, 1, SHR_E_FORMAT},     /* level-2 block 0 all 0 */
+        {AT_RAW, BOX_CTRI, SY_D + 4 * 15, 4, 0, SHR_E_FORMAT},            /* data block 0 all MISS */
+        {AT_RAW, BOX_CTRI, SY_D + 4 * 15, 4, SHR_GID_BLANK, SHR_E_FORMAT},
         {AT_LEN, BOX_POOL, 0, 0, 15, SHR_E_FORMAT},                      /* seqs and pool */
         {AT_FILE, 0, 20, 4, 1, SHR_E_FORMAT},
         {AT_LEN, BOX_POOL, 0, 0, (uint64_t)-1, SHR_E_FORMAT},
@@ -834,19 +896,16 @@ TEST test_package_validation(void) {
         {AT_RAW, BOX_SEQS, 1, 1, 5, SHR_E_FORMAT},
         {AT_RAW, BOX_SEQS, 2, 2, 1, SHR_E_FORMAT},
         {AT_RAW, BOX_SEQS, 4, 4, 3, SHR_E_FORMAT},
-        {AT_RAW, BOX_SEQS, 8, 4, 2 * SY_NG, SHR_E_FORMAT},
         {AT_RAW, BOX_POOL, 8, 4, 'A', SHR_E_FORMAT},                     /* order */
         {AT_LEN, BOX_SEQS, 0, 0, 0, SHR_E_NOT_FOUND},                    /* no sequences: A+U+0301 draws U+FFFD */
         {AT_RAW, BOX_MANI, 32, 4, 0, SHR_E_FORMAT},                      /* ptab */
         {AT_RAW, BOX_MANI, 32, 4, 70000, SHR_E_FORMAT},
         {AT_RAW, BOX_MANI, 32, 4, 3, SHR_E_FORMAT},
-        {AT_LEN, BOX_PTAB, 0, 0, 65, SHR_E_FORMAT},
-        {AT_PTAB, 0, 20, 4, 1, SHR_E_FORMAT},                            /* page records */
-        {AT_PTAB, 1, 24, 4, 0, SHR_E_FORMAT},
-        {AT_PTAB, 1, 24, 4, 4097, SHR_E_FORMAT},
-        {AT_PTAB, 1, 28, 2, 0, SHR_E_FORMAT},
-        {AT_PTAB, 1, 28, 2, SY_H + 1, SHR_E_FORMAT},
-        {AT_PTAB, 0, 30, 2, 1, SHR_E_FORMAT},
+        {AT_LEN, BOX_PTAB, 0, 0, 49, SHR_E_FORMAT},
+        {AT_PTAB, 1, 20, 2, 0, SHR_E_FORMAT},                            /* page records */
+        {AT_PTAB, 1, 20, 2, 4097, SHR_E_FORMAT},
+        {AT_PTAB, 1, 22, 2, 0, SHR_E_FORMAT},
+        {AT_PTAB, 1, 22, 2, SY_H + 1, SHR_E_FORMAT},
         {AT_PTAB, 0, 16, 4, 23, SHR_E_FORMAT},
         {AT_PTAB, 1, 16, 4, (1u << 20) + 1, SHR_E_FORMAT},
         {AT_PTAB, 0, 0, 8, 400, SHR_E_FORMAT},                           /* inside the index */
@@ -854,10 +913,30 @@ TEST test_package_validation(void) {
         {AT_PTAB, 1, 0, 8, 1ull << 40, SHR_E_FORMAT},                    /* past the file */
         {AT_PTAB, 1, 16, 4, 1u << 20, SHR_E_FORMAT},
         {AT_RAW, BOX_MANI, 28, 4, 2 * SY_NG + 1, SHR_E_FORMAT},          /* glyphs not covered */
+        {AT_PTAB, 1, 20, 2, SY_NG - 1, SHR_E_FORMAT},
+        {AT_RAW, BOX_CTRI, SY_D + 64 + 4, 4, 2 << 12, SHR_E_FORMAT},     /* 'A' on a page past the last */
+        {AT_RAW, BOX_CTRI, SY_D + 64 + 4, 4, SY_NG, SHR_E_FORMAT},       /* past the records of its page */
+        {AT_RAW, BOX_CTRI, SY_D + 64 + 4, 4, SY_G2 | (SY_NG - 1), SHR_OK}, /* the last record of page 1 */
+        {AT_RAW, BOX_CTRI, SY_D + 64 + 4, 4, SHR_GID_MISS, SHR_E_NOT_FOUND},
+        {AT_RAW, BOX_SEQS, 8, 4, 2 << 12, SHR_E_FORMAT},                 /* sequence glyphs */
+        {AT_RAW, BOX_SEQS, 8, 4, SY_NG, SHR_E_FORMAT},
+        {AT_RAW, BOX_SEQS, 8, 4, SHR_GID_MISS, SHR_E_NOT_FOUND},         /* A+U+0301 draws U+FFFD */
     };
     static sy_raw base;
     sy_init(&base, ROLE_LATIN, "", 'A', 'B', SY_A4);
     run_cases(cases, sizeof(cases) / sizeof(cases[0]), &base, false);
+    static sy_raw r;
+    const mutation none = {AT_FILE, 0, 0, 1, 0x80, SHR_E_FORMAT};
+    r = base;
+    r.cshift = 16; /* a stored ctri whose data blocks are not aligned */
+    run_cases(&none, 1, &r, false);
+    const uint32_t spaces[3] = {SHR_GID_MISS, SHR_GID_BLANK, 0}; /* U+0020 is MISS or BLANK */
+    for (int i = 0; i < 3; i++) {
+        r = base;
+        sy_map(&r, ' ', spaces[i]);
+        const mutation same = {AT_FILE, 0, 0, 1, 0x80, i < 2 ? SHR_OK : SHR_E_FORMAT};
+        run_cases(&same, 1, &r, false);
+    }
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
     static spkg d;
@@ -919,28 +998,28 @@ TEST test_unknown_boxes(void) {
     PASS();
 }
 
-/* cmap, pool and seqs hold at most 2^22 records each. */
+/* pool and seqs hold at most 2^22 records each. */
 TEST test_record_limits(void) {
     static const struct {
         int box;
         uint32_t size;
-    } boxes[3] = {{BOX_CMAP, 8}, {BOX_POOL, 4}, {BOX_SEQS, 12}};
+    } boxes[2] = {{BOX_POOL, 4}, {BOX_SEQS, 12}};
     size_t big = 12 * ((size_t)SHR_PKG_MAX_RECORDS + 1), cap = (big + SY_CAP + 255) / 256 * 256;
     uint8_t *zeros = calloc(big, 1), *d = aligned_alloc(256, cap);
     ASSERT(zeros && d);
     static sy_raw r;
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         sy_init(&r, ROLE_LATIN, "", 'A', 'B', SY_A4);
         r.payload[boxes[i].box] = zeros;
         r.len[boxes[i].box] = (int32_t)(boxes[i].size * (SHR_PKG_MAX_RECORDS + 1));
         tsrc s = {d, assemble_to(d, cap, &r, SY_STORED), .mode = SRC_MAP};
         ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_E_FORMAT);
         r.len[boxes[i].box] -= (int32_t)boxes[i].size; /* 2^22 of them: then their contents are checked */
-        memcpy(zeros, r.box[BOX_POOL], 16 * (i == 1)); /* a pool that holds the sequences' scalars */
+        memcpy(zeros, r.box[BOX_POOL], 16 * (i == 0)); /* a pool that holds the sequences' scalars */
         s = (tsrc){d, assemble_to(d, cap, &r, SY_STORED), .mode = SRC_MAP};
-        ASSERT_EQ_LL(pkg_status(ctx, &s), i == 1 ? SHR_OK : SHR_E_FORMAT);
+        ASSERT_EQ_LL(pkg_status(ctx, &s), i == 0 ? SHR_OK : SHR_E_FORMAT);
     }
     harness_close(&h);
     free(zeros);
@@ -984,7 +1063,7 @@ TEST test_index_size_limit(void) {
     ASSERT_EQ_LL(s.closes, 1);
 #ifdef SHR_ZSTD
     synth_m(&d, ROLE_LATIN, "", 'A', 'B', SY_A4, SY_ZSTD);
-    put(sy_entry(d.d, "cmap") + 20, 129u << 20, 4); /* so is their raw size */
+    put(sy_entry(d.d, "ctri") + 20, 129u << 20, 4); /* so is their raw size */
     seal(d.d, d.n);
     s = (tsrc){d.d, d.n, .mode = SRC_READ};
     ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_E_LIMIT);
@@ -1023,6 +1102,7 @@ TEST test_page_validation(void) {
         {AT_PAGE, 0, 20, 4, 1u << 20, SHR_E_FORMAT},
     };
     static const mutation records[] = {
+        {AT_RECS, 0, 8, 1, 0x04, SHR_E_FORMAT},         /* format 0: no bitmap */
         {AT_RECS, 0, 8, 1, 0x07, SHR_E_FORMAT},         /* format 3 */
         {AT_RECS, 0, 8, 1, 0x01, SHR_E_FORMAT},         /* 0 cells */
         {AT_RECS, 0, 8, 1, 0x0D, SHR_E_FORMAT},         /* 3 cells */
@@ -1036,10 +1116,7 @@ TEST test_page_validation(void) {
         {AT_RECS, 0, 0, 2, SY_W - 2, SHR_E_FORMAT},     /* past the atlas */
         {AT_RECS, 0, 2, 2, SY_H - 3, SHR_E_FORMAT},
         {AT_RECS, 1, 2, 2, SY_H1 - 3, SHR_E_FORMAT},    /* below the trimmed height */
-        {AT_RECS, 0, 16, 2, 2, SHR_E_FORMAT},           /* empty glyph with a rect */
-        {AT_RECS, 0, 18, 2, 1, SHR_E_FORMAT},
-        {AT_RECS, 0, 20, 1, 1, SHR_E_FORMAT},
-        {AT_RECS, 0, 21, 1, 1, SHR_E_FORMAT},
+        {AT_RECS, 0, 16 * SY_NG - 8, 1, 0x04, SHR_E_FORMAT}, /* the last record */
         {AT_RECS, 0, 8, 1, 0x06, SHR_E_FORMAT},         /* A8 bitmap in an A4 instance */
         {AT_RECS, 0, 4, 1, 3, SHR_E_FORMAT},            /* odd A4 width: the padding nibble is not zero */
         {AT_ATLAS, 0, 3 * SY_W / 2 + 1, 1, 0xF0, SHR_OK}, /* drawn pixels are not checked */
@@ -1091,6 +1168,113 @@ static bool rect_is(const shr__resolved *r, int32_t x0, int32_t y0, int32_t x1, 
     return r->rect.x0 == x0 && r->rect.y0 == y0 && r->rect.x1 == x1 && r->rect.y1 == y1;
 }
 
+/* Three reads from a scalar to its glyph value, at block edges too; blocks may be shared. */
+TEST test_ctri_lookup(void) {
+    static uint32_t map[7][2] = {{0x10, 1},      {0x1F, 2},      {0x3F0, 3}, {0x3FF, SHR_GID_BLANK},
+                                 {0x400, 1 << 12}, {0x10FFF0, 5}, {0x10FFFF, 6}};
+    static uint8_t ct[SY_BOX];
+    size_t n = sy_ctri(ct, map, 7);
+    uint32_t nd = shr__rd32(ct + 4);
+    shr__pkg pkg = {.ctri = ct, .ctri_data = ct + n - 64 * nd};
+    ASSERT_EQ_LL((n - 64 * nd) % 64, 0);
+    static const uint32_t miss[] = {0, 0xF, 0x20, 0x3EF, 0x401, 0x7FF, 0x800, 0x10FFEF, 0x10FFFE, 0xD800};
+    for (size_t i = 0; i < sizeof(miss) / sizeof(miss[0]); i++)
+        ASSERT_EQ_LL(shr__ctri_get(&pkg, miss[i]), SHR_GID_MISS);
+    for (int i = 0; i < 7; i++) ASSERT_EQ_LL(shr__ctri_get(&pkg, map[i][0]), map[i][1]);
+    put(ct + 16 + 2 * 5, shr__rd16(ct + 16), 2); /* U+1400..17FF share the level-2 block of U+0000..03FF */
+    put(ct + SHR_PKG_CTRI + 128 + 2 * 5, shr__rd16(ct + SHR_PKG_CTRI + 128 + 2), 2); /* U+0050.. the data of U+0010.. */
+    ASSERT_EQ_LL(shr__ctri_get(&pkg, 0x1410), 1);
+    ASSERT_EQ_LL(shr__ctri_get(&pkg, 0x17FF), SHR_GID_BLANK);
+    ASSERT_EQ_LL(shr__ctri_get(&pkg, 0x50), 1);
+    ASSERT_EQ_LL(shr__ctri_get(&pkg, 0x5F), 2);
+    ASSERT_EQ_LL(shr__ctri_get(&pkg, 0x1450), 1);
+    PASS();
+}
+
+/* Blank glyphs (no bitmap) and U+0020 draw nothing and never touch pages. */
+TEST test_blank_glyphs(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
+    static sy_raw raw;
+    static spkg d;
+    sy_init(&raw, ROLE_LATIN, "", 'A', 'B', SY_A4);
+    put(raw.box[BOX_SEQS] + 12 + 8, SHR_GID_BLANK, 4); /* B+U+0301 */
+    sy_map(&raw, 0x3000, SHR_GID_BLANK);
+    assemble(&d, &raw, SY_STORED);
+    tsrc s = {d.d, d.n, .mode = SRC_READ, .script = {SHR_IN_PROGRESS}};
+    lib l = {.src = {[ROLE_LATIN] = &s}};
+    shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
+    shr__res *res = shr__bitmap_font_res(f);
+    shr__resolved r;
+    ASSERT_EQ_LL(resolve(f, ' ', &r), SHR_E_NOT_FOUND); /* latin loads: the built-in U+0020, blank too */
+    shr_pump(ctx);
+    ts_complete(ctx, &s, SHR_OK);
+    const uint32_t sb[2] = {'B', 0x301};
+    const uint64_t ids[4] = {glyph1(f, 'B'), glyph1(f, 0x3000), glyph(f, sb, 2), ' '};
+    for (int i = 0; i < 4; i++) ASSERT_EQ_LL(load(ctx, f, ids[i], &r), SHR_E_NOT_FOUND);
+    shr__pkg *pkg = &f->pkg[ROLE_LATIN];
+    ASSERT(pkg->state == PKG_READY && !pkg->pages[0] && !pkg->pages[1]);
+    drain(ctx); /* the other packages asked for U+0020 open */
+    ASSERT(f->wants.len == 0 && !f->pinned && !f->lru && !res->ops->has_work(res));
+    ASSERT_EQ_LL(s.calls, 3); /* header, index, metadata: no page */
+    ASSERT_EQ_LL(SHR_VEC_AT(&f->clusters, shr__cluster, 0)->gid[ROLE_LATIN], SHR_GID_BLANK);
+    harness_close(&h);
+    PASS();
+}
+
+/* A cluster is looked up once per ready package; absent, failed and loading packages leave it to a later lookup. */
+TEST test_cluster_memo(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
+    static spkg d, bad, em;
+    static sy_raw raw;
+    synth(&d);
+    synth_as(&em, ROLE_EMOJI, "", 0x1F600, 0x1F601, SY_A4);
+    sy_init(&raw, ROLE_LATIN, "", 'A', 'B', SY_A4);
+    put(raw.box[BOX_MANI] + 28, 2 * SY_NG + 1, 4);
+    assemble(&bad, &raw, SY_STORED);
+    tsrc s = {d.d, d.n, .mode = SRC_READ, .script = {SHR_IN_PROGRESS}}, sb = {bad.d, bad.n, .mode = SRC_MAP},
+         se = {em.d, em.n, .mode = SRC_MAP};
+    lib l = {.src = {[ROLE_LATIN] = &s, [ROLE_EMOJI] = &se}};
+    shr_pl_res_bitmap_font *f = font_new(ctx, &l, NULL);
+    const uint32_t smile[2] = {0x1F600, 0xFE0F};
+    uint64_t id = glyph2(f), emoji = glyph(f, smile, 2);
+    shr__cluster *c = SHR_VEC_AT(&f->clusters, shr__cluster, 0);
+    for (int i = 0; i < ROLE_COUNT; i++) ASSERT_EQ_LL(c->gid[i], SHR_GID_UNKNOWN);
+    shr__resolved r, a;
+    ASSERT_EQ_LL(resolve(f, id, &r), SHR_OK);
+    shr_pump(ctx);
+    ASSERT_EQ_LL(f->pkg[ROLE_LATIN].state, PKG_LOADING);
+    ASSERT_EQ_LL(resolve(f, id, &r), SHR_OK);
+    ASSERT(r.provisional && c->gid[ROLE_LATIN] == SHR_GID_UNKNOWN && c->gid[ROLE_BUILTIN] == SHR_GID_UNKNOWN);
+    ts_complete(ctx, &s, SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, id, &r), SHR_OK);
+    ASSERT(!r.provisional && rect_is(&r, 0, 4, 4, 8));
+    ASSERT_EQ_LL(c->gid[ROLE_LATIN], SY_G2);
+    ASSERT_EQ_LL(c->gid[ROLE_CJK], SHR_GID_UNKNOWN); /* not asked: latin had it */
+    c->gid[ROLE_LATIN] = 0;                          /* later lookups take the memo: now page 0's glyph */
+    ASSERT_EQ_LL(load(ctx, f, id, &r), SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &a), SHR_OK);
+    ASSERT(rect_is(&r, SY_X0, 1, SY_X0 + 4, 5) && r.buf == a.buf);
+    shr__cluster *e = SHR_VEC_AT(&f->clusters, shr__cluster, 1);
+    ASSERT_EQ_LL(load(ctx, f, emoji, &r), SHR_OK); /* no such emoji sequence: the emoji glyph of its base */
+    ASSERT_EQ_LL(e->gid[ROLE_EMOJI], SHR_GID_MISS);
+    font_free_now(ctx, f);
+
+    l = (lib){.src = {[ROLE_LATIN] = &sb}}; /* latin fails, the others are absent */
+    f = h.font = font_new(ctx, &l, NULL);
+    id = glyph2(f);
+    c = SHR_VEC_AT(&f->clusters, shr__cluster, 0);
+    ASSERT_EQ_LL(load(ctx, f, id, &r), SHR_OK);
+    ASSERT_EQ_LL(last_failure(ctx), SHR_E_FORMAT);
+    ASSERT_EQ_LL(load(ctx, f, id, &r), SHR_OK);
+    ASSERT(!r.provisional && inside(&r, shr__builtin_package, shr__builtin_package_size)); /* U+FFFD */
+    for (int i = ROLE_LATIN; i < ROLE_COUNT; i++) ASSERT_EQ_LL(c->gid[i], SHR_GID_UNKNOWN);
+    ASSERT_EQ_LL(c->gid[ROLE_BUILTIN], SHR_GID_MISS);
+    harness_close(&h);
+    PASS();
+}
+
 TEST test_synthetic_glyphs(void) {
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
@@ -1113,7 +1297,7 @@ TEST test_synthetic_glyphs(void) {
     ASSERT_EQ_LL(a.synth, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC);
     ASSERT_EQ_LL(a.slant_axis, CH); /* twice the line centre's row in the rect */
     ASSERT(!f->pinned && !f->lru && f->page_bytes == 0); /* mapped pages are never pinned or cached */
-    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'B'), &r), SHR_E_NOT_FOUND); /* empty glyph */
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'B'), &r), SHR_E_NOT_FOUND); /* blank */
     uint32_t sa[2] = {'A', 0x301}, sb[2] = {'B', 0x301}, sc[2] = {'C', 0x301}, sel[2] = {'A', 0xFE0E};
     ASSERT_EQ_LL(load(ctx, f, glyph(f, sa, 2), &r), SHR_OK);
     ASSERT_EQ_LL(load(ctx, f, glyph(f, sb, 2), &other), SHR_OK);
@@ -1163,7 +1347,7 @@ TEST test_zstd_round_trip(void) {
     for (uint8_t fmt = SY_A4; fmt <= SY_A8; fmt++) {
         synth_as(&stored, ROLE_LATIN, "", 'A', 'B', fmt);
         synth_m(&packed, ROLE_LATIN, "", 'A', 'B', fmt, SY_ZSTD);
-        ASSERT(packed.n < stored.n / 2 && shr__rd16(sy_box(packed.d, "cmap") + 10) == 0x11);
+        ASSERT(packed.n < stored.n / 2 && shr__rd16(sy_box(packed.d, "ctri") + 10) == 0x11);
         tsrc ss = {stored.d, stored.n, .mode = SRC_MAP};
         lib ls = {.src = {[ROLE_LATIN] = &ss}};
         shr_pl_res_bitmap_font *g = font_new(ctx, &ls, NULL);
@@ -1226,7 +1410,7 @@ TEST test_zstd_frames(void) {
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
     static sy_raw r;
     static spkg d;
-    static const int streams[3] = {0, 2, 3}; /* cmap, page 0's records, page 1's atlas: 256 bytes each */
+    static const int streams[3] = {0, 2, 3}; /* ctri, then page 0's records and page 1's atlas of 256 bytes each */
     for (int k = 0; k < 3; k++)
         for (size_t i = 0; i < sizeof(frames) / sizeof(frames[0]); i++)
             for (int mode = SRC_READ; mode <= SRC_MAP; mode++) {
@@ -1234,17 +1418,17 @@ TEST test_zstd_frames(void) {
                 sy_init(&r, ROLE_LATIN, "", 'A', 'B', SY_A4);
                 r.stream[stream] = frames[i].n ? frames[i].b : raw_block;
                 r.stream_n[stream] = frames[i].n ? frames[i].n : sizeof(raw_block);
-                bool ok = frames[i].want == SHR_OK && stream == 3; /* else cmap, records of 0x5A are invalid */
+                bool ok = frames[i].want == SHR_OK && stream == 3; /* else not ctri's size, records of 0x5A invalid */
                 assemble(&d, &r, SY_ZSTD);
                 tsrc s = {d.d, d.n, .mode = mode};
                 shr_status st = pkg_status(ctx, &s);
                 if (st != (ok ? SHR_OK : SHR_E_FORMAT))
                     fprintf(stderr, "stream %d frame %zu mode %d\n", stream, i, mode);
                 ASSERT_EQ_LL(st, ok ? SHR_OK : SHR_E_FORMAT);
-                ASSERT_EQ_LL(s.calls, mode == SRC_READ ? (stream ? 5 : frames[i].n ? 3 : 2) : 0); /* raw_block: index */
+                ASSERT_EQ_LL(s.calls, mode == SRC_READ ? (stream ? 5 : 3) : 0);
             }
     synth_m(&d, ROLE_LATIN, "", 'A', 'B', SY_A4, SY_ZSTD);
-    put(sy_entry(d.d, "cmap") + 20, shr__rd32(sy_entry(d.d, "cmap") + 16) - 16, 4); /* raw_size not above the box's */
+    put(sy_entry(d.d, "ctri") + 20, shr__rd32(sy_entry(d.d, "ctri") + 16) - 16, 4); /* raw_size not above the box's */
     seal(d.d, d.n);
     tsrc s = {d.d, d.n, .mode = SRC_READ};
     ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_E_FORMAT);
@@ -2805,6 +2989,9 @@ int main(int argc, char **argv) {
     RUN_TEST(test_index_size_limit);
     RUN_TEST(test_index_changed_between_reads);
     RUN_TEST(test_page_validation);
+    RUN_TEST(test_ctri_lookup);
+    RUN_TEST(test_blank_glyphs);
+    RUN_TEST(test_cluster_memo);
     RUN_TEST(test_synthetic_glyphs);
     RUN_TEST(test_zstd_round_trip);
     RUN_TEST(test_zstd_frames);

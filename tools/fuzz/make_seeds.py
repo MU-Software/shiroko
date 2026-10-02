@@ -203,8 +203,8 @@ SEEDS = {
     "fuzz_package": [
         b"\x00\x00",
         b"\x00\x00SHRFPKG1" + bytes(120),
-        b"\x08\x01" + header(5, 200) + bytes(48),
-        b"\x00\x00" + header(4, 200) + bytes(48),
+        b"\x08\x01" + header(6, 200) + bytes(48),
+        b"\x00\x00" + header(5, 200) + bytes(48),
     ],
     "fuzz_compositor": [
         bytes([1]) + layer(0, 0, (0, 0, 64, 48)) + lfill(0, (4, 4, 40, 30)) + SUBMIT + PUMP + check(),

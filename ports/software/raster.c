@@ -15,14 +15,11 @@ typedef struct rgb {
 } rgb;
 
 static inline rgb color_rgb(shr_color c) { return (rgb){(c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF}; }
-static inline rgb blend(rgb fg, rgb bg, uint32_t a) {
-    return (rgb){blend8(fg.r, bg.r, a), blend8(fg.g, bg.g, a), blend8(fg.b, bg.b, a)};
-}
 
 /* RGB565 blends round once from the 5/6-bit destination, as a GPU blending unorm values does:
  * round((m * fg * a + 255 * d * (255 - a)) / 255^2), with w = 255 * (255 - a). */
 static inline uint32_t blend565(uint32_t fg, uint32_t d, uint32_t a, uint32_t w, uint32_t m) {
-    return (uint32_t)((uint64_t)(m * fg * a + d * w + 65025 / 2) / 65025);
+    return (m * fg * a + d * w + 65025 / 2) / 65025;
 }
 
 static inline uint8_t *pixel_at(const shr_surface *s, int32_t x, int32_t y) {
@@ -51,29 +48,24 @@ static inline void write_px(shr_pixel_format f, uint8_t *p, rgb c) {
     }
 }
 
+/* Zero coverage leaves the pixel as it was. The builtins: a fortified memcpy keeps loops scalar. */
 static inline void blend_px(shr_pixel_format f, uint8_t *p, rgb fg, uint32_t a) {
     if (f != SHR_FORMAT_RGB565) {
-        write_px(f, p, blend(fg, read_px(f, p), a));
+        p[0] = (uint8_t)blend8(fg.r, p[0], a), p[1] = (uint8_t)blend8(fg.g, p[1], a), p[2] = (uint8_t)blend8(fg.b, p[2], a);
+        p[3] |= (uint8_t)((a != 0) * 255u);
         return;
     }
-    uint16_t v;
-    memcpy(&v, p, 2);
+    uint16_t v, o;
+    __builtin_memcpy(&v, p, 2);
     uint32_t w = 255 * (255 - a);
-    v = (uint16_t)(blend565(fg.r, v >> 11, a, w, 31) << 11 | blend565(fg.g, (v >> 5) & 63, a, w, 63) << 5 |
+    o = (uint16_t)(blend565(fg.r, v >> 11, a, w, 31) << 11 | blend565(fg.g, (v >> 5) & 63, a, w, 63) << 5 |
                    blend565(fg.b, v & 31, a, w, 31));
-    memcpy(p, &v, 2);
+    __builtin_memcpy(p, &o, 2);
 }
 
 /* Row y of `r`, the region of buffer `b` a GLYPH or IMAGE draws from. */
 static inline const uint8_t *region_row(const shr_image *b, shr_rect r, int32_t y) {
     return (const uint8_t *)b->pixels + (size_t)(r.y0 + y) * b->stride;
-}
-
-/* Coverage of buffer column x (absolute, so A4 nibbles follow the buffer) in `row`. */
-static inline uint32_t coverage_at(const uint8_t *row, int32_t x, shr_pixel_format g) {
-    if (g == SHR_FORMAT_A8) return row[x];
-    uint8_t b = row[x / 2];
-    return 17u * (x % 2 == 0 ? b >> 4 : b & 0x0Fu);
 }
 
 static bool screen_format(shr_pixel_format f) { return f == SHR_FORMAT_RGB565 || f == SHR_FORMAT_RGBX8888; }
@@ -242,12 +234,10 @@ static inline void fill_rows(const shr_surface *dst, shr_rect r, rgb fg, bool di
     write_px(f, px, fg);
     for (int32_t y = r.y0; y < r.y1; y++) {
         uint8_t *p = pixel_at(dst, r.x0, y);
-        for (int32_t x = r.x0; x < r.x1; x++, p += bpp) {
-            if (dim)
-                blend_px(f, p, fg, 128);
-            else
-                memcpy(p, px, bpp);
-        }
+        if (dim)
+            for (int32_t x = r.x0; x < r.x1; x++, p += bpp) blend_px(f, p, fg, 128);
+        else
+            for (int32_t x = 0; x < r.x1 - r.x0; x++) __builtin_memcpy(p + (size_t)x * bpp, px, bpp);
     }
 }
 
@@ -258,29 +248,59 @@ static void do_fill(const shr_surface *dst, shr_rect r, shr_color color, bool di
         fill_rows(dst, r, color_rgb(color), dim, SHR_FORMAT_RGBX8888);
 }
 
-/* Inlined by force: clang otherwise keeps one copy and the formats stop being constants. */
+static inline uint32_t coverage_at(const uint8_t *row, int32_t x, shr_pixel_format g) {
+    return g == SHR_FORMAT_A8 ? row[x] : 17u * ((row[x >> 1] >> (~x & 1) * 4) & 15u);
+}
+
+#define SPAN 64
+
+/* Coverage of buffer columns [x, x + n) of `row` into cov; returns their OR. */
+static inline __attribute__((always_inline)) uint32_t load_coverage(uint8_t *restrict cov, const uint8_t *restrict row,
+                                                                    int32_t x, int32_t n, shr_pixel_format g) {
+    uint32_t any = 0;
+    int32_t k = 0;
+    if (g == SHR_FORMAT_A4 && !(x & 1))
+        for (const uint8_t *q = row + x / 2; k + 2 <= n; k += 2) {
+            uint8_t v = q[k / 2];
+            cov[k] = (uint8_t)(17 * (v >> 4)), cov[k + 1] = (uint8_t)(17 * (v & 15)), any |= v;
+        }
+    for (; k < n; k++) cov[k] = (uint8_t)coverage_at(row, x + k, g), any |= cov[k];
+    return any;
+}
+
+/* Blends cov[0, n) onto the n pixels at p in blocks of 8 from the right, which vectorize. The leftmost block may start
+ * up to 7 pixels left of p when the row has `room` pixels there: cov[-8, 0) is zero, so they stay as they were. */
+static inline __attribute__((always_inline)) void blend_span(uint8_t *restrict p, const uint8_t *restrict cov,
+                                                             int32_t n, int32_t room, rgb fg, uint32_t dim,
+                                                             shr_pixel_format f) {
+    size_t bpp = shr__px_bytes(f);
+    int32_t k = n;
+    for (; k >= 8; k -= 8)
+        for (int32_t i = 0; i < 8; i++) blend_px(f, p + (size_t)(k - 8 + i) * bpp, fg, (cov[k - 8 + i] + dim) >> dim);
+    if (k > 0 && room >= 8 - k)
+        for (int32_t i = 0; i < 8; i++) blend_px(f, p + (k - 8 + i) * (ptrdiff_t)bpp, fg, (cov[k - 8 + i] + dim) >> dim);
+    else
+        for (int32_t i = 0; i < k; i++) blend_px(f, p + (size_t)i * bpp, fg, (cov[i] + dim) >> dim);
+}
+
+/* Inlined by force: clang otherwise keeps one copy and the formats stop being constants. Rows go in spans of SPAN
+ * from the right, so only the leftmost span has a partial block. */
 static inline __attribute__((always_inline)) void glyph_rows(const shr_surface *dst, const shr_draw_cmd *c,
                                                              const shr_image *b, shr_rect r, shr_point s,
                                                              shr_pixel_format f, shr_pixel_format g) {
     rgb fg = color_rgb(c->color);
     size_t bpp = shr__px_bytes(f);
     uint32_t dim = (c->flags & SHR_GLYPH_DIM) != 0;
+    uint8_t buf[8 + SPAN] = {0}, *cov = buf + 8;
     for (int32_t y = r.y0; y < r.y1; y++) {
         const uint8_t *row = region_row(b, c->src_rect, s.y + (y - r.y0));
-        int32_t sx = c->src_rect.x0 + s.x;
         uint8_t *p = pixel_at(dst, r.x0, y);
-        for (int32_t x = r.x0; x < r.x1; x++, p += bpp, sx++) {
-            uint32_t a = (coverage_at(row, sx, g) + dim) >> dim;
-            if (a == 0) continue;
-            blend_px(f, p, fg, a);
+        for (int32_t hi = r.x1 - r.x0; hi > 0; hi -= SPAN) {
+            int32_t lo = hi > SPAN ? hi - SPAN : 0;
+            if (load_coverage(cov, row, c->src_rect.x0 + s.x + lo, hi - lo, g))
+                blend_span(p + (size_t)lo * bpp, cov, hi - lo, r.x0 + lo, fg, dim, f);
         }
     }
-}
-
-/* Coverage of rect column x in `row`, the rect starting at buffer column x0: 0 outside the rect, also where the
- * buffer has pixels. */
-static inline uint32_t synth_in(const uint8_t *row, int32_t x, int32_t w, int32_t x0, shr_pixel_format g) {
-    return (uint32_t)x >= (uint32_t)w ? 0 : coverage_at(row, x0 + x, g);
 }
 
 /* BOLD of the middle sample m between neighbours l and r. */
@@ -289,7 +309,8 @@ static inline uint32_t embolden(uint32_t l, uint32_t m, uint32_t r, bool bold) {
 }
 
 /* The shiroko_driver.h coverage formula over a window in(q - 2 .. q + 1), q = sx - k, moved one column per pixel;
- * every term derives from absolute src coordinates, so clipping never changes a pixel. */
+ * every term derives from absolute src coordinates, so clipping never changes a pixel. in(i) is rect column i,
+ * zero outside the rect: win[j] holds in(c0 + j), loaded only where the rect has pixels. */
 static inline __attribute__((always_inline)) void glyph_synth_rows(const shr_surface *dst, const shr_draw_cmd *c,
                                                                    const shr_image *b, shr_rect r, shr_point s,
                                                                    shr_pixel_format f, shr_pixel_format g) {
@@ -297,21 +318,26 @@ static inline __attribute__((always_inline)) void glyph_synth_rows(const shr_sur
     size_t bpp = shr__px_bytes(f);
     uint32_t dim = (c->flags & SHR_GLYPH_DIM) != 0;
     bool bold = c->flags & SHR_GLYPH_BOLD, italic = c->flags & SHR_GLYPH_ITALIC;
-    int32_t w = c->src_rect.x1 - c->src_rect.x0, x0 = c->src_rect.x0;
+    int32_t w = c->src_rect.x1 - c->src_rect.x0;
+    uint8_t win[SPAN + 3], buf[8 + SPAN] = {0}, *cov = buf + 8;
     for (int32_t y = r.y0; y < r.y1; y++) {
         int32_t sy = s.y + (y - r.y0), k = 0, fr = 0;
         if (italic) shr__slant(c->slant_axis, sy, &k, &fr);
         const uint8_t *row = region_row(b, c->src_rect, sy);
-        int32_t q = s.x - k;
-        uint32_t i0 = synth_in(row, q - 2, w, x0, g), i1 = synth_in(row, q - 1, w, x0, g);
-        uint32_t i2 = synth_in(row, q, w, x0, g);
-        uint32_t b1 = embolden(i0, i1, i2, bold);
         uint8_t *p = pixel_at(dst, r.x0, y);
-        for (int32_t x = r.x0; x < r.x1; x++, p += bpp, q++) {
-            uint32_t i3 = synth_in(row, q + 1, w, x0, g), b2 = embolden(i1, i2, i3, bold);
-            uint32_t a = (((b2 * (uint32_t)(256 - fr) + b1 * (uint32_t)fr + 128) >> 8) + dim) >> dim;
-            i1 = i2, i2 = i3, b1 = b2;
-            if (a) blend_px(f, p, fg, a);
+        for (int32_t hi = r.x1 - r.x0; hi > 0; hi -= SPAN) {
+            int32_t x = hi > SPAN ? hi - SPAN : 0, n = hi - x, c0 = s.x - k + x - 2;
+            int32_t lo = c0 < 0 ? -c0 : 0, top = w - c0 < n + 3 ? w - c0 : n + 3;
+            if (lo >= top) continue;
+            memset(win, 0, sizeof(win));
+            if (!load_coverage(win + lo, row, c->src_rect.x0 + c0 + lo, top - lo, g)) continue;
+            for (int32_t j = 0; j < n; j += 8) /* whole blocks vectorize; cov past n is unused */
+                for (int32_t i = j; i < j + 8; i++) {
+                    uint32_t b1 = embolden(win[i], win[i + 1], win[i + 2], bold);
+                    uint32_t b2 = embolden(win[i + 1], win[i + 2], win[i + 3], bold);
+                    cov[i] = (uint8_t)((b2 * (uint32_t)(256 - fr) + b1 * (uint32_t)fr + 128) >> 8);
+                }
+            blend_span(p + (size_t)x * bpp, cov, n, r.x0 + x, fg, dim, f);
         }
     }
 }

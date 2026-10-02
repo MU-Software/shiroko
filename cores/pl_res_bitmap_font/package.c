@@ -5,7 +5,7 @@ void shr__pkg_release(shr__pkg *pkg) {
     shr_pl_res_bitmap_font *f = pkg->font;
     shr__pages_free(pkg);
     shr__free(&f->al, pkg->buf, pkg->buf_len, 8, SHR_ALLOC_PAYLOAD);
-    shr__free(&f->al, pkg->meta, pkg->meta_len, 8, SHR_ALLOC_PAYLOAD);
+    shr__free(&f->al, pkg->meta, pkg->meta_len, 64, SHR_ALLOC_PAYLOAD);
     if (pkg->src.close) SHR_HOST(f->res.ctx, pkg->src.close(pkg->src.user));
     *pkg = (shr__pkg){.font = f, .role = pkg->role, .state = pkg->state, .retry = pkg->retry};
 }
@@ -24,8 +24,8 @@ static void pkg_retry(shr__pkg *pkg, shr_status st, const char *why) {
     shr__retry_cool(pkg->font, &pkg->retry, st, why);
 }
 
-static const char box_types[] = "manistrssrcsinstcmapseqspoolptabcovr"; /* by BOX_ */
-#define PACKED_BOXES (1u << BOX_CMAP | 1u << BOX_SEQS | 1u << BOX_POOL) /* may be zstd */
+static const char box_types[] = "manistrssrcsinstctriseqspoolptabcovr"; /* by BOX_ */
+#define PACKED_BOXES (1u << BOX_CTRI | 1u << BOX_SEQS | 1u << BOX_POOL) /* may be zstd */
 
 /* A stored payload of `n` bytes is raw_size, a zstd one smaller. */
 static bool raw_bad(uint32_t method, uint64_t n, uint32_t raw) { return raw < n || (raw > n) != method; }
@@ -90,16 +90,22 @@ static const char *parse_index(shr__pkg *pkg, const uint8_t *s, shr_status *st) 
         raw += b->raw;
         pkg->meta_len += shr__box_room(pkg, b);
     }
-    if (!pkg->box[BOX_MANI].size || !pkg->box[BOX_INST].size || !pkg->box[BOX_CMAP].size || !pkg->box[BOX_PTAB].size)
+    if (!pkg->box[BOX_MANI].size || !pkg->box[BOX_INST].size || !pkg->box[BOX_CTRI].size || !pkg->box[BOX_PTAB].size)
         return "missing box";
     if ((pkg->hi - pkg->lo > SHR_PKG_MAX_META) | (raw > SHR_PKG_MAX_META))
         return *st = SHR_E_LIMIT, "package index too large";
     pkg->end = end;
-    pkg->npages = pkg->box[BOX_PTAB].raw / SHR_PKG_ENTRY;
+    pkg->npages = pkg->box[BOX_PTAB].raw / SHR_PKG_PTAB;
     return NULL;
 }
 
 static bool shape_side(uint32_t v) { return v >= 64 && v <= 512 && !(v & (v - 1)); }
+
+/* Neither MISS, BLANK nor a record of a page. */
+static bool glyph_bad(const uint8_t *ptab, uint32_t npages, uint32_t g) {
+    return g < SHR_GID_BLANK &&
+           (g >> 12 >= npages || (g & 4095) >= shr__rd16(ptab + SHR_PKG_PTAB * (uint64_t)(g >> 12) + 20));
+}
 
 /* The metadata boxes in `region` (from the first box), decoded, then their contents. */
 static const char *parse_meta(shr__pkg *pkg, const uint8_t *region, shr_status *st) {
@@ -117,7 +123,7 @@ static const char *parse_meta(shr__pkg *pkg, const uint8_t *region, shr_status *
     }
     for (int k = 0; k < BOX_COUNT; k++) len[k] = pkg->box[k].raw;
     *st = SHR_E_FORMAT;
-    const uint8_t *man = d[BOX_MANI], *in = d[BOX_INST], *cmap = d[BOX_CMAP], *seqs = d[BOX_SEQS], *pool = d[BOX_POOL],
+    const uint8_t *man = d[BOX_MANI], *in = d[BOX_INST], *ct = d[BOX_CTRI], *seqs = d[BOX_SEQS], *pool = d[BOX_POOL],
                   *ptab = d[BOX_PTAB];
     uint32_t features = shr__rd32(pkg->hdr + 20), strs = len[BOX_STRS], nsrc = len[BOX_SRCS] / 48;
     if (len[BOX_MANI] != 36 || man[1] | man[2] | man[3]) return "mani";
@@ -152,14 +158,25 @@ static const char *parse_meta(shr__pkg *pkg, const uint8_t *region, shr_status *
     if (shr__rd16(in + 18) & ~1u || shr__rd64(in + 40)) return "instance reserved bytes";
     if (!shape_side(aw) || !shape_side(ah)) return "instance page shape";
     if (lh != SHR_CELL_HEIGHT || cw != SHR_CELL_WIDTH) return *st = SHR_E_UNSUPPORTED, "no instance for the cell size";
-    uint32_t ncmap = len[BOX_CMAP] / 8, npool = len[BOX_POOL] / 4, nseqs = len[BOX_SEQS] / 12;
-    if (len[BOX_CMAP] % 8 || ncmap > SHR_PKG_MAX_RECORDS) return "cmap size";
-    for (uint32_t i = 0; i < ncmap; i++) {
-        uint32_t cp = shr__rd32(cmap + 8ull * i);
-        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) || shr__rd32(cmap + 8ull * i + 4) >= nglyphs)
-            return "cmap record";
-        if (i && cp <= shr__rd32(cmap + 8ull * (i - 1))) return "cmap order";
+    if (len[BOX_CTRI] < SHR_PKG_CTRI) return "ctri size";
+    uint32_t l2 = shr__rd32(ct), dc = shr__rd32(ct + 4);
+    uint64_t at = SHR_PKG_CTRI + 128ull * l2, data = (at + 63) & ~63ull;
+    if (!l2 || l2 > 65536 || !dc || dc > 65536 || shr__rd64(ct + 8) || len[BOX_CTRI] != data + 64ull * dc)
+        return "ctri size";
+    for (uint64_t i = at; i < data; i++)
+        if (ct[i]) return "ctri padding";
+    for (uint32_t i = 0; i < 1088; i++)
+        if (shr__rd16(ct + 16 + 2 * i) >= l2) return "ctri level 1";
+    for (uint32_t i = 0; i < 64 * l2; i++) {
+        uint32_t v = shr__rd16(ct + SHR_PKG_CTRI + 2ull * i);
+        if (v >= dc || (i < 64 && v)) return "ctri level 2";
     }
+    for (uint32_t i = 0; i < 16; i++)
+        if (shr__rd32(ct + data + 4 * i) != SHR_GID_MISS) return "ctri data block 0";
+    const shr__box *cb = &pkg->box[BOX_CTRI];
+    if (((cb->off + 16) % 64 != 0) > (cb->flags >> 4)) return "ctri alignment"; /* when stored */
+    pkg->ctri = ct, pkg->ctri_data = ct + data;
+    uint32_t npool = len[BOX_POOL] / 4, nseqs = len[BOX_SEQS] / 12;
     if (len[BOX_POOL] % 4 || npool > SHR_PKG_MAX_RECORDS) return "pool size";
     if (pkg->box[BOX_SEQS].size) {
         if (!(features & 4) || !pkg->box[BOX_POOL].size || len[BOX_SEQS] % 12 || nseqs > SHR_PKG_MAX_RECORDS)
@@ -172,34 +189,36 @@ static const char *parse_meta(shr__pkg *pkg, const uint8_t *region, shr_status *
             const uint8_t *r = seqs + 12ull * i;
             uint64_t idx = shr__rd32(r + 4);
             if (r[0] < 2 || r[0] > shr__cluster_max_scalars || r[1] < 1 || r[1] > 4 || shr__rd16(r + 2) ||
-                idx + r[0] > npool || shr__rd32(r + 8) >= nglyphs)
+                idx + r[0] > npool)
                 return "sequence record";
             const uint8_t *q = r - 12;
             if (i && shr__seq_cmp_pool(pool + 4 * (uint64_t)shr__rd32(q + 4), q[0], pool + 4 * idx, NULL, r[0]) >= 0)
                 return "sequence order";
         }
     }
-    if (!npages || npages > SHR_PKG_MAX_PAGES || npages != pkg->npages || len[BOX_PTAB] % SHR_PKG_ENTRY)
+    if (!npages || npages > SHR_PKG_MAX_PAGES || npages != pkg->npages || len[BOX_PTAB] % SHR_PKG_PTAB)
         return "ptab size";
     uint64_t glyph = 0, prev = pkg->end, fsize = shr__rd64(pkg->hdr + 32);
     for (uint32_t i = 0; i < npages; i++) {
-        const uint8_t *r = ptab + (uint64_t)SHR_PKG_ENTRY * i;
+        const uint8_t *r = ptab + (uint64_t)SHR_PKG_PTAB * i;
         uint64_t off = shr__rd64(r);
-        uint32_t size = shr__rd32(r + 16), count = shr__rd32(r + 24), height = shr__rd16(r + 28);
-        if (shr__rd32(r + 20) != glyph || !count || count > SHR_PKG_MAX_PAGE_GLYPHS || !height || height > ah ||
-            shr__rd16(r + 30) || size < 24 || size > SHR_PKG_MAX_PAGE_BYTES || off < prev || off > fsize ||
-            fsize - off < size)
+        uint32_t size = shr__rd32(r + 16), count = shr__rd16(r + 20), height = shr__rd16(r + 22);
+        if (!count || count > SHR_PKG_MAX_PAGE_GLYPHS || !height || height > ah || size < 24 ||
+            size > SHR_PKG_MAX_PAGE_BYTES || off < prev || off > fsize || fsize - off < size)
             return "page record";
         glyph += count;
         prev = off + size;
     }
     if (glyph != nglyphs) return "pages do not cover every glyph";
+    for (uint64_t i = 0; i < 16ull * dc; i++)
+        if (glyph_bad(ptab, npages, shr__rd32(pkg->ctri_data + 4 * i))) return "ctri glyph";
+    for (uint32_t i = 0; i < nseqs; i++)
+        if (glyph_bad(ptab, npages, shr__rd32(seqs + 12ull * i + 8))) return "sequence glyph";
+    if (shr__ctri_get(pkg, ' ') < SHR_GID_BLANK) return "U+0020 has a bitmap";
     pkg->format = format;
     pkg->baseline = baseline;
     pkg->atlas_w = aw, pkg->atlas_h = ah, pkg->stride = format == 1 ? aw / 2u : aw;
     pkg->slot_shape = (uint64_t)format << 56 | (uint64_t)aw << 40 | (uint64_t)ah << 24;
-    pkg->nglyphs = nglyphs;
-    pkg->cmap = cmap, pkg->ncmap = ncmap;
     pkg->seqs = seqs, pkg->nseqs = nseqs;
     pkg->pool = pool;
     pkg->ptab = ptab;
@@ -210,7 +229,7 @@ shr_status shr__page_streams(const shr__page *p, const uint8_t *b, shr__streams 
     const shr__pkg *pkg = p->pkg;
     const uint8_t *e = shr__page_rec(p);
     uint32_t size = shr__rd32(e + 16), flags = shr__rd16(b + 10), method = flags >> 4 & 15, raw = shr__rd32(b + 12),
-             an = shr__rd32(b + 20), atlas = shr__rd16(e + 28) * pkg->stride;
+             an = shr__rd32(b + 20), atlas = shr__page_height(p) * pkg->stride;
     if (memcmp(b + 4, "page", 4) || shr__rd16(b + 8) || shr__rd32(b) != size) return SHR_E_FORMAT;
     if (method >= 2) return SHR_E_UNSUPPORTED;
     /* `x > method`: x when stored */
@@ -225,16 +244,11 @@ shr_status shr__page_streams(const shr__page *p, const uint8_t *b, shr__streams 
 
 bool shr__page_valid(const shr__page *p, const uint8_t *atlas, const uint8_t *recs) {
     const shr__pkg *pkg = p->pkg;
-    const uint8_t *rec = shr__page_rec(p);
-    uint32_t count = shr__rd32(rec + 24), height = shr__rd16(rec + 28);
+    uint32_t count = shr__rd16(shr__page_rec(p) + 20), height = shr__page_height(p);
     for (uint32_t g = 0; g < count; g++) {
         const uint8_t *e = recs + 16ull * g;
         uint32_t x = shr__rd16(e), y = shr__rd16(e + 2), w = e[4], h = e[5], fmt = e[8] & 3u, cells = (e[8] >> 2) & 3u;
         if ((e[8] & 0xF0) | e[9] | shr__rd32(e + 12) || !cells || cells > 2) return false;
-        if (!fmt) {
-            if (x | y | w | h) return false;
-            continue;
-        }
         bool a4 = fmt == 1;
         if (fmt != pkg->format || !w || !h || (a4 && x % 2) || x + w > pkg->atlas_w || y + h > height)
             return false; /* an even A4 x in an atlas of even width leaves room for the padding nibble */
@@ -250,7 +264,7 @@ static shr_status pkg_alloc(shr__pkg *pkg) {
     size_t region = pkg->mapped ? 0 : (size_t)(pkg->hi - pkg->lo);
     if (!pkg->buf && region && !(pkg->buf = shr__malloc(&f->al, region, 8, SHR_ALLOC_PAYLOAD))) return SHR_E_NO_MEMORY;
     pkg->buf_len = region;
-    if (!pkg->meta && pkg->meta_len && !(pkg->meta = shr__malloc(&f->al, pkg->meta_len, 8, SHR_ALLOC_PAYLOAD)))
+    if (!pkg->meta && pkg->meta_len && !(pkg->meta = shr__malloc(&f->al, pkg->meta_len, 64, SHR_ALLOC_PAYLOAD)))
         return SHR_E_NO_MEMORY;
     if (!pkg->pages && !(pkg->pages = shr__calloc(&f->al, pkg->npages, sizeof(shr__page *), SHR_ALIGNOF(shr__page *),
                                                   SHR_ALLOC_PAYLOAD)))

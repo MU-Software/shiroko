@@ -3,12 +3,13 @@
 
 Inputs are pinned by fonts/text_profile.lock.json and cached in $SHIROKO_UCD_CACHE (.cache/ucd/).
 
-  gen_unicode_tables.py --out FILE   write the C tables (property ranges, emoji sequences, profile id) from the
+  gen_unicode_tables.py --out FILE   write the C tables (property table, emoji sequences, profile id) from the
                                      cached inputs; never downloads (the build writes <build dir>/generated/)
   gen_unicode_tables.py --fetch      download and verify the inputs only
 """
 
 import argparse
+import bisect
 import hashlib
 import io
 import json
@@ -230,7 +231,38 @@ def tables(lock):
     return props, decomp, starts, values, seqs, vs_bases, limits
 
 
-def emit(lock, starts, values, seqs, vs_bases, limits):
+def prop_table(props, starts, values):
+    """cp >> 10 picks a level-2 block in L1, cp >> 4 & 63 a data block in it, cp & 15 an index into the distinct
+    values. Identical blocks are shared; level-2 block 0 and data block 0 are all 0, value 0 is Other."""
+    distinct = sorted(set(values))
+    if distinct[0] != 0 or len(distinct) > 256:
+        sys.exit(f"{len(distinct)} distinct property values; the data blocks hold u8 indices with value 0 first")
+    index = {v: i for i, v in enumerate(distinct)}
+    data, data_ids, l2, l2_ids, l1 = [], {}, [], {}, []
+
+    def share(block, blocks, ids):
+        if block not in ids:
+            ids[block] = len(blocks)
+            blocks.append(block)
+        return ids[block]
+
+    share(bytes(16), data, data_ids)
+    share((0,) * 64, l2, l2_ids)
+    for hi in range(0, MAX_CP + 1, 1024):
+        block = tuple(share(bytes(index[props[cp]] for cp in range(mid, mid + 16)), data, data_ids)
+                      for mid in range(hi, hi + 1024, 16))
+        l1.append(share(block, l2, l2_ids))
+    if len(l2) > 65536 or len(data) > 65536:
+        sys.exit("property table blocks exceed u16 numbers")
+    for cp in range(MAX_CP + 1):
+        got = distinct[data[l2[l1[cp >> 10]][cp >> 4 & 63]][cp & 15]]
+        want = values[bisect.bisect_right(starts, cp) - 1]
+        if got != want:
+            sys.exit(f"property table mismatch at U+{cp:04X}: {got:#x} != {want:#x}")
+    return l1, l2, data, distinct
+
+
+def emit(lock, starts, values, seqs, vs_bases, limits, table):
     pid = text_profile_id(lock, starts, values, seqs, vs_bases)
     out = []
     w = out.append
@@ -247,14 +279,23 @@ def emit(lock, starts, values, seqs, vs_bases, limits):
     w(f"const uint32_t shr__cluster_max_bytes = {lock['cluster_max_bytes']};")
     w(f"const uint32_t shr__tab_stop = {lock['tab_stop']};")
     w("")
-    w(f"const uint32_t shr__prop_range_count = {len(starts)};")
-    w("const uint32_t shr__prop_range_start[] = {")
-    for i in range(0, len(starts), 8):
-        w("  " + ", ".join(f"0x{x:06X}" for x in starts[i:i + 8]) + ",")
+    l1, l2, data, distinct = table
+    w(f"const uint16_t shr__uprop_l1[{len(l1)}] = {{")
+    for i in range(0, len(l1), 16):
+        w("  " + ", ".join(str(x) for x in l1[i:i + 16]) + ",")
     w("};")
-    w("const uint32_t shr__prop_range_value[] = {")
-    for i in range(0, len(values), 10):
-        w("  " + ", ".join(f"0x{x:05X}" for x in values[i:i + 10]) + ",")
+    w(f"const uint16_t shr__uprop_l2[] = {{ /* {len(l2)} x 64 */")
+    for block in l2:
+        for i in range(0, 64, 16):
+            w("  " + ", ".join(str(x) for x in block[i:i + 16]) + ",")
+    w("};")
+    w(f"const uint8_t shr__uprop_data[] = {{ /* {len(data)} x 16 */")
+    for block in data:
+        w("  " + ", ".join(str(x) for x in block) + ",")
+    w("};")
+    w("const uint32_t shr__uprop_values[] = {")
+    for i in range(0, len(distinct), 10):
+        w("  " + ", ".join(f"0x{x:05X}" for x in distinct[i:i + 10]) + ",")
     w("};")
     w("")
     pool, offs = [], []
@@ -302,9 +343,13 @@ def main():
         fetch(lock)
         return
     verify_inputs(lock)
-    _, _, starts, values, seqs, vs_bases, limits = tables(lock)
-    write_atomic(args.out, emit(lock, starts, values, seqs, vs_bases, limits))
-    print(f"ranges={len(starts)} sequences={len(seqs)} vs_bases={len(vs_bases)}")
+    props, _, starts, values, seqs, vs_bases, limits = tables(lock)
+    table = prop_table(props, starts, values)
+    l1, l2, data, distinct = table
+    write_atomic(args.out, emit(lock, starts, values, seqs, vs_bases, limits, table))
+    size = 2 * len(l1) + 128 * len(l2) + 16 * len(data) + 4 * len(distinct)
+    print(f"ranges={len(starts)} l2_blocks={len(l2)} data_blocks={len(data)} values={len(distinct)} "
+          f"table={size} B sequences={len(seqs)} vs_bases={len(vs_bases)}")
     for name, sc, by in limits:
         print(f"  {name}: {sc} scalars, {by} bytes")
     print(f"profile={text_profile_id(lock, starts, values, seqs, vs_bases)}")

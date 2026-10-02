@@ -2713,10 +2713,10 @@ TEST test_app_layer_diff(void) {
     ASSERT(rec.damaged == 64 && rec.commands == 2 && rec.n == 2); /* background, the changed fill: no clear below */
     ASSERT(rec.cmds[1].dst.x0 == 0 && rec.cmds[1].dst.x1 == 8 && rec.cmds[1].color == GREEN);
     ASSERT(px(h.out.shown, 40, 40) == canary && px(h.out.shown, 0, 0) == GREEN);
-    shr__lcmd two[2] = {c[0], c[2]}; /* compared by position: both later fills changed */
+    shr__lcmd two[2] = {c[0], c[2]}; /* equal ends match: only the removed fill changed */
     paint(l, 2, two);
     frame(ctx);
-    ASSERT(rec.damaged == 128 && px(h.out.shown, 0, 0) == BLUE && px(h.out.shown, 16, 16) == GREEN);
+    ASSERT(rec.damaged == 64 && px(h.out.shown, 0, 0) == BLUE && px(h.out.shown, 16, 16) == GREEN);
     ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
     ASSERT_EQ_LL(shr_lyr_cmd_fill(l, FULL, RED), SHR_OK);
     ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK); /* starts over */

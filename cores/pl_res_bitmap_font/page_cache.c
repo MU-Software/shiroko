@@ -72,8 +72,7 @@ static shr_status slot_take(shr_pl_res_bitmap_font *f, shr__page *p, uint64_t ex
     if (f->page_bytes - spare + need > f->cache_bytes) return SHR_E_NO_MEMORY;
     while (f->page_bytes + need > f->cache_bytes) {
         shr__page *victim = SHR_CONTAINER(shr__lru_oldest(f->lru), shr__page, lru);
-        shr__ctx_trace(f->res.ctx, SHR_TRACE_PAGE_EVICT, shr__rd32(shr__page_rec(victim) + 20),
-                       shr__page_length(victim), 0);
+        shr__ctx_trace(f->res.ctx, SHR_TRACE_PAGE_EVICT, victim->index, shr__page_length(victim), 0);
         shr__lru_remove(&f->lru, &victim->lru);
         victim->state = PAGE_ABSENT;
         if (!s && victim->slot->shape == pkg->slot_shape) {
@@ -99,7 +98,7 @@ static shr_status slot_take(shr_pl_res_bitmap_font *f, shr__page *p, uint64_t ex
  * its records. Leaves what it took to the caller on failure. */
 static shr_status page_fill(shr_pl_res_bitmap_font *f, shr__page *p, const uint8_t *b, bool cached, const char **why) {
     const shr__pkg *pkg = p->pkg;
-    uint32_t height = shr__rd16(shr__page_rec(p) + 28);
+    uint32_t height = shr__page_height(p);
     shr__streams s;
     *why = "font page invalid";
     shr_status st = shr__page_streams(p, b, &s);
@@ -163,7 +162,7 @@ static void page_ready(shr_pl_res_bitmap_font *f, shr__page *p) {
     p->retry.count = p->retry.cools = 0;
     if (p->slot->bytes) shr__lru_push(&f->lru, &p->lru);
     f->changed = true;
-    shr__ctx_trace(f->res.ctx, SHR_TRACE_PAGE_READY, shr__rd32(shr__page_rec(p) + 20), shr__page_length(p), 0);
+    shr__ctx_trace(f->res.ctx, SHR_TRACE_PAGE_READY, p->index, shr__page_length(p), 0);
 }
 
 /* A read page: a checksum mismatch is re-read like an I/O error, a page that does not decode or validate fails. */
@@ -256,20 +255,7 @@ void shr__pages_schedule(shr_pl_res_bitmap_font *f) {
     f->wants.len = k;
 }
 
-static int64_t cmap_find(const shr__pkg *pkg, uint32_t cp) {
-    uint32_t lo = 0, hi = pkg->ncmap;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2, v = shr__rd32(pkg->cmap + 8ull * mid);
-        if (v == cp) return shr__rd32(pkg->cmap + 8ull * mid + 4);
-        if (v < cp)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return -1;
-}
-
-static int64_t seq_find(const shr__pkg *pkg, const uint32_t *cps, size_t n) {
+static uint32_t seq_find(const shr__pkg *pkg, const uint32_t *cps, size_t n) {
     uint32_t lo = 0, hi = pkg->nseqs;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
@@ -281,7 +267,7 @@ static int64_t seq_find(const shr__pkg *pkg, const uint32_t *cps, size_t n) {
         else
             hi = mid;
     }
-    return -1;
+    return SHR_GID_MISS;
 }
 
 typedef struct hit {
@@ -313,8 +299,9 @@ static int want_page(shr_pl_res_bitmap_font *f, shr__pkg *pkg, uint32_t index, u
     return GLYPH_PENDING;
 }
 
-static int try_package(shr_pl_res_bitmap_font *f, int role, const uint32_t *cps, size_t n, uint64_t frame,
-                       hit *out) {
+/* The glyph of `cps`: a scalar, or the scalars of cluster `c` (looked up once per ready package). */
+static int try_package(shr_pl_res_bitmap_font *f, int role, const uint32_t *cps, size_t n, shr__cluster *c,
+                       uint64_t frame, hit *out) {
     shr__pkg *pkg = &f->pkg[role];
     if (pkg->state == PKG_UNOPENED) {
         if (f->shutting_down) return GLYPH_MISSING;
@@ -324,23 +311,18 @@ static int try_package(shr_pl_res_bitmap_font *f, int role, const uint32_t *cps,
     }
     if (pkg->state == PKG_LOADING) return GLYPH_PENDING;
     if (pkg->state != PKG_READY) return GLYPH_MISSING;
-    int64_t slot = n == 1 ? cmap_find(pkg, cps[0]) : seq_find(pkg, cps, n);
-    if (slot < 0) return GLYPH_MISSING;
-    uint32_t lo = 0, hi = pkg->npages;
-    while (hi - lo > 1) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (shr__rd32(pkg->ptab + SHR_PKG_ENTRY * (uint64_t)mid + 20) <= slot)
-            lo = mid;
-        else
-            hi = mid;
-    }
-    shr__page *p = pkg->pages[lo]; /* the built-in pages are always ready */
-    if (!p || p->state != PAGE_READY) return want_page(f, pkg, lo, frame);
-    *out = (hit){p->recs + 16 * (slot - shr__rd32(pkg->ptab + SHR_PKG_ENTRY * (uint64_t)lo + 20)), p, pkg};
+    uint32_t gid = n == 1 ? shr__ctri_get(pkg, cps[0]) : c->gid[role];
+    if (gid == SHR_GID_UNKNOWN) gid = c->gid[role] = seq_find(pkg, cps, n);
+    if (gid == SHR_GID_MISS) return GLYPH_MISSING;
+    if (gid == SHR_GID_BLANK) return GLYPH_BLANK;
+    shr__page *p = pkg->pages[gid >> 12]; /* the built-in pages are always ready */
+    if (!p || p->state != PAGE_READY) return want_page(f, pkg, gid >> 12, frame);
+    *out = (hit){p->recs + 16 * (gid & 4095), p, pkg};
     return GLYPH_READY;
 }
 
-static int text_chain(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t n, uint64_t frame, hit *out) {
+static int text_chain(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t n, shr__cluster *c, uint64_t frame,
+                      hit *out) {
     int order[5], k = 0;
     uint32_t props = shr__uprops(cps[0]);
     if (n == 1 && (props & SHR_UP_NERD)) order[k++] = ROLE_NERD;
@@ -351,7 +333,7 @@ static int text_chain(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t n, 
     order[k++] = ROLE_SYMBOLS;
     order[k++] = ROLE_BUILTIN;
     for (int i = 0; i < k; i++) {
-        int r = try_package(f, order[i], cps, n, frame, out);
+        int r = try_package(f, order[i], cps, n, c, frame, out);
         if (r != GLYPH_MISSING) return r;
     }
     return GLYPH_MISSING;
@@ -362,9 +344,10 @@ shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t fr
     const uint32_t *cps = &one;
     size_t n = 1;
     uint8_t kind = SHR_GLYPH_SCALAR;
+    shr__cluster *c = NULL;
     if (id & SHR_ID_CLUSTER) {
         if (one >= f->clusters.len) return SHR_E_INVALID_ARG;
-        const shr__cluster *c = SHR_VEC_AT(&f->clusters, shr__cluster, one);
+        c = SHR_VEC_AT(&f->clusters, shr__cluster, one);
         cps = SHR_VEC_AT(&f->pool, uint32_t, c->off);
         n = c->n, kind = c->kind, base = c->cp;
     }
@@ -372,23 +355,23 @@ shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t fr
     hit h = {0};
     int r;
     if (id & SHR_ID_EMOJI) { /* the emoji glyph, else the text glyph of a single visible scalar */
-        r = try_package(f, ROLE_EMOJI, cps, n, frame, &h);
+        r = try_package(f, ROLE_EMOJI, cps, n, c, frame, &h);
         if (r == GLYPH_MISSING && n > 1 && kind == SHR_GLYPH_SCALAR)
-            r = try_package(f, ROLE_EMOJI, &base, 1, frame, &h);
-        if (r == GLYPH_MISSING && kind == SHR_GLYPH_SCALAR) r = text_chain(f, &base, 1, frame, &h);
+            r = try_package(f, ROLE_EMOJI, &base, 1, NULL, frame, &h);
+        if (r == GLYPH_MISSING && kind == SHR_GLYPH_SCALAR) r = text_chain(f, &base, 1, NULL, frame, &h);
     } else {
-        r = text_chain(f, cps, n, frame, &h);
-        if (r == GLYPH_MISSING && n > 1 && kind == SHR_GLYPH_SCALAR) r = text_chain(f, &base, 1, frame, &h);
+        r = text_chain(f, cps, n, c, frame, &h);
+        if (r == GLYPH_MISSING && n > 1 && kind == SHR_GLYPH_SCALAR) r = text_chain(f, &base, 1, NULL, frame, &h);
     }
-    if (r == GLYPH_MISSING) r = text_chain(f, &fffd, 1, frame, &h);
+    if (r == GLYPH_MISSING) r = text_chain(f, &fffd, 1, NULL, frame, &h);
     if (r == GLYPH_NO_MEMORY) return SHR_E_NO_MEMORY;
     out->provisional = r == GLYPH_PENDING;
     if (r == GLYPH_PENDING) {
-        r = n == 1 ? try_package(f, ROLE_BUILTIN, cps, 1, frame, &h) : GLYPH_MISSING;
-        if (r != GLYPH_READY) try_package(f, ROLE_BUILTIN, &fffd, 1, frame, &h);
+        r = n == 1 ? try_package(f, ROLE_BUILTIN, cps, 1, NULL, frame, &h) : GLYPH_MISSING;
+        if (r == GLYPH_MISSING) r = try_package(f, ROLE_BUILTIN, &fffd, 1, NULL, frame, &h);
     }
+    if (r == GLYPH_BLANK) return SHR_E_NOT_FOUND; /* draws nothing: no page */
     const uint8_t *e = h.entry; /* found: the built-in package always has U+FFFD */
-    if (!(e[8] & 3)) return SHR_E_NOT_FOUND;
     shr__page *p = h.page;
     p->want = frame;
     if (p->slot->bytes && p->pin[0] != frame && p->pin[1] != frame) { /* pages of the cache may be evicted */

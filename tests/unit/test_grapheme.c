@@ -54,6 +54,79 @@ TEST grapheme_breaks_match_uax29_test_file(void) {
     PASS();
 }
 
+/* Marks out[cp] = i + 1 where field 1 of a UCD line is names[i]. */
+static bool load_ucd(const char *file, const char *const *names, size_t count, uint8_t *out) {
+    char path[512], line[512];
+    snprintf(path, sizeof(path), "%s/%s", SHR_UCD_DIR, file);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    while (fgets(line, sizeof(line), f)) {
+        char *end = line + strcspn(line, "#\n"), *p;
+        *end = 0;
+        if (!strchr(line, ';')) continue;
+        uint32_t lo = (uint32_t)strtoul(line, &p, 16), hi = lo;
+        if (p[0] == '.' && p[1] == '.') hi = (uint32_t)strtoul(p + 2, &p, 16);
+        p = strchr(p, ';') + 1;
+        while (*p == ' ') p++;
+        while (end > p && end[-1] == ' ') *--end = 0;
+        for (size_t i = 0; i < count; i++)
+            if (!strcmp(p, names[i])) memset(out + lo, (int)i + 1, hi - lo + 1);
+    }
+    fclose(f);
+    return true;
+}
+
+TEST uprops_match_ucd_for_every_scalar(void) {
+    static const char *const gcb[] = {"CR", "LF", "Control", "Extend", "ZWJ", "Regional_Indicator", "Prepend",
+                                      "SpacingMark", "L", "V", "T", "LV", "LVT"};
+    static const char *const extpict[] = {"Extended_Pictographic"}, *const wide[] = {"W", "F"};
+    enum { N = 0x110000 };
+    uint8_t *g = calloc(N, 1), *e = calloc(N, 1), *w = calloc(N, 1);
+    ASSERT(g && e && w);
+    ASSERT(load_ucd("GraphemeBreakProperty.txt", gcb, 13, g));
+    ASSERT(load_ucd("emoji-data.txt", extpict, 1, e));
+    ASSERT(load_ucd("EastAsianWidth.txt", wide, 2, w));
+    uint32_t bad = N;
+    for (uint32_t cp = 0; cp < N && bad == N; cp++) {
+        uint32_t p = shr__uprops(cp);
+        if (shr__gcb(p) != g[cp] || !(p & SHR_UP_EXTPICT) != !e[cp] || !(p & SHR_UP_WIDE) != !w[cp]) bad = cp;
+    }
+    if (bad != N) fprintf(stderr, "U+%04X: props %X\n", bad, shr__uprops(bad));
+    free(g), free(e), free(w);
+    ASSERT_EQ_LL(bad, N);
+    PASS();
+}
+
+TEST uprops_samples(void) {
+    static const struct { uint32_t cp, props; } cases[] = {
+        {0x0000F, SHR_GCB_CONTROL | SHR_UP_CC},
+        {0x00010, SHR_GCB_CONTROL | SHR_UP_CC},
+        {0x003FF, 0},
+        {0x00400, 0},
+        {0x0FFFF, 0},
+        {0x10000, 0},
+        {0x0ABFF, 0},
+        {0x0AC00, SHR_GCB_LV | SHR_UP_WIDE | SHR_UP_CJK},
+        {0x0D7A3, SHR_GCB_LVT | SHR_UP_WIDE | SHR_UP_CJK},
+        {0x0D7A4, 0},
+        {0x0DFFF, 0},
+        {0x0E000, SHR_UP_CO | SHR_UP_NERD},
+        {0x1F1E5, SHR_UP_EXTPICT},
+        {0x1F1E6, SHR_GCB_RI | SHR_UP_EMOJI | SHR_UP_EPRES},
+        {0x1F1FF, SHR_GCB_RI | SHR_UP_EMOJI | SHR_UP_EPRES},
+        {0x10FFFD, SHR_UP_CO},
+        {0x10FFFF, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint32_t p = shr__uprops(cases[i].cp);
+        if (p != cases[i].props) fprintf(stderr, "U+%04X: props %X, expected %X\n", cases[i].cp, p, cases[i].props);
+        ASSERT_EQ_LL(p, cases[i].props);
+    }
+    ASSERT_EQ_LL(shr__uprops(0x110000), shr__uprops(0x10FFFF));
+    ASSERT_EQ_LL(shr__uprops(UINT32_MAX), shr__uprops(0x10FFFF));
+    PASS();
+}
+
 TEST seq_cmp_orders_by_prefix_then_length(void) {
     const uint32_t a[2] = {1, 2}, b[2] = {1, 3};
     ASSERT_EQ_LL(shr__seq_cmp(a, 2, a, 2), 0);
@@ -69,6 +142,8 @@ GREATEST_MAIN_DEFS();
 int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(grapheme_breaks_match_uax29_test_file);
+    RUN_TEST(uprops_match_ucd_for_every_scalar);
+    RUN_TEST(uprops_samples);
     RUN_TEST(seq_cmp_orders_by_prefix_then_length);
     GREATEST_MAIN_END();
 }

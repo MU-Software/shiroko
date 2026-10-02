@@ -82,8 +82,8 @@ static void entry_free(sw *s, entry *e) {
 /* What uthash allocates with the first entry. */
 #define TABLE_BYTES (sizeof(UT_hash_table) + HASH_INITIAL_NUM_BUCKETS * sizeof(UT_hash_bucket))
 
-/* A miss renders the group into its own buffer (not zeroed: groups are opaque) and stores it; an entry the
- * table could not take has hh.tbl == NULL. NULL = draw directly: no memory, or a group over half of the
+/* A miss drawn whole renders the group into its own buffer (not zeroed: groups are opaque) and stores it; an entry
+ * the table could not take has hh.tbl == NULL. NULL = draw directly: no memory, or a group over half of the
  * budget beside the table. */
 static entry *render(sw *s, const shr_surface *dst, const shr_draw_cmd *group, size_t n, const entry_id *id) {
     int32_t w = id->width, h = id->height;
@@ -118,7 +118,7 @@ static void draw_group(sw *s, const shr_surface *dst, const shr_draw_cmd *group,
     if (e) {
         shr__lru_remove(&s->lru, &e->lru);
         shr__lru_push(&s->lru, &e->lru);
-    } else {
+    } else if (!memcmp(&clip, &group->dst, sizeof(clip))) {
         e = render(s, dst, group, n, &id);
     }
     if (!e) {

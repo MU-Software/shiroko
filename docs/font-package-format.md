@@ -1,4 +1,4 @@
-# Shiroko font package format v5
+# Shiroko font package format v6
 
 All integers are little-endian with the widths given below; every checksum is XXH3-64 (xxHash, seed 0); no native struct is serialized. Python `struct` formats are given for every record. One package holds one provider (role) with one instance, from its regular face, for the single cell size of the build (`fontpack.py build --cell WxH`, at most 64x127 so that a two-cell glyph fits the glyph record's u8 width and i8 bearing/top); the runtime supports no other size. Packages hold no bold or italic faces: `SHR_STYLE_BOLD` and `SHR_STYLE_ITALIC` text is drawn from the regular coverage, which drivers embolden and slant (`SHR_GLYPH_BOLD`, `SHR_GLYPH_ITALIC` in `shiroko_driver.h`), except for glyphs the emoji or Nerd package serves and for box drawing and block characters (U+2500–259F, U+1FB00–1FBFF).
 
@@ -22,7 +22,7 @@ Every box starts with a 16-byte header, `"<I4sHHI"`:
 
 A checksum "of a box" always covers the whole box, `[offset, offset + size)`, header included.
 
-A stored box's payload is its raw bytes. A zstd box's payload is one zstd frame, except a page box (below). Compression is a choice of the build; the runtime decodes whatever method a box declares. Only `cmap`, `seqs`, `pool` and `page` may be zstd.
+A stored box's payload is its raw bytes. A zstd box's payload is one zstd frame, except a page box (below). Compression is a choice of the build; the runtime decodes whatever method a box declares. Only `ctri`, `seqs`, `pool` and `page` may be zstd.
 
 ### `shrf`: header (128 B, offset 0)
 
@@ -31,7 +31,7 @@ A stored box's payload is its raw bytes. A zstd box's payload is one zstd frame,
 | Offset | Type | Field |
 |---:|---|---|
 | 0 | box | size 128, type `shrf`, version 0, flags 1, raw_size 112: the bytes `80 00 00 00 73 68 72 66` are the magic |
-| 16 | u16 | format version = 5 |
+| 16 | u16 | format version = 6 |
 | 18 | u16 | 0 |
 | 20 | u32 | required features: bit0 A4, bit1 A8, bit2 sequences, bit3 zstd (some box is zstd); other bits are rejected |
 | 24 | u32 | optional features: ignored (written as 0) |
@@ -71,30 +71,47 @@ Each known type appears at most once and carries REQUIRED, except `covr`, which 
 | `strs` | stored | UTF-8 bytes |
 | `srcs` | stored | n × 48 B, `"<II32sII"`: `u32 name_off, u32 name_len, u8[32] sha256, u32 license_off, u32 license_len`; strings inside `strs`; the licence is the SPDX conjunction of the font's licence and every component licence |
 | `inst` | stored | 48 B, `"<HBBHHIhhhH16sHH8x"`: `u16 source, u8 0, u8 format, u16 line_height, u16 cell_width, u32 ppem_26_6, i16 baseline, i16 underline_y, i16 strike_y, u16 raster_flags, u8[16] font_instance_id, u16 page_width, u16 page_height, u8[8] 0`; page_width and page_height (the page shape W × H) are each 64, 128, 256 or 512; raster_flags bit0 = fontpack's pinned FreeType raster mode, other bits 0; ppem_26_6 is nominal: symbols and CJK glyphs that would not fit their cells are sized per glyph |
-| `cmap` | stored or zstd | n × 8 B, `"<II"`: `u32 scalar, u32 glyph_index`, sorted by scalar, unique |
-| `seqs` | stored or zstd | n × 12 B, `"<BBHII"`: `u8 length, u8 kind, u16 0, u32 pool_index, u32 glyph_index`, sorted by scalar array, unique |
+| `ctri` | stored or zstd | the scalar table (below) |
+| `seqs` | stored or zstd | n × 12 B, `"<BBHII"`: `u8 length, u8 kind, u16 0, u32 pool_index, u32 glyph`, sorted by scalar array, unique |
 | `pool` | stored or zstd | n × 4 B: u32 scalars |
-| `ptab` | stored | page_count × 32 B, `"<QQIIIHH"`: `u64 offset, u64 xxh3 (of the page box), u32 size (of the page box), u32 first_glyph, u32 glyph_count, u16 height, u16 0` |
+| `ptab` | stored | page_count × 24 B, `"<QQIHH"`: `u64 offset, u64 xxh3 (of the page box), u32 size (of the page box), u16 glyph_count, u16 height` |
 | `covr` | stored | 36 B, `"<9I"`: counters scalars, sequences, aliases, uvs, ivs, missing, reserved (written as 0), glyphs, bitmap_bytes |
 
-Roles: 1 latin, 2 cjk, 3 symbols, 4 emoji, 5 nerd. Formats: 1 A4, 2 A8. Sequence kinds: 1 glyph, 2 alias, 3 default UVS, 4 non-default UVS. Every key maps to a glyph index, so aliases share bitmaps and cannot form cycles. Metrics are in pixels from the top of the line cell: `baseline`, `underline_y`, `strike_y`.
+Roles: 1 latin, 2 cjk, 3 symbols, 4 emoji, 5 nerd. Formats: 1 A4, 2 A8. Sequence kinds: 1 glyph, 2 alias, 3 default UVS, 4 non-default UVS. Metrics are in pixels from the top of the line cell: `baseline`, `underline_y`, `strike_y`.
+
+A **glyph** value names where a key's bitmap is: `page << 12 | record` for record `record` of page `page`, or one of two values no page can produce: MISS `0xFFFFFFFF` (the package has no glyph for the key) and BLANK `0xFFFFFFFE` (the key has a glyph that draws nothing, such as a space). Every key maps to a glyph value, so aliases share bitmaps and cannot form cycles.
+
+### `ctri`: scalar table
+
+A three-level table from a scalar `cp` (≤ 0x10FFFF) to its glyph value: `cp >> 10` (11 bits) picks a level-2 block in L1, `cp >> 4 & 63` (6 bits) a data block in that level-2 block, and `cp & 15` (4 bits) the glyph value in that data block. Raw payload:
+
+| Offset | Type | Field |
+|---:|---|---|
+| 0 | u32 | l2_count: level-2 blocks (1..65536) |
+| 4 | u32 | data_count: data blocks (1..65536) |
+| 8 | u32[2] | 0 |
+| 16 | u16[1088] | L1: level-2 block of each 1024 scalars |
+| 2192 | u16[64] × l2_count | level-2 blocks: data block of each 16 scalars |
+| D | u32[16] × data_count | data blocks: glyph values |
+
+D = 2192 + 128 × l2_count rounded up to a multiple of 64; the bytes before D are 0, and raw_size = D + 64 × data_count. Level-2 block 0 is all 0 and data block 0 is all MISS, so scalars of empty ranges cost the same three reads. Blocks may be shared; which numbers they get is the builder's choice. A stored `ctri` box starts where (offset + 16) % 64 == 0, so its data blocks start at multiples of 64 B in the file and in a package mapped at a 64-aligned address.
 
 ### `page` boxes
 
-Pages are ordered, contiguous and cover every glyph index once. Page i holds glyphs [first_glyph, first_glyph + glyph_count) (1 to 4096 of them) in the top `height` rows (1 ≤ height ≤ H) of a W × H atlas of stride = W × bytes per pixel (A4 ½, A8 1). Its raw content is
+Page i holds glyph_count glyphs (1 to 4096), the records 0 .. glyph_count − 1 that glyph values `i << 12 | record` name, in the top `height` rows (1 ≤ height ≤ H) of a W × H atlas of stride = W × bytes per pixel (A4 ½, A8 1). Only glyphs with a bitmap have records; keys of glyphs that draw nothing map to BLANK. Its raw content is
 
 ```
 atlas:   height rows of stride bytes, no padding                       (height × stride B)
 records: glyph_count × 16 B, "<HHBBbbBBHI":
          u16 x, u16 y, u8 width, u8 height, i8 bearing_x, i8 top, u8 flags, u8 0, u16 source_glyph, u32 0
-         flags: bits0-1 format (0 none, 1 A4, 2 A8), bits2-3 cells, bits4-7 0
+         flags: bits0-1 format (the instance's: 1 A4, 2 A8), bits2-3 cells, bits4-7 0
 ```
 
 The page box: header (type `page`, version 0, flags REQUIRED | METHOD << 4, raw_size = 8 + height × stride + 16 × glyph_count), then `"<II"` page_index (= i), atlas_stream_bytes, then the atlas stream (atlas_stream_bytes B), then the records stream (the rest of the box). The 8 bytes `page_index, atlas_stream_bytes` are never compressed. Stored: the streams are the atlas and the records as they are. zstd: each stream is one zstd frame, of the atlas and of the records; both streams are frames.
 
 A stored page box starts where (offset + 24) % 256 == 0, so its atlas starts at a multiple of 256 B in the file and can be drawn from in place in a package mapped at a 256-aligned address (as the built-in one is). zstd pages are packed tightly.
 
-A glyph's bitmap is the rect `[x, x + width) × [y, y + height)` of the atlas, in the instance's format (A4 packs the left pixel in the high nibble), with `x + width ≤ W` and `y + height ≤` the page's height; `bearing_x` is from the left edge of the first cell, `top` is the number of rows above the baseline. An A4 glyph starts at an even `x` and, for an odd width, the column right of its rect (inside the atlas, whose width is even) is a zero nibble in every row of the rect. Glyphs without a bitmap (spaces) have format 0 and `x`, `y`, `width` and `height` 0. Rects may touch (readers take nothing outside a glyph's rect).
+A glyph's bitmap is the rect `[x, x + width) × [y, y + height)` of the atlas, in the instance's format (A4 packs the left pixel in the high nibble), with `x + width ≤ W` and `y + height ≤` the page's height; `bearing_x` is from the left edge of the first cell, `top` is the number of rows above the baseline. An A4 glyph starts at an even `x` and, for an odd width, the column right of its rect (inside the atlas, whose width is even) is a zero nibble in every row of the rect. Rects may touch (readers take nothing outside a glyph's rect).
 
 ### `free` boxes
 
@@ -112,13 +129,13 @@ A zstd stream of n bytes that decodes to `expected` bytes (known from `inst`, `p
 
 ## Loader rules, in order
 
-The runtime and `fontpack.py` (`Package`) check these rules in this order; the first that fails rejects the package (or the page) with the status given (SHR_E_FORMAT where none is). "Known" types are `mani strs srcs inst cmap seqs pool ptab covr`.
+The runtime and `fontpack.py` (`Package`) check these rules in this order; the first that fails rejects the package (or the page) with the status given (SHR_E_FORMAT where none is). "Known" types are `mani strs srcs inst ctri seqs pool ptab covr`.
 
 **Header** (read when the package opens):
 
 1. The source holds at least 128 bytes.
 2. Bytes [0, 8) are `80 00 00 00 73 68 72 66` (a v4 file starts with `SHRFPKG1` and fails here).
-3. Version 0, flags 1, raw_size 112, format version 5, bytes [18, 20) zero.
+3. Version 0, flags 1, raw_size 112, format version 6, bytes [18, 20) zero.
 4. XXH3 of [0, 120) equals the header checksum — SHR_E_CHECKSUM.
 5. Required features: no bit beyond bit3 — SHR_E_UNSUPPORTED; bit3 (zstd) in a runtime built without zstd — SHR_E_UNSUPPORTED (nothing else is read).
 6. Bytes [88, 120) zero.
@@ -135,9 +152,9 @@ The runtime and `fontpack.py` (`Package`) check these rules in this order; the f
     3. an unknown type: REQUIRED set — SHR_E_UNSUPPORTED; else the entry is skipped (no further rule applies to it);
     4. a known type: not seen before;
     5. METHOD ≥ 2 — SHR_E_UNSUPPORTED;
-    6. flags: no bit set but REQUIRED and METHOD; REQUIRED set unless `covr`; METHOD 1 only for `cmap`, `seqs`, `pool`, and only with required feature bit3; version 0;
+    6. flags: no bit set but REQUIRED and METHOD; REQUIRED set unless `covr`; METHOD 1 only for `ctri`, `seqs`, `pool`, and only with required feature bit3; version 0;
     7. stored: raw_size = size − 16; zstd: raw_size > size − 16.
-12. `mani`, `inst`, `cmap` and `ptab` are present.
+12. `mani`, `inst`, `ctri` and `ptab` are present.
 13. The metadata region, from the first known box to the end of the last known box, is at most 128 MiB, and so is the sum of the known boxes' raw_size — SHR_E_LIMIT.
 
 **Metadata** (the region, read at once). For each known box, in offset order:
@@ -152,11 +169,11 @@ Then the contents:
 18. `inst`: 48 B. `srcs`: a multiple of 48 B. `covr`: 36 B. Each source's name and licence strings inside `strs`.
 19. `inst`: source < the number of sources when `srcs` is present; style byte 0; format 1 or 2 with its required feature bit; 1 ≤ line_height, cell_width ≤ 1024; 0 ≤ baseline ≤ line_height, 0 ≤ underline_y, strike_y < line_height; raster_flags & ~1 = 0; reserved bytes 0; page_width and page_height each 64, 128, 256 or 512.
 20. (runtime) The instance's cell size is the build's — SHR_E_UNSUPPORTED.
-21. `cmap`: a multiple of 8 B, at most 2^22 records; scalars ≤ 0x10FFFF, not surrogates, strictly increasing; glyph indices < glyph_count.
+21. `ctri`: raw_size ≥ 2192; 1 ≤ l2_count, data_count ≤ 65536 and the two u32 after them 0; raw_size = D + 64 × data_count with the bytes before D 0; every L1 entry < l2_count and every level-2 entry < data_count; level-2 block 0 all 0 and data block 0 all MISS; stored: (offset + 16) % 64 = 0.
 22. `pool`: a multiple of 4 B, at most 2^22 scalars.
-23. `seqs` (when present): required feature bit2, `pool` present, a multiple of 12 B, at most 2^22 records; every pool scalar ≤ 0x10FFFF and not a surrogate; each record: 2 ≤ length ≤ the text profile's cluster limit, kind 1–4, zero 0, pool_index + length ≤ pool size, glyph index < glyph_count; keys strictly increasing.
-24. `ptab`: raw_size = 32 × page_count (mani); 1 ≤ page_count ≤ 2^16. Each entry, in order: first_glyph = the glyphs of the pages before; 1 ≤ glyph_count ≤ 4096; 1 ≤ height ≤ page_height; the u16 after height 0; 24 ≤ size ≤ 1 MiB; offset ≥ the end of the previous page (the first: ≥ the end of the last box `sidx` lists, known or not); offset + size ≤ file size.
-25. The pages cover glyph_count glyphs.
+23. `seqs` (when present): required feature bit2, `pool` present, a multiple of 12 B, at most 2^22 records; every pool scalar ≤ 0x10FFFF and not a surrogate; each record: 2 ≤ length ≤ the text profile's cluster limit, kind 1–4, zero 0, pool_index + length ≤ pool size; keys strictly increasing.
+24. `ptab`: raw_size = 24 × page_count (mani); 1 ≤ page_count ≤ 2^16. Each entry, in order: 1 ≤ glyph_count ≤ 4096; 1 ≤ height ≤ page_height; 24 ≤ size ≤ 1 MiB; offset ≥ the end of the previous page (the first: ≥ the end of the last box `sidx` lists, known or not); offset + size ≤ file size.
+25. The pages' glyph_count sum to glyph_count (mani). Every glyph value in the `ctri` data blocks and in `seqs` is MISS, BLANK, or names a record: page < page_count and record < that page's glyph_count. U+0020 maps to MISS or BLANK.
 
 **Page** i (each time it is read, or decoded from a mapping):
 
@@ -165,15 +182,15 @@ Then the contents:
 28. Stored: size = raw_size + 16 and (offset + 24) % 256 = 0.
 29. page_index = i; stored: atlas_stream_bytes = height × stride; zstd: atlas_stream_bytes ≤ size − 24.
 30. The atlas stream decodes to height × stride bytes, then the records stream to 16 × glyph_count bytes.
-31. Each record: flags & 0xF0 = 0, cells 1 or 2, the zero byte and the u32 0; format 0: x, y, width and height 0; else format = the instance's, width and height ≥ 1, A4 x even, x + width ≤ page_width, y + height ≤ the page's height, and for an odd A4 width the padding nibble (in the decoded atlas) zero in every row.
+31. Each record: flags & 0xF0 = 0, cells 1 or 2, the zero byte and the u32 0; format = the instance's, width and height ≥ 1, A4 x even, x + width ≤ page_width, y + height ≤ the page's height, and for an odd A4 width the padding nibble (in the decoded atlas) zero in every row.
 
 Overlapping rects are not rejected: they draw wrong pixels but never read outside the page. Nothing else is hashed; there is no whole-package hash and no hash of decoded bytes (decoding is deterministic and its input is hashed). COVERAGE is informational: `missing` counts profile sequences the source fonts cannot draw.
 
-`fontpack.py verify`, `install` and `build` apply rules 1–31 (pages: all of them; the cell size and file name only in `install`) and then walk the box chain: from offset 0 the boxes tile the file; each is `shrf`, `sidx`, a box `sidx` lists (its header's type and size those of the entry), a page `ptab` lists, or a `free` box; every listed box and page is reached. Errors are explicit, also under `python -O`. A v4 file fails with "format v4 package: rebuild with fontpack 5".
+`fontpack.py verify`, `install` and `build` apply rules 1–31 (pages: all of them; the cell size and file name only in `install`) and then walk the box chain: from offset 0 the boxes tile the file; each is `shrf`, `sidx`, a box `sidx` lists (its header's type and size those of the entry), a page `ptab` lists, or a `free` box; every listed box and page is reached. Errors are explicit, also under `python -O`. A v4 file fails with "format v4 package: rebuild with fontpack 6", a v5 file with "format v5 package: rebuild with fontpack 6".
 
 ## Runtime
 
-The runtime opens a package in three asynchronous steps, all in `shr_pump()`: the header (128 B, rules 1–8), the index (rules 9–13), then one read of the metadata region (rules 14–25), whose boxes are decoded into one resident allocation. A mapped package's index is decoded the same way (stored boxes could stay in place). The built-in package and stored indexes need no zstd decoder; the decoder context (about 96 KB) is allocated at a font's first compressed box and shared by its packages. A runtime built without zstd (CMake `SHIROKO_ZSTD=OFF`) rejects any package whose header declares bit3 at open, before reading further.
+The runtime opens a package in three asynchronous steps, all in `shr_pump()`: the header (128 B, rules 1–8), the index (rules 9–13), then one read of the metadata region (rules 14–25), whose boxes are decoded into one resident allocation (each box at a multiple of 64 B). A mapped package's stored boxes are used in place; its zstd boxes are decoded the same way. The built-in package and stored indexes need no zstd decoder; the decoder context (about 96 KB) is allocated at a font's first compressed box and shared by its packages. A runtime built without zstd (CMake `SHIROKO_ZSTD=OFF`) rejects any package whose header declares bit3 at open, before reading further.
 
 Resident pages live in slots of the page cache (`page_cache_bytes`), driver buffers of the page shape (format, W, H); an evicted slot takes a page of any package with the same shape. A page is decoded into the top `height` rows of its slot; the rows below are zeroed after every decode. A page charges H × the slot's stride, its record block (16 × glyph_count) and, while its read is in flight, a staging buffer of the page box's size. A stored page of a mapped package (and of the built-in one) is drawn from in place when the driver can wrap it, else decoded into a slot. To make room, a page evicts only the oldest unpinned pages that the latest frame neither drew from nor wanted; when that is not enough, the page waits for memory (read and mapped packages alike) and the frame settles with fallback glyphs, while a page larger than the whole cache fails with SHR_E_LIMIT.
 
@@ -187,7 +204,7 @@ A CJK package's ppem is the largest, in 1/64 steps up to the Latin em, at which 
 
 **Page shape.** `fontpack.config.json` gives per format the default shape (`page_atlas`), the candidate shapes (`page_shapes`, each side 64–512, a power of two) and the most glyphs per page (`max_page_records`, at most 4096). Candidates are the shapes in which every glyph fits (A4 span width + (width & 1) ≤ W, height ≤ H). If all glyphs fit on one page of some candidate whose trimmed atlas (used rows × stride) is smaller than one default page, the package takes the candidate with the fewest trimmed bytes (ties: the smaller W, then the smaller H); otherwise the default. Glyphs are shelf-packed in index order; a page ends when the next glyph does not fit below the last shelf or the page holds `max_page_records`. Every page's height is H except the last one's: its used rows (at least 1). Atlas bytes no glyph covers are 0. `--page-atlas WxH` forces that one shape for both formats (the fuzz seeds use the smallest shape of at least 2 cells by 1 line).
 
-**Compression.** By default `cmap`, `seqs`, `pool` and pages are zstd: level 19, window log at most 18, content size written, no checksum or dictionary id, one frame per stream. A box (a page: either stream) whose frame is not smaller than its raw bytes is stored. `--store-index` keeps `cmap`, `seqs` and `pool` stored (for flash-mapped packages, whose stored boxes need no decoding); `--method stored` stores everything. Required feature bit3 is set when some box ended up zstd. Metadata boxes follow `sidx` in the order `mani strs srcs inst cmap seqs pool ptab covr`, then the pages; a stored page is preceded by a `free` box of g = (−(offset + 24)) mod 256 bytes, or g + 256 when 0 < g < 16 (none when g = 0). `package_id` and `install`'s byte-identical check therefore depend on the libzstd that the pinned `zstandard` bundles.
+**Compression.** By default `ctri`, `seqs`, `pool` and pages are zstd: level 19, window log at most 18, content size written, no checksum or dictionary id, one frame per stream. A box (a page: either stream) whose frame is not smaller than its raw bytes is stored. `--store-index` keeps `ctri`, `seqs` and `pool` stored (for flash-mapped packages, whose stored boxes need no decoding); `--method stored` stores everything. Required feature bit3 is set when some box ended up zstd. Metadata boxes follow `sidx` in the order `mani strs srcs inst ctri seqs pool ptab covr`, then the pages. A stored `ctri` is preceded by a `free` box of g = (−(offset + 16)) mod 64 bytes, or g + 64 when 0 < g < 16 (none when g = 0); a stored page by one of g = (−(offset + 24)) mod 256 bytes, or g + 256 when 0 < g < 16. Glyphs are numbered in page order as they are packed; glyphs without a bitmap get no record, and their keys map to BLANK. `package_id` and `install`'s byte-identical check therefore depend on the libzstd that the pinned `zstandard` bundles.
 
 `install` verifies each package, copies NOTICE, LICENSES/ and inventory.json from the packages' build directory (whose inventory must describe exactly those package ids), rewrites an existing payload unless it is byte-identical to the verified package (temporary file, fsync, rename, directory fsync), and only then writes the next activation record. Only the runtime checks that the instance matches its cell size; a build that would produce no glyphs fails without writing a package.
 

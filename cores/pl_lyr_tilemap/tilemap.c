@@ -31,6 +31,7 @@ typedef struct shr__tilemap {
     shr__cell *cells;
     uint8_t *dirty;
     shr__vec cmds; /* shr__lcmd, reused per row */
+    shr__vec keys; /* uint64_t, the bytes a row's cache key hashes */
 } shr__tilemap;
 
 static const char tilemap_kind;
@@ -100,76 +101,64 @@ static void place(shr__tilemap *t, int32_t r, int32_t c, const shr__cell *e) {
     for (uint16_t k = 1; k < e->span; k++) row[c + k] = (shr__cell){.span = k, .kind = CELL_CONT};
 }
 
-static bool push(shr__tilemap *t, shr__lcmd cmd) {
-    shr__lcmd *p = shr__vec_push(&t->cmds, &t->al);
-    if (p) *p = cmd;
-    return p != NULL;
-}
-
-/* Paints the empty cells from *gap (if any) to c with the tilemap background. */
-static bool fill_gap(shr__tilemap *t, int32_t *gap, int32_t c, int32_t y) {
-    if (*gap < 0) return true;
-    shr_rect dst = {*gap * SHR_CELL_WIDTH, y, c * SHR_CELL_WIDTH, y + SHR_CELL_HEIGHT};
-    *gap = -1;
-    return push(t, (shr__lcmd){SHR__LCMD_FILL, 0, dst, {0, 0}, t->bg, NULL, 0, {0}});
-}
-
-/* One group per row: per cell background, glyph and decorations. Only rows that opaque backgrounds cover
- * completely get a cache hint, since a cached row replaces what lies under it. */
+/* One group per row: the backgrounds as runs of one colour, then per cell glyph and decorations, which stay inside
+ * their cells. Only rows that opaque backgrounds cover completely get a cache hint, since a cached row replaces what
+ * lies under it. */
 static shr_status build_row(shr__tilemap *t, int32_t r) {
     const shr__cell *row = &t->cells[(size_t)r * (size_t)t->cols];
     const shr__line_metrics lm = shr__bitmap_font_line_metrics();
     shr__res *res = shr__bitmap_font_res(t->font);
     const int32_t y = r * SHR_CELL_HEIGHT;
-    XXH3_state_t key;
-    XXH3_128bits_reset(&key);
-    uint64_t head[2] = {res->serial, (uint64_t)t->has_bg << 32 | t->bg};
-    XXH3_128bits_update(&key, head, sizeof head);
-    int32_t covered = 0, gap = -1;
-    bool ok = true;
-    t->cmds.len = 0;
-    if (!push(t, (shr__lcmd){0})) return SHR_E_NO_MEMORY;
+    size_t most = 4 * (size_t)t->cols + 2; /* cache pair, a background and three commands per cell */
+    t->cmds.len = t->keys.len = 0;
+    if (!shr__vec_reserve(&t->cmds, &t->al, most) || !shr__vec_reserve(&t->keys, &t->al, most))
+        return SHR_E_NO_MEMORY;
+    shr__lcmd *cmds = t->cmds.data, *out = cmds + 1;
+    uint64_t *keys = t->keys.data, *k = keys;
+    *k++ = res->serial, *k++ = (uint64_t)t->has_bg << 32 | t->bg;
+    int32_t covered = 0, run = -1;
+    shr_color run_color = 0;
+    for (int32_t c = 0; c <= t->cols; c++) {
+        const shr__cell *e = &row[c < t->cols ? c : 0];
+        if (c < t->cols && e->kind == CELL_CONT) continue;
+        bool head = c < t->cols && e->kind == CELL_HEAD, bg = head && (e->style.flags & SHR_STYLE_BG);
+        bool filled = c < t->cols && (bg || t->has_bg);
+        shr_color color = bg ? e->style.bg : t->bg;
+        if (run >= 0 && (!filled || color != run_color))
+            *out++ = (shr__lcmd){SHR__LCMD_FILL, 0, {run * SHR_CELL_WIDTH, y, c * SHR_CELL_WIDTH, y + SHR_CELL_HEIGHT},
+                                 {0, 0}, run_color, NULL, 0, {0}},
+            run = -1;
+        if (filled && run < 0) run = c, run_color = color;
+        if (!head) continue;
+        covered += filled ? e->span : 0;
+        k[0] = (uint64_t)c << 32 | e->span, k[1] = (uint64_t)e->style.fg << 32 | e->style.bg;
+        k[2] = (uint64_t)e->style.flags << 1 | e->has_glyph, k[3] = e->glyph, k += 4;
+    }
     for (int32_t c = 0; c < t->cols; c++) {
         const shr__cell *e = &row[c];
-        if (e->kind == CELL_EMPTY) {
-            if (gap < 0 && t->has_bg) gap = c;
-            continue;
-        }
-        ok &= fill_gap(t, &gap, c, y);
-        if (e->kind != CELL_HEAD) continue;
-        uint32_t f = e->style.flags, blink = (f & SHR_STYLE_BLINK) ? SHR__LCMD_BLINK : 0;
-        uint32_t fx = ((f & SHR_STYLE_DIM) ? SHR__LCMD_DIM : 0) | blink;
+        uint32_t f = e->style.flags;
+        if (e->kind != CELL_HEAD || (f & SHR_STYLE_CONCEAL)) continue;
+        uint32_t fx = ((f & SHR_STYLE_DIM) ? SHR__LCMD_DIM : 0) | ((f & SHR_STYLE_BLINK) ? SHR__LCMD_BLINK : 0);
         uint32_t gx = fx | ((f & SHR_STYLE_BOLD) ? SHR__LCMD_BOLD : 0) |
                       ((f & SHR_STYLE_ITALIC) ? SHR__LCMD_ITALIC : 0); /* glyph styles: not on the lines */
-        uint64_t h[4] = {(uint64_t)c << 32 | e->span, (uint64_t)e->style.fg << 32 | e->style.bg,
-                         (uint64_t)f << 1 | e->has_glyph, e->glyph};
-        XXH3_128bits_update(&key, h, sizeof h);
         shr_rect dst = {c * SHR_CELL_WIDTH, y, (c + e->span) * SHR_CELL_WIDTH, y + SHR_CELL_HEIGHT};
-        if ((f & SHR_STYLE_BG) || t->has_bg) {
-            ok &= push(t, (shr__lcmd){SHR__LCMD_FILL, 0, dst, {0, 0}, (f & SHR_STYLE_BG) ? e->style.bg : t->bg, NULL, 0, {0}});
-            covered += e->span;
-        }
-        if (!(f & SHR_STYLE_CONCEAL)) {
-            if (e->has_glyph)
-                ok &= push(t, (shr__lcmd){SHR__LCMD_GLYPH, gx, dst,
-                                          {dst.x0, dst.y0}, e->style.fg, res, e->glyph, {0}});
-            if (f & SHR_STYLE_UNDERLINE)
-                ok &= push(t, (shr__lcmd){SHR__LCMD_FILL, fx, {dst.x0, y + lm.underline_y, dst.x1, y + lm.underline_y + 1},
-                                          {0, 0}, e->style.fg, NULL, 0, {0}});
-            if (f & SHR_STYLE_STRIKE)
-                ok &= push(t, (shr__lcmd){SHR__LCMD_FILL, fx, {dst.x0, y + lm.strike_y, dst.x1, y + lm.strike_y + 1},
-                                          {0, 0}, e->style.fg, NULL, 0, {0}});
-        }
+        if (e->has_glyph)
+            *out++ = (shr__lcmd){SHR__LCMD_GLYPH, gx, dst, {dst.x0, dst.y0}, e->style.fg, res, e->glyph, {0}};
+        if (f & SHR_STYLE_UNDERLINE)
+            *out++ = (shr__lcmd){SHR__LCMD_FILL, fx, {dst.x0, y + lm.underline_y, dst.x1, y + lm.underline_y + 1},
+                                 {0, 0}, e->style.fg, NULL, 0, {0}};
+        if (f & SHR_STYLE_STRIKE)
+            *out++ = (shr__lcmd){SHR__LCMD_FILL, fx, {dst.x0, y + lm.strike_y, dst.x1, y + lm.strike_y + 1},
+                                 {0, 0}, e->style.fg, NULL, 0, {0}};
     }
-    if (!(ok & fill_gap(t, &gap, t->cols, y))) return SHR_E_NO_MEMORY;
-    if (t->cmds.len == 1) return shr__lyr_group_set(t->layer, (uint32_t)r, NULL, 0);
-    if (covered < t->cols && !t->has_bg)
-        return shr__lyr_group_set(t->layer, (uint32_t)r, SHR_VEC_AT(&t->cmds, shr__lcmd, 1), t->cmds.len - 1);
-    if (!push(t, (shr__lcmd){.kind = SHR__LCMD_CACHE_END})) return SHR_E_NO_MEMORY;
-    XXH128_hash_t k = XXH3_128bits_digest(&key);
-    *SHR_VEC_AT(&t->cmds, shr__lcmd, 0) = (shr__lcmd){SHR__LCMD_CACHE_BEGIN, 0, {0, y, t->cols * SHR_CELL_WIDTH, y + SHR_CELL_HEIGHT},
-                                                      {0, 0}, 0, NULL, 0, {k.low64, k.high64}};
-    return shr__lyr_group_set(t->layer, (uint32_t)r, t->cmds.data, t->cmds.len);
+    size_t n = (size_t)(out - cmds);
+    if (n == 1) return shr__lyr_group_set(t->layer, (uint32_t)r, NULL, 0);
+    if (covered < t->cols && !t->has_bg) return shr__lyr_group_set(t->layer, (uint32_t)r, cmds + 1, n - 1);
+    XXH128_hash_t h = XXH3_128bits(keys, (size_t)(k - keys) * sizeof(*keys));
+    cmds[0] = (shr__lcmd){SHR__LCMD_CACHE_BEGIN, 0, {0, y, t->cols * SHR_CELL_WIDTH, y + SHR_CELL_HEIGHT},
+                          {0, 0}, 0, NULL, 0, {h.low64, h.high64}};
+    *out = (shr__lcmd){.kind = SHR__LCMD_CACHE_END};
+    return shr__lyr_group_set(t->layer, (uint32_t)r, cmds, n + 1);
 }
 
 /* Changed rows are rebuilt once per submit; rows that fail stay dirty for the next one. */
@@ -195,6 +184,7 @@ static void tilemap_destroy(void *state) {
     shr__alloc al = t->al;
     free_grid(t);
     shr__vec_free(&t->cmds, &al);
+    shr__vec_free(&t->keys, &al);
     shr__bitmap_font_res(t->font)->users--;
     SHR_DELETE(&al, t, shr__tilemap);
 }
@@ -246,6 +236,7 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
         } else {
             *t = (shr__tilemap){.al = *al, .layer = layer, .font = font};
             SHR_VEC_INIT(&t->cmds, shr__lcmd);
+            SHR_VEC_INIT(&t->keys, uint64_t);
             if ((st = shr__lyr_attach(layer, &tilemap_kind, t, tilemap_destroy, flush)) != SHR_OK)
                 SHR_DELETE(al, t, shr__tilemap), t = NULL;
             else

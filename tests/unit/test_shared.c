@@ -78,7 +78,7 @@ TEST vec_grows_by_doubling_and_keeps_contents(void) {
     SHR_VEC_INIT(&v, uint32_t);
     for (uint32_t i = 0; i < 9; i++) {
         uint32_t *p = shr__vec_push(&v, &al);
-        ASSERT(p && *p == 0);
+        ASSERT(p);
         *p = i * 3;
     }
     ASSERT_EQ_LL(v.len, 9);

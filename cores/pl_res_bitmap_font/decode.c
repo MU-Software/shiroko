@@ -40,7 +40,7 @@ const uint8_t *shr__box_payload(shr_pl_res_bitmap_font *f, const shr__box *b, co
 
 bool shr__page_decode(shr_pl_res_bitmap_font *f, const shr__page *p, const shr__streams *s, uint8_t *atlas,
                       uint8_t *recs) {
-    size_t n = (size_t)shr__rd16(shr__page_rec(p) + 28) * p->pkg->stride;
+    size_t n = (size_t)shr__page_height(p) * p->pkg->stride;
     if (s->method)
         return unzstd(f, s->atlas, s->atlas_n, atlas, n) && unzstd(f, s->recs, s->recs_n, recs, shr__page_recs(p)) &&
                shr__page_valid(p, atlas, recs);

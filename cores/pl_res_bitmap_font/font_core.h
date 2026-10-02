@@ -5,9 +5,11 @@
 #include "shr_hash.h"
 #include "shr_lru.h"
 
-#define SHR_PKG_VERSION 5
+#define SHR_PKG_VERSION 6
 #define SHR_PKG_HEADER 128
-#define SHR_PKG_ENTRY 32 /* sidx and ptab entries */
+#define SHR_PKG_ENTRY 32 /* sidx entries */
+#define SHR_PKG_PTAB 24  /* ptab entries */
+#define SHR_PKG_CTRI 2192 /* offset of the ctri level-2 blocks */
 #define SHR_PKG_MAX_BOXES 32
 #define SHR_PKG_MAX_RECORDS (1u << 22)
 #define SHR_PKG_MAX_PAGES (1u << 16)
@@ -23,6 +25,10 @@
 #else
 #define SHR_PKG_FEATURES 7u
 #endif
+/* Glyph values besides page << 12 | record: no glyph, a glyph that draws nothing, a cluster not looked up yet. */
+#define SHR_GID_MISS 0xFFFFFFFFu
+#define SHR_GID_BLANK 0xFFFFFFFEu
+#define SHR_GID_UNKNOWN 0xFFFFFFFDu
 #define SHR_MAX_CELL_SIZE 1024
 #define SHR_FONT_MAX_CLUSTERS (1u << 16)
 
@@ -31,9 +37,9 @@ enum { ROLE_BUILTIN, ROLE_LATIN, ROLE_CJK, ROLE_SYMBOLS, ROLE_EMOJI, ROLE_NERD, 
 enum { PKG_UNOPENED, PKG_ABSENT, PKG_LOADING, PKG_READY, PKG_FAILED };
 enum { LOAD_HEADER, LOAD_INDEX, LOAD_META };
 enum { PAGE_ABSENT, PAGE_LOADING, PAGE_READY, PAGE_FAILED };
-enum { GLYPH_READY, GLYPH_PENDING, GLYPH_MISSING, GLYPH_NO_MEMORY };
+enum { GLYPH_READY, GLYPH_PENDING, GLYPH_MISSING, GLYPH_BLANK, GLYPH_NO_MEMORY };
 /* The metadata boxes, in their file order. */
-enum { BOX_MANI, BOX_STRS, BOX_SRCS, BOX_INST, BOX_CMAP, BOX_SEQS, BOX_POOL, BOX_PTAB, BOX_COVR, BOX_COUNT };
+enum { BOX_MANI, BOX_STRS, BOX_SRCS, BOX_INST, BOX_CTRI, BOX_SEQS, BOX_POOL, BOX_PTAB, BOX_COVR, BOX_COUNT };
 
 /* Attempts of a package or page. A failed or refused one runs again from `at` or once a source signals
  * readiness after `ready` was read. One waiting for memory (`wake` set) runs again once the font's wake moved
@@ -93,8 +99,8 @@ struct shr__pkg {
     uint8_t order[BOX_COUNT], nbox; /* the boxes present, by offset */
     uint64_t lo, hi, end;           /* the metadata region; the end of the last indexed box */
     shr__retry retry;
-    uint32_t nglyphs, ncmap, nseqs, npages;
-    const uint8_t *cmap, *seqs, *pool, *ptab;
+    uint32_t nseqs, npages;
+    const uint8_t *ctri, *ctri_data, *seqs, *pool, *ptab; /* ctri_data: its data blocks */
     uint8_t format;
     int16_t baseline;
     uint16_t atlas_w, atlas_h; /* the page shape */
@@ -108,6 +114,7 @@ typedef struct shr__cluster {
     uint32_t off;
     uint8_t n, kind;
     uint32_t cp;
+    uint32_t gid[ROLE_COUNT]; /* glyph value per package once it is ready, else SHR_GID_UNKNOWN */
 } shr__cluster;
 
 struct shr_pl_res_bitmap_font {
@@ -160,13 +167,21 @@ static inline uint64_t shr__io_tag(const shr__pkg *pkg, uint32_t page_plus_one) 
     return (uint64_t)pkg->role << 32 | page_plus_one;
 }
 
-static inline const uint8_t *shr__page_rec(const shr__page *p) { return p->pkg->ptab + SHR_PKG_ENTRY * (uint64_t)p->index; }
+static inline const uint8_t *shr__page_rec(const shr__page *p) { return p->pkg->ptab + SHR_PKG_PTAB * (uint64_t)p->index; }
 static inline uint32_t shr__page_length(const shr__page *p) { return shr__rd32(shr__page_rec(p) + 16); }
-static inline size_t shr__page_recs(const shr__page *p) { return 16 * (size_t)shr__rd32(shr__page_rec(p) + 24); }
+static inline size_t shr__page_recs(const shr__page *p) { return 16 * (size_t)shr__rd16(shr__page_rec(p) + 20); }
+static inline uint32_t shr__page_height(const shr__page *p) { return shr__rd16(shr__page_rec(p) + 22); }
 
-/* Bytes of `meta` a box takes: none when stored in a mapped package (used in place). */
+/* The glyph value of scalar `cp` (at most 0x10FFFF). */
+static inline uint32_t shr__ctri_get(const shr__pkg *pkg, uint32_t cp) {
+    uint32_t b = shr__rd16(pkg->ctri + 16 + 2 * (cp >> 10));
+    uint32_t d = shr__rd16(pkg->ctri + SHR_PKG_CTRI + 128 * b + 2 * (cp >> 4 & 63));
+    return shr__rd32(pkg->ctri_data + 64 * d + 4 * (cp & 15));
+}
+
+/* Bytes of `meta` a box takes, in multiples of 64: none when stored in a mapped package (used in place). */
 static inline size_t shr__box_room(const shr__pkg *pkg, const shr__box *b) {
-    return (((size_t)b->raw + 7) & ~(size_t)7) * ((pkg->mapped == 0) | (b->flags >> 4));
+    return (((size_t)b->raw + 63) & ~(size_t)63) * ((pkg->mapped == 0) | (b->flags >> 4));
 }
 
 /* The streams of a page box. */

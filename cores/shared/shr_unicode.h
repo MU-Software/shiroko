@@ -41,25 +41,21 @@ extern const uint32_t shr__text_rules_version;
 extern const uint32_t shr__cluster_max_scalars;
 extern const uint32_t shr__cluster_max_bytes;
 extern const uint32_t shr__tab_stop;
-extern const uint32_t shr__prop_range_count;
-extern const uint32_t shr__prop_range_start[];
-extern const uint32_t shr__prop_range_value[];
+extern const uint16_t shr__uprop_l1[1088];
+extern const uint16_t shr__uprop_l2[];
+extern const uint8_t shr__uprop_data[];
+extern const uint32_t shr__uprop_values[];
 extern const uint32_t shr__emoji_seq_count;
 extern const uint32_t shr__emoji_seq_pool[];
 extern const shr__seq_ref shr__emoji_seq_index[];
 extern const uint32_t shr__emoji_vs_base_count;
 extern const uint32_t shr__emoji_vs_base[];
 
+/* Values above U+10FFFF read as U+10FFFF; a sign mask, as a compare-select branches on RV32. */
 static inline uint32_t shr__uprops(uint32_t cp) {
-    uint32_t lo = 0, hi = shr__prop_range_count;
-    while (hi - lo > 1) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (shr__prop_range_start[mid] <= cp)
-            lo = mid;
-        else
-            hi = mid;
-    }
-    return shr__prop_range_value[lo];
+    cp ^= (cp ^ 0x10FFFFu) & (uint32_t)((0x10FFFF - (int64_t)cp) >> 32);
+    uint32_t data = shr__uprop_l2[(uint32_t)shr__uprop_l1[cp >> 10] << 6 | (cp >> 4 & 63)];
+    return shr__uprop_values[shr__uprop_data[data << 4 | (cp & 15)]];
 }
 
 static inline unsigned shr__gcb(uint32_t p) { return p & 0x0F; }

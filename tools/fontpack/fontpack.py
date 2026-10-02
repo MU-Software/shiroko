@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build, verify and install Shiroko bitmap font packages (format v5, docs/font-package-format.md).
+"""Build, verify and install Shiroko bitmap font packages (format v6, docs/font-package-format.md).
 
   fontpack.py fetch                 download pinned inputs into $SHIROKO_FONT_CACHE/src (.cache/fonts/src)
   fontpack.py build --cell WxH [PACKAGE ...]   build packages (default set) for one cell size into build/fonts;
       --out DIR --scalars 0041-005A,AC00       never downloads; --scalars builds reduced packages (fuzz seeds),
       --page-atlas WxH                         --page-atlas forces one page shape for both formats,
-      --method zstd|stored --store-index       --method stored stores every box, --store-index cmap/seqs/pool
+      --method zstd|stored --store-index       --method stored stores every box, --store-index ctri/seqs/pool
   fontpack.py builtin --cell WxH --out FILE.c  write the built-in package (ASCII + U+FFFD, stored) as a C array
       [--page-atlas WxH]
   fontpack.py verify FILE ...       check every box, page and glyph of packages
@@ -52,8 +52,8 @@ OUT = ROOT / "build" / "fonts"
 LOCK = json.loads((FONTS / "fonts.lock.json").read_text(encoding="utf-8"))
 CONFIG = json.loads((FONTS / "fontpack.config.json").read_text(encoding="utf-8"))
 UNICODE_C = os.environ.get("SHIROKO_UNICODE_TABLES")
-VERSION = "fontpack 5"
-FORMAT_VERSION = 5
+VERSION = "fontpack 6"
+FORMAT_VERSION = 6
 LOAD_FLAGS = {"target_light": freetype.FT_LOAD_TARGET_LIGHT, "target_normal": freetype.FT_LOAD_TARGET_NORMAL}
 RENDER_MODES = {"normal": freetype.FT_RENDER_MODE_NORMAL, "light": freetype.FT_RENDER_MODE_LIGHT}
 
@@ -65,14 +65,17 @@ HEADER_SIZE = 128
 BOX = struct.Struct("<I4sHHI")  # size, type, version, flags, raw_size
 HEAD = struct.Struct("<I4sHHIHHIIIQQ32sQ32xQ")
 ENTRY = struct.Struct("<4sHHQIIQ")  # sidx entry: type, flags, version, offset, size, raw_size, xxh3
-PTAB = struct.Struct("<QQIIIHH")  # offset, xxh3, size, first_glyph, glyph_count, height, 0
+PTAB = struct.Struct("<QQIHH")  # offset, xxh3, size, glyph_count, height
 RECORD = struct.Struct("<HHBBbbBBHI")
 REQUIRED, STORED, ZSTD = 1, 0, 1
 MAGIC = b"\x80\0\0\0shrf"
-META = (b"mani", b"strs", b"srcs", b"inst", b"cmap", b"seqs", b"pool", b"ptab", b"covr")
-PACKED = (b"cmap", b"seqs", b"pool")  # the metadata boxes that may be zstd
+META = (b"mani", b"strs", b"srcs", b"inst", b"ctri", b"seqs", b"pool", b"ptab", b"covr")
+PACKED = (b"ctri", b"seqs", b"pool")  # the metadata boxes that may be zstd
 MAX_INDEX = 32
 PAGE_ALIGN = 256  # stored atlases, so a mapped page can be a driver buffer in place
+CTRI_ALIGN = 64  # stored ctri data blocks
+CTRI_L2 = 2192  # ctri: header and L1 (1088 u16) before the level-2 blocks
+MISS, BLANK = 0xFFFFFFFF, 0xFFFFFFFE
 SHAPE_SIDES = (64, 128, 256, 512)
 MAX_PAGE_RECORDS = 4096
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
@@ -489,17 +492,15 @@ def layout(records, fmt, shape, limit=1 << 16):
     while g < len(records) and len(pages) < limit:
         first, x, y, shelf, pos = g, 0, 0, 0, []
         while g < len(records) and g - first < CONFIG["max_page_records"]:
-            w, h, rows = records[g][0], records[g][1], records[g][6]
-            px = py = 0
-            if rows:
-                if x + span(fmt, w) > aw:
-                    x, y, shelf = 0, y + shelf, 0
-                if y + h > ah:
-                    break
-                px, py, x, shelf = x, y, x + span(fmt, w), max(shelf, h)
-            pos.append((px, py))
+            w, h = records[g][:2]
+            if x + span(fmt, w) > aw:
+                x, y, shelf = 0, y + shelf, 0
+            if y + h > ah:
+                break
+            pos.append((x, y))
+            x, shelf = x + span(fmt, w), max(shelf, h)
             g += 1
-        pages.append((first, pos, max(1, y + shelf)))
+        pages.append((first, pos, y + shelf))
     return pages, g == len(records)
 
 
@@ -508,7 +509,7 @@ def page_shape(records, fmt, name):
     key = format_key(fmt)
     default = tuple(CONFIG["page_atlas"][key])
     fits = [tuple(s) for s in CONFIG["page_shapes"][key]
-            if all(not r[6] or (span(fmt, r[0]) <= s[0] and r[1] <= s[1]) for r in records)]
+            if all(span(fmt, r[0]) <= s[0] and r[1] <= s[1] for r in records)]
     if default not in fits:
         sys.exit(f"{name}: a glyph exceeds the {default[0]}x{default[1]} page atlas")
     best = None
@@ -521,7 +522,7 @@ def page_shape(records, fmt, name):
 
 
 def pack_pages(records, fmt, shape):
-    """Pages (first, count, height, atlas, records): every page H rows tall but the last, trimmed to its glyphs."""
+    """Pages (count, height, atlas, records): every page H rows tall but the last, trimmed to its glyphs."""
     aw, ah = shape
     stride = atlas_stride(fmt, aw)
     placed, _ = layout(records, fmt, shape)
@@ -529,16 +530,33 @@ def pack_pages(records, fmt, shape):
     for n, (first, pos, rows) in enumerate(placed):
         height = rows if n == len(placed) - 1 else ah
         atlas, recs = bytearray(stride * height), bytearray()
-        for g, (px, py) in enumerate(pos, first):
-            w, h, bx, top, flags, gid, rows_ = records[g]
+        for (w, h, bx, top, flags, gid, bitmap), (px, py) in zip(records[first:], pos):
             at = px // 2 if fmt == FMT_A4 else px
-            for r, row in enumerate(rows_ or ()):
+            for r, row in enumerate(bitmap):
                 atlas[(py + r) * stride + at:(py + r) * stride + at + len(row)] = row
-            used += span(fmt, w) * h if rows_ else 0
+            used += span(fmt, w) * h
             recs += RECORD.pack(px, py, w, h, bx, top, flags, 0, gid & 0xFFFF, 0)
-        pages.append((first, len(pos), height, bytes(atlas), bytes(recs)))
+        pages.append((len(pos), height, bytes(atlas), bytes(recs)))
         area += aw * height
     return pages, used / area
+
+
+def ctri_table(glyphs):
+    """The ctri payload of {scalar: glyph value}: level-2 and data blocks shared by content, block 0 empty."""
+    l2, data, used, l1 = {(0,) * 64: 0}, {(MISS,) * 16: 0}, {cp >> 4 for cp in glyphs}, []
+    for hi in range(0x110000 >> 10):
+        row = tuple(data.setdefault(tuple(glyphs.get(b << 4 | i, MISS) for i in range(16)), len(data))
+                    if b in used else 0 for b in range(hi << 6, hi + 1 << 6))
+        l1.append(l2.setdefault(row, len(l2)))
+    if len(data) > 1 << 16:
+        sys.exit(f"ctri: {len(data)} data blocks exceed 65536")
+    out = bytearray(struct.pack("<II8x1088H", len(l2), len(data), *l1))
+    for row in l2:
+        out += struct.pack("<64H", *row)
+    out += bytes(-len(out) % CTRI_ALIGN)
+    for block in data:
+        out += struct.pack("<16I", *block)
+    return bytes(out)
 
 
 def zstd(raw):
@@ -575,8 +593,8 @@ def decode(method, s, expected):
 
 
 def assemble(profile_id, features, meta, pages, method="zstd", store_index=False, tamper=None, extra=()):
-    """The package bytes. meta: raw payload by box type (ptab is laid out here); pages: (first, count, height,
-    atlas, records); extra: (type, flags, payload) boxes indexed after covr. tamper(type, page, raws, method,
+    """The package bytes. meta: raw payload by box type (ptab is laid out here); pages: (count, height, atlas,
+    records); extra: (type, flags, payload) boxes indexed after covr. tamper(type, page, raws, method,
     streams) -> (method, streams) changes encoded streams before layout and hashing."""
     def encode(t, i, raws, packed):
         streams = [zstd(r) for r in raws] if packed else []
@@ -596,30 +614,32 @@ def assemble(profile_id, features, meta, pages, method="zstd", store_index=False
             boxes.append([t, (0 if t == b"covr" else REQUIRED) | m << 4, len(meta[t]), data])
     boxes += [[t, flags, len(data), data] for t, flags, data in extra]
     encoded = []
-    for i, (first, count, height, atlas, recs) in enumerate(pages):
+    for i, (count, height, atlas, recs) in enumerate(pages):
         m, (a, r) = encode(b"page", i, [atlas, recs], zip_pages)
         encoded.append((m, BOX.pack(16 + 8 + len(a) + len(r), b"page", 0, REQUIRED | m << 4, 8 + len(atlas) + len(recs))
                         + struct.pack("<II", i, len(a)) + a + r))
     sidx_size = 24 + ENTRY.size * len(boxes)
     off = HEADER_SIZE + sidx_size
     for b in boxes:
-        b.append(off)
-        off += 16 + (b[2] if b[3] is None else len(b[3]))
+        gap = -(off + 16) % CTRI_ALIGN if b[0] == b"ctri" and b[1] >> 4 == STORED else 0
+        gap += CTRI_ALIGN if 0 < gap < 16 else 0
+        b += [gap, off + gap]
+        off += gap + 16 + (b[2] if b[3] is None else len(b[3]))
     tail, ptab = bytearray(), bytearray()
-    for (m, page), (first, count, height, _, _) in zip(encoded, pages):
+    for (m, page), (count, height, _, _) in zip(encoded, pages):
         gap = -(off + len(tail) + 24) % PAGE_ALIGN if m == STORED else 0
         if gap:
             gap += PAGE_ALIGN if gap < 16 else 0
             tail += BOX.pack(gap, b"free", 0, 0, gap - 16) + bytes(gap - 16)
-        ptab += PTAB.pack(off + len(tail), xxh3(page), len(page), first, count, height, 0)
+        ptab += PTAB.pack(off + len(tail), xxh3(page), len(page), count, height)
         tail += page
     ptab = bytes(ptab)
     next(b for b in boxes if b[0] == b"ptab")[3] = tamper(b"ptab", 0, [ptab], STORED, [ptab])[1][0] if tamper else ptab
     body, entries = bytearray(), bytearray()
-    for t, flags, raw, data, at in boxes:
+    for t, flags, raw, data, gap, at in boxes:
         box = BOX.pack(16 + len(data), t, 0, flags, raw) + data
         entries += ENTRY.pack(t, flags, 0, at, len(box), raw, xxh3(box))
-        body += box
+        body += (BOX.pack(gap, b"free", 0, 0, gap - 16) + bytes(gap - 16) if gap else b"") + box
     sidx = BOX.pack(sidx_size, b"sidx", 0, REQUIRED, sidx_size - 16) + struct.pack("<II", len(boxes), 0) + entries
     zipped = any(b[1] >> 4 & 15 == ZSTD for b in boxes) or any(m == ZSTD for m, _ in encoded)
     size = HEADER_SIZE + len(sidx) + len(body) + len(tail)
@@ -634,11 +654,7 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
     regular = faces[pkg["faces"]["regular"]]
     cmap, seqs = plan_keys(profile, pkg, regular, scalars, ivd, report, keep)
 
-    slot_keys, slot_of = [], {}
-    for key in list(cmap.values()) + [v[1] for v in seqs.values()]:
-        if key not in slot_of:
-            slot_of[key] = len(slot_keys)
-            slot_keys.append(key)
+    slot_keys = list(dict.fromkeys(list(cmap.values()) + [v[1] for v in seqs.values()]))
 
     latin_face = faces[CONFIG["packages"]["latin"]["faces"]["regular"]]
     baseline, underline, strike = size_metrics(latin_face, size)
@@ -647,7 +663,7 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
     em = fit_ppem(latin_face, "latin", size, baseline)
     inst_ppem, lift = (cjk_ppem(regular, scalars, size, baseline, em) if role == "cjk"
                        else (fit_ppem(regular, role, size, baseline), 0))
-    glyph_records, bitmaps = [], []
+    glyph_records, bitmaps, record_of = [], [], []
     clipped = notdef = 0
     for key in slot_keys:
         kind, v = key
@@ -675,7 +691,7 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
             ppem *= min(cells * cw / len(rows[0]), lh / len(rows)) * 0.98
             rows, left, top, advance = raster(regular, gid, ppem)
         if rows is None:
-            glyph_records.append((0, 0, 0, 0, cells << 2, gid, None))
+            record_of.append(None)
             continue
         w, h = len(rows[0]), len(rows)
         if box:
@@ -689,10 +705,12 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
         packed = pack_rows(rows, fmt)
         if not (-128 <= bx <= 127 and -128 <= top <= 127 and w < 256 and h < 256):
             sys.exit(f"{name}: glyph {key} exceeds record range")
+        record_of.append(len(glyph_records))
         glyph_records.append((w, h, bx, top, fmt | (cells << 2), gid, packed))
         bitmaps.append(sum(map(len, packed)))
-    report.update(slots=len(slot_keys), clipped=clipped, notdef=notdef, bitmap_bytes=sum(bitmaps))
-    if not slot_keys:
+    report.update(slots=len(slot_keys), blank=len(slot_keys) - len(glyph_records), clipped=clipped, notdef=notdef,
+                  bitmap_bytes=sum(bitmaps))
+    if not glyph_records:
         sys.exit(f"{name}: the build has no glyphs")
 
     keys = [(k,) if isinstance(k, int) else k for k in cmap] + list(seqs)
@@ -702,9 +720,10 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
         sys.exit(f"{name}: key of {longest} scalars/{longest_bytes} bytes exceeds the profile limit")
     report.update(max_key_scalars=longest, max_key_bytes=longest_bytes)
 
-    nglyphs = len(slot_keys)
     shape = page_shape(glyph_records, fmt, name)
     pages, fill = pack_pages(glyph_records, fmt, shape)
+    values = [n << 12 | r for n, page in enumerate(pages) for r in range(page[0])]
+    glyph_of = {k: BLANK if r is None else values[r] for k, r in zip(slot_keys, record_of)}
 
     strings = bytearray()
 
@@ -720,7 +739,7 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
               f"raster {CONFIG['raster']['load']}/{CONFIG['raster']['render']}; "
               f"shaping {shaping_script(role)}/{SHAPING['language']}/{SHAPING['direction']}/default features")
     pname = s(f"shiroko-{name}")
-    meta = {b"mani": struct.pack("<B3x8sIIIIII", ROLES[role], locale, *pname, *build, nglyphs, len(pages))}
+    meta = {b"mani": struct.pack("<B3x8sIIIIII", ROLES[role], locale, *pname, *build, len(values), len(pages))}
     meta[b"srcs"] = struct.pack("<II32sII", *s(regular.id), bytes.fromhex(LOCK["faces"][regular.id]["sha256"]),
                                 *s(spdx_expression(LOCK["licenses"][pkg["license"]])))
     meta[b"strs"] = bytes(strings)
@@ -729,24 +748,24 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
                                     sort_keys=True).encode()).digest()[:16]
     meta[b"inst"] = struct.pack("<HBBHHIhhhH16sHH8x", 0, 0, fmt, lh, cw, round(inst_ppem * 64), baseline, underline,
                                 strike, 1, iid, *shape)
-    meta[b"cmap"] = b"".join(struct.pack("<II", cp, slot_of[k]) for cp, k in sorted(cmap.items()))
+    meta[b"ctri"] = ctri_table({cp: glyph_of[k] for cp, k in cmap.items()})
     pool, seq_recs = [], bytearray()
     for key in sorted(seqs):
         kind, target = seqs[key]
-        seq_recs += struct.pack("<BBHII", len(key), kind, 0, len(pool), slot_of[target])
+        seq_recs += struct.pack("<BBHII", len(key), kind, 0, len(pool), glyph_of[target])
         pool.extend(key)
     if seqs:
         meta[b"seqs"], meta[b"pool"] = bytes(seq_recs), struct.pack(f"<{len(pool)}I", *pool)
     meta[b"covr"] = struct.pack("<9I", len(cmap), sum(1 for k in seqs.values() if k[0] == SEQ_GLYPH),
                                 sum(1 for k in seqs.values() if k[0] == SEQ_ALIAS), report.get("uvs", 0),
                                 report.get("ivs", 0), report.get("emoji_unsupported", 0), 0,
-                                len(glyph_records), sum(bitmaps))
+                                len(values), sum(bitmaps))
     features = (FEAT_SEQ if seqs else 0) | (FEAT_A4 if fmt == FMT_A4 else FEAT_A8)
     blob = assemble(profile.id, features, meta, pages, method, store_index)
     report.update(file_bytes=len(blob), pages=len(pages), shape=f"{shape[0]}x{shape[1]}",
                   index_bytes=PTAB.unpack_from(blob, box_offset(blob, b"ptab") + 16)[0],
-                  atlas_raw_bytes=sum(len(p[3]) for p in pages), atlas_fill=round(fill, 4), package_id=sha256(blob),
-                  cmap=len(cmap), sequences=len(seqs))
+                  atlas_raw_bytes=sum(len(p[2]) for p in pages), atlas_fill=round(fill, 4), package_id=sha256(blob),
+                  scalars=len(cmap), sequences=len(seqs))
     return blob, report
 
 
@@ -795,10 +814,11 @@ class Package:
     def __init__(self, blob, profile_id, max_scalars):
         self.blob = blob
         check(len(blob) >= HEADER_SIZE, "shorter than a header")
-        check(blob[:8] != b"SHRFPKG1", "format v4 package: rebuild with fontpack 5")
+        check(blob[:8] != b"SHRFPKG1", "format v4 package: rebuild with fontpack 6")
         check(blob[:8] == MAGIC, "bad magic")
         (_, _, ver, flags, raw, fver, zero, feat, _, sidx_size, fsize, soff, self.profile, sidx_digest,
          digest) = HEAD.unpack_from(blob)
+        check(fver != 5, "format v5 package: rebuild with fontpack 6")
         check(ver == 0 and flags == REQUIRED and raw == HEADER_SIZE - 16 and fver == FORMAT_VERSION and zero == 0,
               "header version")
         check(digest == xxh3(blob[:120]), "header checksum")
@@ -831,7 +851,7 @@ class Package:
                   and (method == STORED or (t in PACKED and feat & FEAT_ZSTD)), f"{t!r} flags")
             check(raw == size - 16 if method == STORED else raw > size - 16, f"{t!r} raw size")
             boxes[t] = (off, size, flags, raw, digest)
-        check(all(t in boxes for t in (b"mani", b"inst", b"cmap", b"ptab")), "missing box")
+        check(all(t in boxes for t in (b"mani", b"inst", b"ctri", b"ptab")), "missing box")
         check(max(o + s for o, s, *_ in boxes.values()) - min(o for o, *_ in boxes.values()) <= 128 << 20
               and sum(b[3] for b in boxes.values()) <= 128 << 20, "package index too large")
 
@@ -866,13 +886,22 @@ class Package:
         check(raster & ~1 == 0 and reserved == bytes(8), "instance reserved bytes")
         check(aw in SHAPE_SIDES and ah in SHAPE_SIDES, "instance page shape")
         self.atlas = (aw, ah, atlas_stride(fmt, aw))
-        cmap = meta[b"cmap"]
-        check(len(cmap) % 8 == 0 and len(cmap) // 8 <= 1 << 22, "cmap size")
-        self.cmap = dict(struct.iter_unpack("<II", cmap))
-        keys = list(self.cmap)
-        check(all(cp <= 0x10FFFF and not 0xD800 <= cp <= 0xDFFF and slot < self.nglyphs
-                  for cp, slot in self.cmap.items()), "cmap record")
-        check(len(keys) == len(cmap) // 8 and keys == sorted(keys), "cmap order")
+        ctri = meta[b"ctri"]
+        check(len(ctri) >= CTRI_L2, "ctri size")
+        l2n, dn, z0, z1 = struct.unpack_from("<IIII", ctri)
+        check(1 <= l2n <= 1 << 16 and 1 <= dn <= 1 << 16 and z0 == z1 == 0, "ctri header")
+        d = CTRI_L2 + 128 * l2n + 63 & ~63
+        check(len(ctri) == d + 64 * dn, "ctri size")
+        check(not any(ctri[CTRI_L2 + 128 * l2n:d]), "ctri padding")
+        l1 = struct.unpack_from("<1088H", ctri, 16)
+        l2 = struct.unpack_from(f"<{64 * l2n}H", ctri, CTRI_L2)
+        values = struct.unpack_from(f"<{16 * dn}I", ctri, d)
+        check(max(l1) < l2n and max(l2) < dn, "ctri block number")
+        check(not any(l2[:64]) and set(values[:16]) == {MISS}, "ctri block 0")
+        check(boxes[b"ctri"][2] >> 4 != STORED or (boxes[b"ctri"][0] + 16) % CTRI_ALIGN == 0, "ctri not aligned")
+        self.scalars = {hi << 10 | mid << 4 | i: v for hi, b in enumerate(l1) if b
+                        for mid, block in enumerate(l2[64 * b:64 * b + 64]) if block
+                        for i, v in enumerate(values[16 * block:16 * block + 16]) if v != MISS}
         pool_data = meta.get(b"pool", b"")
         check(len(pool_data) % 4 == 0 and len(pool_data) // 4 <= 1 << 22, "pool size")
         pool = struct.unpack(f"<{len(pool_data) // 4}I", pool_data)
@@ -883,22 +912,25 @@ class Package:
                   "seqs size")
             check(all(cp <= 0x10FFFF and not 0xD800 <= cp <= 0xDFFF for cp in pool), "sequence scalar")
             prev = None
-            for length, kind, zero, idx, slot in struct.iter_unpack("<BBHII", seq_data):
-                check(2 <= length <= max_scalars and 1 <= kind <= 4 and zero == 0 and idx + length <= len(pool)
-                      and slot < self.nglyphs, "sequence record")
+            for length, kind, zero, idx, glyph in struct.iter_unpack("<BBHII", seq_data):
+                check(2 <= length <= max_scalars and 1 <= kind <= 4 and zero == 0 and idx + length <= len(pool),
+                      "sequence record")
                 key = pool[idx:idx + length]
                 check(prev is None or key > prev, "sequence order")
                 prev = key
-                self.seqs[key] = (kind, slot)
+                self.seqs[key] = (kind, glyph)
         check(len(meta[b"ptab"]) == PTAB.size * npages and 1 <= npages <= 1 << 16, "ptab size")
         self.pages = list(PTAB.iter_unpack(meta[b"ptab"]))
-        expect, prev_end = 0, end
-        for off, _, size, first, count, height, zero in self.pages:
-            check(first == expect and 1 <= count <= MAX_PAGE_RECORDS and 1 <= height <= ah and zero == 0
-                  and 24 <= size <= 1 << 20 and off >= prev_end and off + size <= fsize, "page record")
-            expect += count
+        prev_end = end
+        for off, _, size, count, height in self.pages:
+            check(1 <= count <= MAX_PAGE_RECORDS and 1 <= height <= ah and 24 <= size <= 1 << 20 and off >= prev_end
+                  and off + size <= fsize, "page record")
             prev_end = off + size
-        check(expect == self.nglyphs, "pages do not cover every glyph")
+        counts = [p[3] for p in self.pages]
+        check(sum(counts) == self.nglyphs, "pages do not cover every glyph")
+        check(all(v >= BLANK or (v >> 12 < npages and v & 4095 < counts[v >> 12])
+                  for v in set(values) | {g for _, g in self.seqs.values()}), "glyph value")
+        check(self.scalars.get(0x20, MISS) >= BLANK, "U+0020 has a bitmap")
         self.data = [self.check_page(i) for i in range(npages)]
 
         pos, reached = soff + sidx_size, 0
@@ -918,7 +950,7 @@ class Package:
 
     def check_page(self, i):
         """The page's method, atlas and records after rules 26-31."""
-        off, digest, size, first, count, height, _ = self.pages[i]
+        off, digest, size, count, height = self.pages[i]
         aw, ah, stride = self.atlas
         box = self.blob[off:off + size]
         check(xxh3(box) == digest, f"page {i} checksum")
@@ -935,30 +967,22 @@ class Package:
               f"page {i} streams")
         atlas = decode(method, box[24:24 + abytes], height * stride)
         recs = decode(method, box[24 + abytes:], 16 * count)
+        a4 = self.inst[2] == FMT_A4
         for g in range(count):
             x, y, w, h, _, _, flags, zero, _, zero2 = RECORD.unpack_from(recs, 16 * g)
-            fmt, cells = flags & 3, flags >> 2 & 3
-            check(1 <= cells <= 2 and flags & 0xF0 == 0 and zero == zero2 == 0, f"glyph {first + g} flags")
-            if not fmt:
-                check(x == y == w == h == 0, f"glyph {first + g} without bitmap")
-                continue
-            a4 = fmt == FMT_A4
-            check(fmt == self.inst[2] and w and h and not (a4 and x % 2) and x + w <= aw and y + h <= height,
-                  f"glyph {first + g} rect")
+            check(flags & 3 == self.inst[2] and 1 <= flags >> 2 & 3 <= 2 and flags & 0xF0 == 0 and zero == zero2 == 0,
+                  f"page {i} record {g} flags")
+            check(w and h and not (a4 and x % 2) and x + w <= aw and y + h <= height, f"page {i} record {g} rect")
             check(not a4 or w % 2 == 0 or not any(atlas[(y + r) * stride + (x + w) // 2] & 15 for r in range(h)),
-                  f"glyph {first + g} A4 padding")
+                  f"page {i} record {g} A4 padding")
         return method, atlas, recs
 
-    def record(self, slot):
-        """The glyph record of a slot and the atlas of its page."""
-        for (_, _, _, first, count, _, _), (_, atlas, recs) in zip(self.pages, self.data):
-            if first <= slot < first + count:
-                return RECORD.unpack_from(recs, 16 * (slot - first)), atlas
-        raise KeyError(slot)
-
-    def glyph(self, slot):
+    def glyph(self, value):
         """fmt, w, h, bearing_x, top, stride, flags and the bitmap rows packed at stride = row bytes."""
-        (x, y, w, h, bx, top, flags, _, _, _), atlas = self.record(slot)
+        if value == BLANK:
+            return self.inst[2], 0, 0, 0, 0, 0, 0, b"", None
+        _, atlas, recs = self.data[value >> 12]
+        x, y, w, h, bx, top, flags, _, _, _ = RECORD.unpack_from(recs, 16 * (value & 4095))
         stride, fmt = self.atlas[2], flags & 3
         row = (w + 1) // 2 if fmt == FMT_A4 else w
         at = x // 2 if fmt == FMT_A4 else x
@@ -968,7 +992,7 @@ class Package:
     def content(self):
         """What `assemble` takes to write this package again."""
         meta = {t: v for t, v in self.meta.items() if t != b"ptab"}
-        pages = [(p[3], p[4], p[5], atlas, recs) for p, (_, atlas, recs) in zip(self.pages, self.data)]
+        pages = [(p[3], p[4], atlas, recs) for p, (_, atlas, recs) in zip(self.pages, self.data)]
         return self.profile, self.features & ~FEAT_ZSTD, meta, pages
 
 
@@ -1002,10 +1026,10 @@ def cell_fit(pkg):
     """Box/block and Powerline glyphs must reach the cell edges (triangle tips may be partial)."""
     out = {}
     for cp in (0x2588, 0x2502, 0x2500, 0xE0B0, 0xE0B2):
-        if cp not in pkg.cmap:
+        if cp not in pkg.scalars:
             continue
         lh, cw, base = pkg.inst[3], pkg.inst[4], pkg.inst[6]
-        fmt, w, h, bx, top, stride, flags, data, _ = pkg.glyph(pkg.cmap[cp])
+        fmt, w, h, bx, top, stride, flags, data, _ = pkg.glyph(pkg.scalars[cp])
         cov = [[0] * cw for _ in range(lh)]
         for y in range(h):
             for x in range(w):
@@ -1032,16 +1056,16 @@ def cell_fit(pkg):
 def preview(pkg, path, report):
     step = max(1, pkg.nglyphs // 192)
     lh, cw, baseline = pkg.inst[3], pkg.inst[4], pkg.inst[6]
-    slots = list(range(0, pkg.nglyphs, step))[:192]
+    values = [n << 12 | r for n, p in enumerate(pkg.pages) for r in range(p[3])][::step][:192]
     cols = 32
-    img = Image.new("L", (cols * 2 * cw + 8, ((len(slots) + cols - 1) // cols) * lh + 8), 0)
-    for n, slot in enumerate(slots):
-        fmt, w, h, bx, top, stride, flags, data, _ = pkg.glyph(slot)
+    img = Image.new("L", (cols * 2 * cw + 8, ((len(values) + cols - 1) // cols) * lh + 8), 0)
+    for n, value in enumerate(values):
+        fmt, w, h, bx, top, stride, flags, data, _ = pkg.glyph(value)
         ox, oy = 4 + (n % cols) * 2 * cw, 4 + (n // cols) * lh
         for y in range(h):
             for x in range(w):
                 a = (data[y * stride + x // 2] >> (4 if x % 2 == 0 else 0) & 15) * 17 if fmt == FMT_A4 else \
-                    data[y * stride + x] if fmt == FMT_A8 else 0
+                    data[y * stride + x]
                 px, py = ox + bx + x, oy + baseline - top + y
                 if 0 <= px < img.width and 0 <= py < img.height:
                     img.putpixel((px, py), max(img.getpixel((px, py)), a))
@@ -1155,7 +1179,7 @@ def build(names, size, out=None, keep=None, method="zstd", store_index=False):
             reports[name] = report
             print(f"{out / f'shiroko-{name}.shrf'}: {report['file_bytes']} bytes (index {report['index_bytes']}), "
                   f"{report['pages']} pages of {report['shape']}, atlas fill {report['atlas_fill']:.1%}, "
-                  f"{report['cmap']} scalars, {report['sequences']} sequences, clipped {report['clipped']}")
+                  f"{report['scalars']} scalars, {report['sequences']} sequences, clipped {report['clipped']}")
         write_licenses(stage, names, reports)
         (stage / "coverage.json").write_text(json.dumps(reports, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         bad = {n: r["unserved"] for n, r in reports.items() if r.get("unserved")}
@@ -1349,13 +1373,16 @@ def reader_selftest(blob, profile):
     content = pkg.content()
     profile_id, features, meta, pages = content
     last = len(pages) - 1
-    first, count, height, atlas, recs = pages[last]
+    count, height, atlas, recs = pages[last]
     if height >= ah:
         sys.exit("selftest needs a package whose last page is trimmed")
-    glyphs = [(n, i, RECORD.unpack_from(p[4], 16 * i)) for n, p in enumerate(pages) for i in range(p[1])]
+    glyphs = [(n, i, RECORD.unpack_from(p[3], 16 * i)) for n, p in enumerate(pages) for i in range(p[0])]
     odd, g, (x, y, w, h) = next((n, i, r[:4]) for n, i, r in glyphs if r[2] % 2 and r[0] + r[2] + 3 <= aw)
-    low, lg, lh = next((n, i, r[3]) for n, i, r in glyphs if n == last and r[2])
-    blank, bg = next((n, i) for n, i, r in glyphs if not r[2])
+    lg, lh = next((i, r[3]) for n, i, r in glyphs if n == last)
+    tri = meta[b"ctri"]
+    l2n, dn = struct.unpack_from("<II", tri)
+    d = len(tri) - 64 * dn
+    some = min(pkg.scalars)
 
     def zstd_pkg(**kw):
         return assemble(*content, **kw)
@@ -1384,15 +1411,15 @@ def reader_selftest(blob, profile):
 
     def with_page(n, a=None, r=None):
         p = pages[n]
-        return assemble(profile_id, features, meta, pages[:n] + [p[:3] + (a or p[3], r or p[4])] + pages[n + 1:])
+        return assemble(profile_id, features, meta, pages[:n] + [p[:2] + (a or p[2], r or p[3])] + pages[n + 1:])
 
     def poked(data, at, value, fmt="<H"):
         b = bytearray(data)
         struct.pack_into(fmt, b, at, value)
         return bytes(b)
 
-    def inst(at, value, fmt):
-        return lambda: assemble(profile_id, features, meta | {b"inst": poked(meta[b"inst"], at, value, fmt)}, pages)
+    def with_meta(t, data):
+        return lambda: assemble(profile_id, features, meta | {t: data}, pages)
 
     def edit(fn, reseal=True, base=zstd_pkg):
         def build():
@@ -1401,12 +1428,15 @@ def reader_selftest(blob, profile):
             return resealed(b) if reseal else bytes(b)
         return build
 
-    def moved(b):
-        entry = box_offset(b, b"ptab") + 16 + PTAB.size * last
-        off = struct.unpack_from("<Q", b, entry)[0]
-        b[off:off] = BOX.pack(16, b"free", 0, 0, 0)
+    def inserted(b, at):
+        """A 16-byte free box at `at`, every listed box and page behind it moved."""
+        p = box_offset(b, b"ptab")
+        for r in [*range(HEADER_SIZE + 32, HEADER_SIZE + struct.unpack_from("<I", b, 28)[0], ENTRY.size),
+                  *range(p + 16, p + 16 + PTAB.size * len(pages), PTAB.size)]:
+            off = struct.unpack_from("<Q", b, r)[0]
+            struct.pack_into("<Q", b, r, off + 16 * (off >= at))
+        b[at:at] = BOX.pack(16, b"free", 0, 0, 0)
         struct.pack_into("<Q", b, 32, len(b))
-        struct.pack_into("<Q", b, entry, off + 16)
 
     def appended(b):
         b += bytes(16)
@@ -1415,20 +1445,38 @@ def reader_selftest(blob, profile):
     def flip(at):
         return lambda b: b.__setitem__(at, b[at] ^ 1)
 
-    rec, recs_odd, atlas_odd, pad = 16 * g, pages[odd][4], pages[odd][3], y * stride + (x + w) // 2
+    rec, recs_odd, atlas_odd, pad = 16 * g, pages[odd][3], pages[odd][2], y * stride + (x + w) // 2
     cases = [
         ("v4 package", edit(lambda b: b.__setitem__(slice(0, 8), b"SHRFPKG1"), False), "format v4"),
+        ("v5 package", edit(lambda b: struct.pack_into("<H", b, 16, 5)), "format v5"),
         ("header checksum", edit(flip(48), False), "header checksum"),
         ("unknown required feature", edit(lambda b: struct.pack_into("<I", b, 20, features | 16)),
          "unsupported required feature"),
         ("index checksum", edit(flip(HEADER_SIZE + 24 + 16), False), "index checksum"),
         ("unknown required box", lambda: zstd_pkg(extra=[(b"xtra", REQUIRED, b"x")]), "unsupported required box"),
-        ("method 2 index box", lambda: zstd_pkg(tamper=lambda t, i, r, m, s: (2 if t == b"cmap" else m, s)),
+        ("method 2 index box", lambda: zstd_pkg(tamper=lambda t, i, r, m, s: (2 if t == b"ctri" else m, s)),
          "unsupported method"),
         ("zstd without its feature bit", edit(lambda b: struct.pack_into("<I", b, 20, features)), "flags"),
-        ("metadata box checksum", edit(lambda b: flip(box_offset(b, b"cmap") + 20)(b), False), "b'cmap' checksum"),
+        ("metadata box checksum", edit(lambda b: flip(box_offset(b, b"ctri") + 20)(b), False), "b'ctri' checksum"),
         ("missing inst", lambda: assemble(profile_id, features, {k: v for k, v in meta.items() if k != b"inst"},
                                           pages), "missing box"),
+        ("ctri without level-2 blocks", with_meta(b"ctri", poked(tri, 0, 0, "<I")), "ctri header"),
+        ("ctri reserved bytes", with_meta(b"ctri", poked(tri, 12, 1, "<I")), "ctri header"),
+        ("ctri shorter than its blocks", with_meta(b"ctri", tri[:-64]), "ctri size"),
+        ("ctri padding before the data blocks", with_meta(b"ctri", poked(tri, d - 1, 1, "<B")), "ctri padding"),
+        ("L1 entry past the level-2 blocks", with_meta(b"ctri", poked(tri, 16 + 2 * 1087, l2n)), "block number"),
+        ("level-2 entry past the data blocks", with_meta(b"ctri", poked(tri, CTRI_L2 + 128 * l2n - 2, dn)),
+         "block number"),
+        ("dirty level-2 block 0", with_meta(b"ctri", poked(tri, CTRI_L2 + 126, 1)), "ctri block 0"),
+        ("dirty data block 0", with_meta(b"ctri", poked(tri, d + 60, BLANK, "<I")), "ctri block 0"),
+        ("stored ctri off the 64-byte grid", edit(lambda b: inserted(b, box_offset(b, b"ctri")), base=stored_pkg),
+         "ctri not aligned"),
+        ("glyph value past the pages", with_meta(b"ctri", ctri_table(pkg.scalars | {some: len(pages) << 12})),
+         "glyph value"),
+        ("glyph value past the records", with_meta(b"ctri", ctri_table(pkg.scalars | {some: last << 12 | count})),
+         "glyph value"),
+        ("glyph value 0xFFFFFFFD", with_meta(b"ctri", ctri_table(pkg.scalars | {some: BLANK - 1})), "glyph value"),
+        ("U+0020 with a bitmap", with_meta(b"ctri", ctri_table(pkg.scalars | {0x20: 0})), "U+0020"),
         ("page checksum", edit(flip(-1), False), "page %d checksum" % last),
         ("method 2 page", page(lambda r, s: (2, s)), "unsupported method"),
         ("truncated frame", page(lambda r, s: (ZSTD, [s[0][:-1], s[1]])), "zstd frame data"),
@@ -1439,21 +1487,25 @@ def reader_selftest(blob, profile):
          "zstd frame magic"),
         ("skippable frame", page(lambda r, s: (ZSTD, [struct.pack("<II", 0x184D2A50, 0) + s[0], s[1]])),
          "zstd frame magic"),
-        ("stored page off the 256-byte grid", edit(moved, base=stored_pkg), "not aligned"),
+        ("stored page off the 256-byte grid",
+         edit(lambda b: inserted(b, struct.unpack_from("<Q", b, box_offset(b, b"ptab") + 16 + PTAB.size * last)[0]),
+              base=stored_pkg), "page %d not aligned" % last),
         ("stored page longer than its content", page(lambda r, s: (STORED, [s[0], s[1] + b"\0"]), stored_pkg),
          "stored size"),
-        ("page glyph count", ptab(24, count + 1, "<I"), "cover"),
-        ("page height above the shape", ptab(28, ah + 1, "<H"), "page record"),
+        ("page glyph count", ptab(20, count + 1, "<H"), "cover"),
+        ("page height above the shape", ptab(22, ah + 1, "<H"), "page record"),
         ("rect below the trimmed height", lambda: with_page(last, r=poked(recs, 16 * lg + 2, height - lh + 1)), "rect"),
         ("rect past the atlas width", lambda: with_page(odd, r=poked(recs_odd, rec, aw - w + 1)), "rect"),
         ("odd A4 x", lambda: with_page(odd, r=poked(recs_odd, rec, x + 1)), "rect"),
         ("padding nibble", lambda: with_page(odd, a=poked(atlas_odd, pad, atlas_odd[pad] | 1, "<B")), "padding"),
-        ("glyph without bitmap placed", lambda: with_page(blank, r=poked(pages[blank][4], 16 * bg, 2)),
-         "without bitmap"),
-        ("page shape off the shape set", inst(36, 96, "<H"), "page shape"),
-        ("reserved instance bytes", inst(47, 1, "<B"), "reserved"),
+        ("record without bitmap", lambda: with_page(odd, r=poked(recs_odd, rec + 8, 1 << 2, "<B")), "flags"),
+        ("page shape off the shape set", with_meta(b"inst", poked(meta[b"inst"], 36, 96)), "page shape"),
+        ("reserved instance bytes", with_meta(b"inst", poked(meta[b"inst"], 47, 1, "<B")), "reserved"),
         ("box chain gap", edit(appended), "box chain"),
     ]
+    if b"seqs" in meta:
+        cases.append(("sequence glyph value", with_meta(b"seqs", poked(meta[b"seqs"], 8, len(pages) << 12, "<I")),
+                      "glyph value"))
     for name, make, why in cases:
         try:
             Package(make(), *profile)
@@ -1598,7 +1650,7 @@ def main():
         profile = pinned_profile()
         for f in args.files:
             pkg = verified(f, profile)
-            print(f"{f}: ok ({pkg.nglyphs} slots, {len(pkg.pages)} pages of {pkg.atlas[0]}x{pkg.atlas[1]})")
+            print(f"{f}: ok ({pkg.nglyphs} glyphs, {len(pkg.pages)} pages of {pkg.atlas[0]}x{pkg.atlas[1]})")
     elif args.cmd == "selftest":
         selftest(args.packages)
     else:

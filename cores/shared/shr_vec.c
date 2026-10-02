@@ -18,9 +18,7 @@ bool shr__vec_reserve(shr__vec *v, const shr__alloc *al, size_t extra) {
 
 void *shr__vec_push(shr__vec *v, const shr__alloc *al) {
     if (!shr__vec_reserve(v, al, 1)) return NULL;
-    void *p = (char *)v->data + v->len++ * v->elem;
-    memset(p, 0, v->elem);
-    return p;
+    return (char *)v->data + v->len++ * v->elem;
 }
 
 void shr__vec_free(shr__vec *v, const shr__alloc *al) {

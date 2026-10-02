@@ -202,7 +202,7 @@ static void reseal(uint8_t *p, size_t n) {
                     wr64(p + e + 24, XXH3_64bits(p + off, len));
                     continue;
                 }
-                for (uint64_t r = off + 16; !memcmp(p + e, "ptab", 4) && r + 32 <= off + len; r += 32)
+                for (uint64_t r = off + 16; !memcmp(p + e, "ptab", 4) && r + 24 <= off + len; r += 24)
                     if (inside(shr__rd64(p + r), shr__rd32(p + r + 16), n))
                         wr64(p + r + 8, XXH3_64bits(p + shr__rd64(p + r), shr__rd32(p + r + 16)));
             }

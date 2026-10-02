@@ -192,7 +192,8 @@ static shr_status intern(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t 
     if (full) return SHR_E_LIMIT;
     if (!shr__vec_reserve(&f->clusters, &f->al, 1) || !shr__vec_reserve(&f->pool, &f->al, n)) return SHR_E_NO_MEMORY;
     shr__cluster *c = shr__vec_push(&f->clusters, &f->al);
-    *c = (shr__cluster){h, (uint32_t)f->pool.len, (uint8_t)n, cls->glyph_kind, cls->glyph_cp};
+    *c = (shr__cluster){h, (uint32_t)f->pool.len, (uint8_t)n, cls->glyph_kind, cls->glyph_cp, {0}};
+    for (int r = 0; r < ROLE_COUNT; r++) c->gid[r] = SHR_GID_UNKNOWN;
     memcpy(SHR_VEC_AT(&f->pool, uint32_t, f->pool.len), cps, n * sizeof(uint32_t));
     f->pool.len += n;
     f->slots[i] = (uint32_t)f->clusters.len;
@@ -202,8 +203,9 @@ static shr_status intern(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t 
 
 shr_status shr__bitmap_font_glyph(shr_pl_res_bitmap_font *font, const uint32_t *cps, size_t n,
                                   const shr__cluster_class *cls, uint64_t *out_id) {
-    if (!font || !cps || !n || !cls || !out_id || cps[0] > 0x10FFFF) return SHR_E_INVALID_ARG;
-    if (cls->glyph_kind == SHR_GLYPH_NONE) return SHR_E_NOT_FOUND;
+    if (!font || !cps || !n || !cls || !out_id || cps[0] > 0x10FFFF || cls->glyph_cp > 0x10FFFF)
+        return SHR_E_INVALID_ARG;
+    if (cls->glyph_kind == SHR_GLYPH_NONE || (n == 1 && cps[0] == ' ')) return SHR_E_NOT_FOUND;
     if (cls->glyph_kind == SHR_GLYPH_REPLACEMENT) {
         *out_id = 0xFFFD;
         return SHR_OK;

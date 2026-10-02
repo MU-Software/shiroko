@@ -428,6 +428,39 @@ TEST synth_matches_the_spec_reference(void) {
     PASS();
 }
 
+/* Rows wider than the driver's 64-pixel spans. */
+TEST synth_wide_rows_match_the_spec_reference(void) {
+    enum { W = 150, H = 3, SW = W + 8 };
+    static const shr_pixel_format srcs[2] = {SHR_FORMAT_A8, SHR_FORMAT_A4};
+    static uint8_t px[W * H], eb[(W + 4) * (H + 2)], buf[SW * H * 4];
+    uint32_t want[64];
+    for (int sf = 0; sf < 2; sf++) {
+        coverage_noise(px, sizeof(px));
+        size_t stride = sf ? (W + 1) / 2 : W;
+        shr_image m = {px, W, H, stride, stride * H, srcs[sf], 0};
+        shr_rect rect;
+        shr_image b = embed(&m, eb, &rect);
+        for (uint32_t flags = 1; flags < 8; flags++) {
+            int32_t x0, x1;
+            shr__glyph_footprint(W, H, flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC), 1, &x0, &x1);
+            int32_t fw = x1 - x0;
+            shr_surface s = packed(buf, FMTS[sf], fw, H);
+            shr_draw_cmd c[2] = {fill((shr_rect){0, 0, fw, H}, 0),
+                                 region(SHR_CMD_GLYPH, (shr_rect){0, 0, fw, H}, b, rect, (shr_point){x0, 0})};
+            c[1].flags = flags, c[1].slant_axis = 1;
+            ASSERT_EQ_LL(exec(&s, c, 2), SHR_OK);
+            for (int32_t y = 0; y < H; y++)
+                for (int32_t x = 0; x < fw; x += 64) {
+                    int32_t n = fw - x < 64 ? fw - x : 64;
+                    ref_row(&m, flags, 1, y, x0 + x, n, want);
+                    for (int32_t i = 0; i < n; i++)
+                        ASSERT_EQ_LL(raw(&s, x + i, y), mix(FMTS[sf], 0xFFFFFF, enc(FMTS[sf], 0), want[i]));
+                }
+        }
+    }
+    PASS();
+}
+
 TEST synth_is_clip_invariant(void) {
     enum { W = 7, H = 6, SW = 16, SH = 9 };
     uint8_t px[5 * H], eb[6 * (H + 2)];
@@ -1138,8 +1171,14 @@ TEST cached_driver_hit_matches_direct_drawing(void) {
         ASSERT_EQ_LL(exec(&sr, c, n), SHR_OK);
         shr_framebuffer_driver drv;
         ASSERT_EQ_LL(shr_software_driver_create(NULL, 1 << 16, NBUF, &drv), SHR_OK);
-        ASSERT_EQ_LL(drv.execute(drv.user, &sa, c, n, 1), SHR_OK); /* miss: renders and stores */
+        ASSERT_EQ_LL(drv.execute(drv.user, &sa, c, n, 1), SHR_OK); /* partial miss: draws the clip only */
         ASSERT_MEM_EQ(ref, a, sizeof(ref));
+        c[3].color = SHR_RGB(0, 0, 0); /* nothing was stored */
+        ASSERT_EQ_LL(drv.execute(drv.user, &sb, c, n, 2), SHR_OK);
+        ASSERT_EQ_LL(raw(&sb, 3, 2), enc(FMTS[i], 0));
+        c[3].color = SHR_RGB(40, 40, 40), c[2].cache_clip = c[2].dst;
+        ASSERT_EQ_LL(drv.execute(drv.user, &sb, c, n, 2), SHR_OK); /* whole miss: renders and stores */
+        c[2].cache_clip.x0 = 2, memset(b, 0x11, sizeof(b));
         ASSERT_EQ_LL(drv.execute(drv.user, &sb, c, n, 2), SHR_OK); /* hit */
         ASSERT_MEM_EQ(ref, b, sizeof(ref));
         /* A hit copies the stored pixels: same key and size with other commands still draws the old content. */
@@ -1454,7 +1493,7 @@ TEST uncacheable_groups_draw_directly(void) {
             memset(ref, 0x5A, sizeof(ref)), memset(out, 0x5A, sizeof(out));
             shr_surface sr = packed(ref, FMTS[k], 6, 3), so = packed(out, FMTS[k], 6, 3);
             shr_draw_cmd c[8];
-            size_t n = group(c, 9, (shr_rect){0, 1, 6, 3}, (shr_rect){1, 1, 5, 2}, FMTS[k]);
+            size_t n = group(c, 9, (shr_rect){0, 1, 6, 3}, (shr_rect){0, 1, 6, 3}, FMTS[k]);
             ASSERT_EQ_LL(exec(&sr, c, n), SHR_OK);
             f.budget = -1;
             shr_framebuffer_driver drv;
@@ -1613,6 +1652,7 @@ int main(int argc, char **argv) {
     RUN_TEST(glyph_a8_dim_keeps_faint_coverage);
     RUN_TEST(synth_hand_vectors);
     RUN_TEST(synth_matches_the_spec_reference);
+    RUN_TEST(synth_wide_rows_match_the_spec_reference);
     RUN_TEST(synth_is_clip_invariant);
     RUN_TEST(synth_sources_stay_in_the_footprint);
     RUN_TEST(synth_size_and_axis_limits);
