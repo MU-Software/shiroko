@@ -573,6 +573,71 @@ static shr_status text_cells(stage *s) {
     return s->st;
 }
 
+/* ===== Scrolling: rows moved as pixels against the same rows drawn directly ===== */
+
+#define SC_COLS 24
+#define SC_ROWS 8
+
+static void scroll_line(stage *s, shr_lyr *l, int32_t row, int line) {
+    static const char *const text[] = {"line 0 abc 한글", "line 1 \U0001F600 wide 漢字", "line 2 ─── box ───",
+                                       "line 3 é combining", "line 4 tab\there", "line 5 \U0001F469‍\U0001F4BB zwj",
+                                       "line 6 0123456789", "line 7 last 끝"};
+    static const uint32_t flags[] = {0, SHR_STYLE_BOLD, SHR_STYLE_UNDERLINE, SHR_STYLE_ITALIC, SHR_STYLE_BG};
+    stage_text(s, l, row, 0, text[line % 8], STYLE(line % 2 ? PINK : FG, SEL, flags[line % 5]), 0);
+}
+
+static shr_lyr *scroll_grid(stage *s) {
+    const shr_color bg = DARK;
+    return stage_grid(s, 1, cells(1, 1, SC_COLS, SC_ROWS), &bg);
+}
+
+/* A cursor above the grid and a sprite above both. */
+static void scroll_overlays(stage *s, int32_t cursor_row) {
+    shr_lyr *cursor = stage_layer(s, 2, cells(4, 1 + cursor_row, 1, 1));
+    if (cursor) shr_lyr_cmd_begin(cursor);
+    stage_fill(s, cursor, cells(0, 0, 1, 1), GREEN);
+    if (cursor) stage_ok(s, shr_lyr_cmd_commit(cursor), "commit");
+    uint8_t px[16 * 16 * 4]; /* small: larger layers above make the scroll a redraw */
+    for (int i = 0; i < 16 * 16; i++)
+        px[4 * i] = 240, px[4 * i + 1] = (uint8_t)(i / 16 * 14), px[4 * i + 2] = 60, px[4 * i + 3] = (uint8_t)(i % 16 * 16);
+    shr_pl_res_image *img = stage_image(s, 16, 16, px);
+    shr_lyr *sp = stage_layer(s, 3, (shr_rect){9 * CW + 3, 2 * CH + 5, 9 * CW + 19, 2 * CH + 21});
+    if (sp) shr_lyr_cmd_begin(sp);
+    if (sp) stage_ok(s, shr_lyr_cmd_image(sp, img, (shr_rect){0, 0, 16, 16}, (shr_point){0, 0}), "cmd_image");
+    if (sp) stage_ok(s, shr_lyr_cmd_commit(sp), "commit");
+}
+
+static shr_status scroll_build(stage *s) {
+    shr_lyr *g = scroll_grid(s);
+    for (int32_t r = 0; r < SC_ROWS; r++) scroll_line(s, g, r, r);
+    scroll_overlays(s, 6);
+    return s->st;
+}
+
+static const shr_text_style scroll_status = {FG, SEL, SHR_STYLE_BG};
+
+/* Up two rows, then the rows between the first and the last down one; the cursor follows its line. */
+static shr_status scroll_update(stage *s) {
+    shr_lyr *g = s->nlayers ? s->layers[0] : NULL, *cursor = s->nlayers > 1 ? s->layers[1] : NULL;
+    if (g) stage_ok(s, shr_pl_lyr_tilemap_scroll(g, 0, SC_ROWS, 2, scroll_status), "scroll");
+    if (g) stage_ok(s, shr_pl_lyr_tilemap_scroll(g, 1, SC_ROWS - 1, -1, plain), "scroll");
+    stage_text(s, g, 1, 2, "new line", plain, 0);
+    stage_text(s, g, SC_ROWS - 1, 0, "-- status --", scroll_status, 0);
+    if (cursor) stage_ok(s, shr_lyr_set_rect(cursor, cells(4, 1 + 5, 1, 1)), "set_rect");
+    return s->st;
+}
+
+static shr_status scroll_ref(stage *s) {
+    shr_lyr *g = scroll_grid(s);
+    scroll_line(s, g, 0, 2);
+    stage_text(s, g, 1, 2, "new line", plain, 0);
+    for (int32_t r = 2; r < SC_ROWS - 1; r++) scroll_line(s, g, r, r + 1);
+    if (g) stage_ok(s, shr_pl_lyr_tilemap_clear(g, SC_ROWS - 1, 0, 1, SC_COLS, scroll_status), "clear");
+    stage_text(s, g, SC_ROWS - 1, 0, "-- status --", scroll_status, 0);
+    scroll_overlays(s, 5);
+    return s->st;
+}
+
 /* ===== Images ===== */
 
 #define AW 256
@@ -1049,6 +1114,11 @@ const scene scenes[] = {
     {.name = "tm-update-rot180-ref", SCREEN(28, 8), .rotation = SHR_ROTATE_180, .build = tm_update_ref},
     {.name = "tm-restyle", SCREEN(18, 3), .build = tm_restyle_build, .update = tm_restyle},
     {.name = "tm-restyle-ref", SCREEN(18, 3), .build = tm_restyle_ref},
+    {.name = "scroll", SCREEN(SC_COLS + 2, SC_ROWS + 2), .build = scroll_build, .update = scroll_update},
+    {.name = "scroll-ref", SCREEN(SC_COLS + 2, SC_ROWS + 2), .build = scroll_ref},
+    {.name = "scroll-rot90cw", SCREEN(SC_COLS + 2, SC_ROWS + 2), .rotation = SHR_ROTATE_90_CW, .build = scroll_build,
+     .update = scroll_update},
+    {.name = "scroll-rot90cw-ref", SCREEN(SC_COLS + 2, SC_ROWS + 2), .rotation = SHR_ROTATE_90_CW, .build = scroll_ref},
     {.name = "cleared", SCREEN(14, 6), .build = cleared},
     {.name = "cleared-ref", SCREEN(14, 6), .build = cleared_ref},
     {.name = "text-layout", SCREEN(18, 4), .build = text_layout},
@@ -1106,6 +1176,8 @@ const reftest reftests[] = {
     {"tm-update-rot180", "tm-update-rot180-ref"},
     {"styled-exempt", "styled-exempt-ref"},
     {"tm-restyle", "tm-restyle-ref"},
+    {"scroll", "scroll-ref"},
+    {"scroll-rot90cw", "scroll-rot90cw-ref"},
     {"cleared", "cleared-ref"},
     {"text-layout", "text-cells"},
     {"occluded", "occluded-ref"},

@@ -28,14 +28,22 @@ static inline void shr__default_free(void *user, void *p, size_t size, size_t al
     free(p);
 }
 
-/* false for a half-filled allocator. */
+/* Payload used every frame. */
+enum { SHR__HOT = SHR_ALLOC_PAYLOAD | SHR_ALLOC_HOT };
+
+/* false for a half-filled allocator or unknown flags. */
 static inline bool shr__alloc_init(shr__alloc *out, const shr_allocator *in) {
-    out->a = (in && in->alloc) ? *in : (shr_allocator){NULL, shr__default_alloc, shr__default_free};
-    return !in || !in->alloc == !in->free;
+    out->a = (in && in->alloc) ? *in : (shr_allocator){NULL, shr__default_alloc, shr__default_free, 0};
+    return !in || (!in->alloc == !in->free && !(in->flags & ~(uint32_t)SHR_ALLOC_HOT));
+}
+
+/* The hints the allocator did not ask for are dropped. */
+static inline shr_alloc_kind shr__kind(const shr__alloc *al, shr_alloc_kind kind) {
+    return (shr_alloc_kind)((uint32_t)kind & (al->a.flags | ~(uint32_t)SHR_ALLOC_HOT));
 }
 
 static inline void *shr__malloc(const shr__alloc *al, size_t size, size_t align, shr_alloc_kind kind) {
-    return al->a.alloc(al->a.user, size ? size : 1, align, kind);
+    return al->a.alloc(al->a.user, size ? size : 1, align, shr__kind(al, kind));
 }
 
 static inline void *shr__calloc(const shr__alloc *al, size_t count, size_t size, size_t align, shr_alloc_kind kind) {
@@ -47,12 +55,14 @@ static inline void *shr__calloc(const shr__alloc *al, size_t count, size_t size,
 }
 
 static inline void shr__free(const shr__alloc *al, void *p, size_t size, size_t align, shr_alloc_kind kind) {
-    if (p) al->a.free(al->a.user, p, size ? size : 1, align, kind);
+    if (p) al->a.free(al->a.user, p, size ? size : 1, align, shr__kind(al, kind));
 }
 
 #define SHR_NEW(al, T) ((T *)shr__calloc((al), 1, sizeof(T), SHR_ALIGNOF(T), SHR_ALLOC_DESCRIPTOR))
 #define SHR_DELETE(al, p, T) shr__free((al), (p), sizeof(T), SHR_ALIGNOF(T), SHR_ALLOC_DESCRIPTOR)
 #define SHR_NEW_ARRAY(al, T, n) ((T *)shr__calloc((al), (n), sizeof(T), SHR_ALIGNOF(T), SHR_ALLOC_PAYLOAD))
 #define SHR_FREE_ARRAY(al, p, T, n) shr__free((al), (p), sizeof(T) * (n), SHR_ALIGNOF(T), SHR_ALLOC_PAYLOAD)
+#define SHR_NEW_HOT_ARRAY(al, T, n) ((T *)shr__calloc((al), (n), sizeof(T), SHR_ALIGNOF(T), SHR__HOT))
+#define SHR_FREE_HOT_ARRAY(al, p, T, n) shr__free((al), (p), sizeof(T) * (n), SHR_ALIGNOF(T), SHR__HOT)
 
 #endif

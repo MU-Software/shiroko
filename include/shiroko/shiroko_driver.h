@@ -57,15 +57,20 @@ const char *shr_status_name(shr_status status);
 typedef enum shr_alloc_kind {
     SHR_ALLOC_DESCRIPTOR = 0, /* descriptors, small state */
     SHR_ALLOC_PAYLOAD,        /* large buffers: pages, images, command lists */
-    SHR_ALLOC_DMA             /* buffers a device may access */
+    SHR_ALLOC_DMA,            /* buffers a device may access */
+    /* A hint OR-ed into one of the above: memory used every frame (rows of commands, a band's command list, per-frame
+     * state), worth the fastest RAM. Passed only to an allocator whose flags ask for it. */
+    SHR_ALLOC_HOT = 1 << 8
 } shr_alloc_kind;
 
 /* Both functions or neither (NULL allocator = malloc/free). SHR_ALLOC_DMA
- * requests must return memory a DMA-only driver can access. */
+ * requests must return memory a DMA-only driver can access. flags: the hints (SHR_ALLOC_HOT) `kind` may carry; 0 =
+ * plain kinds. free() receives the kind alloc() received. Other bits are SHR_E_INVALID_ARG. */
 typedef struct shr_allocator {
     void *user;
     void *(*alloc)(void *user, size_t size, size_t align, shr_alloc_kind kind);
     void (*free)(void *user, void *ptr, size_t size, size_t align, shr_alloc_kind kind);
+    uint32_t flags;
 } shr_allocator;
 
 typedef struct shr_rect {
@@ -128,21 +133,42 @@ typedef struct shr_image {
 
 shr_status shr_image_validate(const shr_image *image) SHR_NONBLOCKING;
 
+/* An image inside a command: a COPY or ROTATE source, the memory of a REGISTER. It spans
+ * (height - 1) * stride + the row bytes of width, nothing when it is empty or DEVICE. */
+typedef struct shr_image_ref {
+    const void *pixels;
+    int32_t width;
+    int32_t height;
+    uint32_t stride;
+    uint8_t format;    /* shr_pixel_format */
+    uint8_t domain;    /* shr_memory_domain, 0 means SHR_MEMORY_CPU */
+    uint16_t reserved; /* unspecified */
+} shr_image_ref;
+
+/* The image `ref` names, byte_length what it spans; SHR_E_INVALID_ARG (or SHR_E_OVERFLOW) where shr_image_validate
+ * would refuse that image. */
+shr_status shr_image_ref_get(const shr_image_ref *ref, shr_image *out) SHR_NONBLOCKING;
+
 typedef enum shr_cmd_kind {
     SHR_CMD_FILL = 1,        /* dst <- color */
     SHR_CMD_GLYPH,           /* dst <- color through the A4/A8 coverage of `src_rect` of `buffer` */
     SHR_CMD_IMAGE,           /* dst <- RGBA8888 `src_rect` of `buffer`, source-over */
     SHR_CMD_COPY,            /* dst <- src surface, format converted */
-    SHR_CMD_ROTATE,          /* dst <- rotated src surface */
-    SHR_CMD_CACHE_BEGIN,     /* hint: commands up to CACHE_END draw exactly `dst`, identified by `key` */
-    SHR_CMD_CACHE_END,
+    SHR_CMD_ROTATE,          /* dst <- rotated src image */
+    SHR_CMD_KEEP_BEGIN,      /* commands up to KEEP_END draw `dst` into keep `buffer` instead of the destination */
+    SHR_CMD_KEEP_END,
+    SHR_CMD_KEEP_DRAW,       /* dst <- keep `buffer`, copied exactly */
     SHR_CMD_BUFFER_REGISTER, /* id `buffer` names memory `src` from now on, replacing what it named */
     SHR_CMD_BUFFER_UPDATE,   /* the pixels of `buffer` inside `src_rect` changed */
-    SHR_CMD_BUFFER_RELEASE   /* id `buffer` names nothing; no effect when it named nothing */
+    SHR_CMD_BUFFER_RELEASE,  /* id `buffer` names nothing; no effect when it named nothing */
+    SHR_CMD_KEEP_RELEASE     /* keep `buffer` holds nothing; no effect when it held nothing */
 } shr_cmd_kind;
 
-/* DIM: GLYPH coverage, or a FILL, at half strength. BOLD, ITALIC: GLYPH style synthesized from the coverage. */
-enum { SHR_GLYPH_DIM = 1u << 0, SHR_GLYPH_BOLD = 1u << 1, SHR_GLYPH_ITALIC = 1u << 2 };
+/* DIM: GLYPH coverage, or a FILL, at half strength. BOLD, ITALIC: GLYPH style synthesized from the coverage.
+ * ON_FILL: hint that the GLYPH's `dst` holds the FILL colour `bg` (shr_draw_cmd). */
+enum { SHR_GLYPH_DIM = 1u << 0, SHR_GLYPH_BOLD = 1u << 1, SHR_GLYPH_ITALIC = 1u << 2, SHR_GLYPH_ON_FILL = 1u << 3 };
+/* COPY onto its own destination: the pixels of the destination outside `dst` become unspecified (shr_draw_cmd). */
+enum { SHR_COPY_REST_UNDEFINED = 1u << 4 };
 #define SHR_GLYPH_SLANT 54       /* italic slope in 1/256 (about 12 degrees) */
 #define SHR_GLYPH_SYNTH_MAX 1024 /* largest src_rect width or height of a BOLD or ITALIC GLYPH */
 
@@ -158,14 +184,32 @@ typedef enum shr_rotation {
 shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t height, shr_point p, bool inverse,
                                   shr_point *out);
 
-/* Destination rectangles are already clipped by the compositor: each lies inside the destination and inside
- * its group's `dst`. Between CACHE_BEGIN and CACHE_END the commands draw the whole group `dst` (unclipped by
- * damage) and only `cache_clip` of it is written to the destination; equal `key`, `dst` size and destination
- * format mean equal pixels, so a driver may render the group into a separate buffer and copy a cached result.
- * Hence a group is opaque (its commands cover all of `dst` with opaque pixels before anything is blended),
- * reads no destination pixels and holds no ROTATE.
- * ROTATE: `src` is the whole logical surface and `dst` a rect of the output whose size is `src` rotated;
- * `src_origin` is unused.
+/* A command (64 bytes) sets `kind`, `flags` (0 when the kind takes none) and the fields its kind reads: FILL dst,
+ * color; GLYPH buffer, dst, src_origin, color, src_rect, with ON_FILL bg, with ITALIC slant_axis; IMAGE buffer, dst,
+ * src_origin, src_rect; COPY dst, src_origin, src; ROTATE rotation, dst, src; KEEP_BEGIN buffer, dst; KEEP_END
+ * nothing more; KEEP_DRAW buffer, dst, src_origin; BUFFER_REGISTER buffer, src; BUFFER_UPDATE buffer, src_rect;
+ * BUFFER_RELEASE and KEEP_RELEASE buffer. Its other fields are unspecified, and a driver reads none of them.
+ * Destination rectangles are already clipped by the compositor: each lies inside the destination, except in keep
+ * groups.
+ * Keeps: pixels the driver holds under an id in 1..caps.max_keeps (none when 0), from KEEP_BEGIN until KEEP_RELEASE or
+ * the next KEEP_BEGIN of the id. The commands from KEEP_BEGIN to KEEP_END lie inside its `dst` (W x H, which may reach
+ * outside the destination, within 2^24 pixels of its origin) and draw exactly `dst` into keep `buffer` instead of the
+ * destination; the keep then holds W x H pixels of the destination format. A keep group is opaque (its commands cover
+ * all of `dst` with opaque pixels before anything is blended), reads no destination pixels and holds no ROTATE or
+ * keep command. KEEP_DRAW: `dst` takes keep pixels exactly, keep pixel `src_origin` at dst.x0, dst.y0, into a
+ * destination of the keep's format. Within a batch an id is stored at most once and never drawn before it is stored
+ * there, so a driver may store a batch's groups first; KEEP_DRAW draws what an earlier accepted batch or an earlier
+ * group of the batch stored. KEEP_RELEASE comes with the buffer commands at the start of a batch. Held keeps take
+ * W * H * bytes per pixel each, at most caps.max_keep_bytes each and in sum at most caps.keep_bytes when these are
+ * not 0. After an error or a timeout what every keep id holds is unspecified: the compositor releases each id it may
+ * have stored before using it again, as it releases every id before its first frame.
+ * After SHR_E_NO_MEMORY from a batch storing keeps, it keeps no more bytes than were held before that batch.
+ * ROTATE: `dst` takes `src`, any image, rotated: its size is the rotated size of `src`.
+ * A COPY whose `src` is the destination itself (same pixels, format and stride, or the same DEVICE surface) moves
+ * pixels: `dst` takes them as they were before the COPY, whatever the overlap. The compositor sends such moves, ahead
+ * of the other draws of a batch, only to a driver with SHR_DRIVER_CHEAP_MOVE. With SHR_COPY_REST_UNDEFINED the
+ * destination pixels outside `dst` become unspecified as well, since later commands of the frame draw all of them, so
+ * a driver may move the whole destination, or where it is scanned out from, instead of `dst` alone.
  * Buffers: GLYPH and IMAGE draw from buffers, memory the driver knows by an id in 1..caps.max_buffers. An id keeps
  * its memory across batches, from BUFFER_REGISTER until RELEASE or the next REGISTER of the id. Buffer commands come
  * only at the start of a batch, before any other command, and take effect in order before its draws. Pixels
@@ -184,29 +228,49 @@ shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t 
  * A BOLD or ITALIC GLYPH may take rect columns outside the rect, and outside the buffer, within its footprint
  * [x0, x1): x0 = ITALIC ? k(H - 1) : 0, x1 = W + BOLD + (ITALIC ? k(0) + (f(0) != 0) : 0); its rows stay inside
  * the rect.
- * A batch is checked before anything is drawn. SHR_E_INVALID_ARG: a rect outside the destination or its group,
- * a nested or unbalanced group, a COPY in a group reading the destination, ROTATE in a group, a buffer command
- * after another command, REGISTER of id 0, of an id above caps.max_buffers or of invalid memory, UPDATE or a draw
- * naming an id that is not registered, an UPDATE or draw `src_rect` outside its buffer, an A4 draw `src_rect` with
- * odd x0, a draw reading outside its `src_rect` (a styled GLYPH outside its footprint) or a COPY outside `src`, a
- * BOLD or ITALIC GLYPH with a `src_rect` larger than SHR_GLYPH_SYNTH_MAX, an ITALIC GLYPH with |slant_axis| >
- * 4 * SHR_GLYPH_SYNTH_MAX, a bad rotation or ROTATE size. SHR_E_UNSUPPORTED: REGISTER of a format other than A4,
- * A8 and RGBA8888 or of memory outside the caps, a buffer or source format the kind does not take, a COPY whose
- * source overlaps `dst` with another format or stride, a ROTATE whose source overlaps `dst`. */
+ * ON_FILL GLYPH: for each `dst` pixel, the last earlier command of the batch whose `dst` holds it is a FILL without
+ * DIM of colour `bg`, in the same keep group as the GLYPH or, like it, outside any. Blending onto the pixel that FILL
+ * writes (RGB565: `bg` quantized to 5/6/5 bits; RGBX8888: its bytes, X included) then equals blending onto `dst`, so a
+ * driver may do that without reading `dst`, or ignore the flag.
+ * A batch is checked before anything is drawn. SHR_E_INVALID_ARG: a kind outside shr_cmd_kind, a rect outside the
+ * destination or its group, a nested or unbalanced group, a COPY in a group reading the destination, ROTATE or a keep
+ * command in a group, a buffer command or KEEP_RELEASE after another command, REGISTER of id 0, of an id above
+ * caps.max_buffers or of invalid memory, UPDATE or a draw naming an id that is not registered, an UPDATE or draw
+ * `src_rect` outside its buffer, an A4 draw `src_rect` with odd x0, a draw reading outside its `src_rect` (a styled
+ * GLYPH outside its footprint) or a COPY outside `src`, a BOLD or ITALIC GLYPH with a `src_rect` larger than
+ * SHR_GLYPH_SYNTH_MAX, an ITALIC GLYPH with |slant_axis| > 4 * SHR_GLYPH_SYNTH_MAX, a bad rotation or ROTATE size, a
+ * KEEP_BEGIN or KEEP_DRAW of id 0 or above caps.max_keeps, a second KEEP_BEGIN of an id in the batch, a KEEP_DRAW of an
+ * id that holds nothing or is stored later in the batch, reading outside its keep or into a destination of another
+ * format, a keep group taking more than caps.max_keep_bytes, stores leaving more than caps.keep_bytes held.
+ * SHR_E_UNSUPPORTED: REGISTER of a format other than A4, A8 and RGBA8888 or of memory outside the caps, a buffer or
+ * source format the kind does not take, a COPY whose source overlaps `dst` with another format or stride, a ROTATE
+ * whose source overlaps `dst`.
+ * SHR_E_NO_MEMORY: no memory for a keep the batch stores. */
+#if defined(__cplusplus) && defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
 typedef struct shr_draw_cmd {
-    shr_cmd_kind kind;
-    uint32_t flags;
+    uint8_t kind;          /* shr_cmd_kind */
+    uint8_t rotation;      /* ROTATE: shr_rotation */
+    uint16_t flags;
+    uint32_t buffer;       /* GLYPH, IMAGE, BUFFER_*: buffer id; KEEP_*: keep id */
     shr_rect dst;
-    shr_color color;          /* FILL, GLYPH */
-    uint32_t buffer;          /* GLYPH, IMAGE, BUFFER_*: buffer id */
-    shr_rect src_rect;        /* GLYPH, IMAGE: buffer region drawn from; UPDATE: region changed */
-    shr_image src;            /* COPY, ROTATE: source surface; REGISTER: the buffer's memory */
-    shr_point src_origin;     /* GLYPH, IMAGE: rect pixel drawn at dst.x0, dst.y0; COPY: src pixel */
-    shr_rotation rotation;    /* ROTATE */
-    uint64_t key[2];          /* CACHE_BEGIN: 128-bit content hash */
-    shr_rect cache_clip;      /* CACHE_BEGIN: part of dst drawn this time */
-    int32_t slant_axis;       /* ITALIC GLYPH: twice the rect y the shear turns about */
+    shr_point src_origin;  /* GLYPH, IMAGE: rect pixel drawn at dst.x0, dst.y0; COPY: src pixel; KEEP_DRAW: keep pixel */
+    union {
+        struct {
+            shr_color color;   /* FILL, GLYPH */
+            shr_color bg;      /* GLYPH: the colour under `dst` with ON_FILL */
+            shr_rect src_rect; /* GLYPH, IMAGE: buffer region drawn from; UPDATE: region changed */
+        };
+        shr_image_ref src;     /* COPY, ROTATE: source surface; REGISTER: the buffer's memory */
+    };
+    int32_t slant_axis;    /* GLYPH with ITALIC: twice the rect y the shear turns about */
+    uint32_t reserved;
 } shr_draw_cmd;
+#if defined(__cplusplus) && defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 typedef enum shr_fence_state {
     SHR_FENCE_PENDING = 0,
@@ -219,6 +283,13 @@ typedef enum shr_fence_state {
 typedef uint64_t shr_fence;
 
 enum { SHR_BUFFER_COPIES = 1u << 0 }; /* buffer_flags: the driver draws from its own copies of buffers */
+/* flags: moving pixels inside a destination (a COPY onto itself) costs less than drawing them again; without it the
+ * compositor draws moved pixels again. */
+enum { SHR_DRIVER_CHEAP_MOVE = 1u << 1 };
+/* flags: storing a keep group costs about what drawing it plainly does (the copy into the keep runs off the CPU); the
+ * compositor then also stores groups it draws for the first time, within a credit that keeps drawn again earn back.
+ * Like all caps, read by shr_create(). */
+enum { SHR_DRIVER_CHEAP_STORE = 1u << 2 };
 
 /* Destinations, sources and buffers outside these limits make the submission fail with SHR_E_UNSUPPORTED:
  * a driver implements every command kind (a device driver may run some on the software port). */
@@ -234,6 +305,10 @@ typedef struct shr_driver_caps {
     int32_t max_buffer_height;
     uint64_t buffer_bytes;     /* SHR_BUFFER_COPIES: byte_length sum of registered buffers, 0 = unlimited */
     uint32_t buffer_flags;
+    uint32_t max_keeps;        /* keep ids are 1..max_keeps; 0 = the driver keeps nothing */
+    uint64_t keep_bytes;       /* bytes held keeps may take, 0 = unlimited */
+    uint64_t max_keep_bytes;   /* bytes one keep may take, 0 = up to keep_bytes */
+    uint32_t flags;            /* SHR_DRIVER_* */
 } shr_driver_caps;
 
 /* execute(): SHR_OK = finished before returning; SHR_IN_PROGRESS = the device
@@ -250,7 +325,8 @@ typedef struct shr_driver_caps {
  * cancel() only requests cancellation. reset() stops the device and returns
  * SHR_OK once no submission can access memory any more.
  * sync() (optional) runs before execute() for the SHR_MEMORY_DMA memory the batch hands the device: the whole
- * destination, each whole COPY or ROTATE source, the whole memory of each REGISTER and, for each UPDATE, the rows
+ * destination (once per frame, before its first batch drawing there: only batches write it after that), each whole
+ * COPY or ROTATE source, the whole memory of each REGISTER and, for each UPDATE, the rows
  * src_rect.y0 .. y1 - 1 of its buffer. The CPU may have written them last, the device reads or writes them next.
  * The driver makes what it writes coherent for the CPU and the display itself before the submission completes. */
 typedef struct shr_framebuffer_driver {

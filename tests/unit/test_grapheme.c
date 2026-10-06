@@ -127,6 +127,13 @@ TEST uprops_samples(void) {
     PASS();
 }
 
+TEST emoji_selector_bases_and_sequences_start_with_an_emoji(void) { /* shr__classify relies on it */
+    for (uint32_t i = 0; i < shr__emoji_vs_base_count; i++) ASSERT(shr__uprops(shr__emoji_vs_base[i]) & SHR_UP_EMOJI);
+    for (uint32_t i = 0; i < shr__emoji_seq_count; i++)
+        ASSERT(shr__uprops(shr__emoji_seq_pool[shr__emoji_seq_index[i].offset]) & SHR_UP_EMOJI);
+    PASS();
+}
+
 TEST seq_cmp_orders_by_prefix_then_length(void) {
     const uint32_t a[2] = {1, 2}, b[2] = {1, 3};
     ASSERT_EQ_LL(shr__seq_cmp(a, 2, a, 2), 0);
@@ -144,6 +151,7 @@ int main(int argc, char **argv) {
     RUN_TEST(grapheme_breaks_match_uax29_test_file);
     RUN_TEST(uprops_match_ucd_for_every_scalar);
     RUN_TEST(uprops_samples);
+    RUN_TEST(emoji_selector_bases_and_sequences_start_with_an_emoji);
     RUN_TEST(seq_cmp_orders_by_prefix_then_length);
     GREATEST_MAIN_END();
 }

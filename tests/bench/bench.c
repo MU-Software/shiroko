@@ -11,6 +11,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "text_scenes.h"
+
 #define W 1280
 #define H 720
 #define BPP (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? 2 : 4)
@@ -85,9 +87,9 @@ static shr_draw_cmd *cell_cmds(shr_cmd_kind kind, uint32_t id, uint32_t flags, s
     shr_draw_cmd *c = calloc((size_t)ROWS * COLS, sizeof(*c));
     for (int r = 0, i = 0; r < ROWS; r++)
         for (int k = 0; k < COLS; k++, i++)
-            c[i] = (shr_draw_cmd){.kind = kind, .dst = {k * CW, r * CH, (k + 1) * CW, (r + 1) * CH},
+            c[i] = (shr_draw_cmd){.kind = (uint8_t)kind, .dst = {k * CW, r * CH, (k + 1) * CW, (r + 1) * CH},
                                   .color = SHR_RGB(200, 180 + r, k), .buffer = id, .src_rect = {0, 0, CW, CH},
-                                  .flags = flags, .slant_axis = CH};
+                                  .flags = (uint16_t)flags, .slant_axis = CH};
     *n = (size_t)ROWS * COLS;
     return c;
 }
@@ -138,30 +140,35 @@ static void bench_software(void) {
 
     shr_pixel_format of = SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? SHR_FORMAT_RGBX8888 : SHR_FORMAT_RGB565;
     shr_surface out = screen_surface(other, W, H, of), rot = screen_surface(other, H, W, SHR_PIXEL_FORMAT);
-    shr_image logical = {pixels, W, H, dst.stride, dst.byte_length, SHR_PIXEL_FORMAT, SHR_MEMORY_CPU};
+    shr_image_ref logical = {pixels, W, H, (uint32_t)dst.stride, SHR_PIXEL_FORMAT, SHR_MEMORY_CPU, 0};
     shr_draw_cmd copy = {.kind = SHR_CMD_COPY, .dst = {0, 0, W, H}, .src = logical};
     run("software/copy-convert-screen", op_batch, &(batch){NULL, out, &copy, 1}, screen_px, "px");
     shr_draw_cmd turn = {.kind = SHR_CMD_ROTATE, .dst = {0, 0, H, W}, .src = logical, .rotation = SHR_ROTATE_90_CW};
     run("software/rotate-90-screen", op_batch, &(batch){NULL, rot, &turn, 1}, screen_px, "px");
 
-    /* One cached group per row (background + glyph per cell) after the glyph's REGISTER; every operation is a hit. */
-    shr_draw_cmd *rows = calloc((size_t)ROWS * (COLS * 2 + 2) + 1, sizeof(*rows));
+    /* One keep per row (background + glyph per cell after the glyph's REGISTER), stored by one batch and then drawn by
+     * every operation. */
+    shr_draw_cmd *rows = calloc((size_t)ROWS * (COLS * 2 + 2) + 1, sizeof(*rows)), draws[ROWS];
     size_t m = 0;
-    rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_BUFFER_REGISTER, .buffer = A8_SRC, .src = srcs[A8_SRC - 1]};
+    const shr_image *m8 = &srcs[A8_SRC - 1];
+    rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_BUFFER_REGISTER, .buffer = A8_SRC,
+                               .src = {m8->pixels, m8->width, m8->height, (uint32_t)m8->stride, SHR_FORMAT_A8, 0, 0}};
     for (int r = 0; r < ROWS; r++) {
         shr_rect row = {0, r * CH, W, (r + 1) * CH};
-        rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_CACHE_BEGIN, .dst = row, .key = {(uint64_t)r + 1, 7}, .cache_clip = row};
+        rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_KEEP_BEGIN, .dst = row, .buffer = (uint32_t)r + 1};
         for (int k = 0; k < COLS; k++) {
             shr_rect cell = {k * CW, r * CH, (k + 1) * CW, (r + 1) * CH};
             rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_FILL, .dst = cell, .color = SHR_RGB(20, 20, r)};
             rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_GLYPH, .dst = cell, .color = SHR_RGB(220, 220, 220),
                                        .buffer = A8_SRC, .src_rect = {0, 0, CW, CH}};
         }
-        rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_CACHE_END};
+        rows[m++] = (shr_draw_cmd){.kind = SHR_CMD_KEEP_END};
+        draws[r] = (shr_draw_cmd){.kind = SHR_CMD_KEEP_DRAW, .dst = row, .buffer = (uint32_t)r + 1};
     }
     shr_framebuffer_driver drv;
-    check("driver", shr_software_driver_create(NULL, 8u << 20, NSRC, &drv));
-    run("software/cache-rows-hit", op_batch, &(batch){&drv, dst, rows, m}, screen_px, "px");
+    check("driver", shr_software_driver_create(NULL, (uint64_t)ROWS * W * CH * BPP, ROWS, NSRC, &drv));
+    check("store", drv.execute(drv.user, &dst, rows, m, 1));
+    run("software/keep-rows-draw", op_batch, &(batch){&drv, dst, draws, ROWS}, screen_px, "px");
     shr_software_driver_destroy(&drv);
     free(rows);
 }
@@ -199,11 +206,12 @@ typedef struct env {
 /* Buffer ids of the drivers below: font pages within page_cache_bytes, builtin pages and images. */
 #define MAX_BUFFERS 1024
 
-/* cache_bytes < 0: a driver that draws nothing. */
-static void env_open(env *e, long cache_bytes) {
+/* keep_bytes < 0: a driver that draws nothing; 0: one that keeps nothing. */
+static void env_open(env *e, long keep_bytes) {
     memset(e, 0, sizeof(*e));
-    if (cache_bytes >= 0)
-        check("driver", shr_software_driver_create(NULL, (uint64_t)cache_bytes, MAX_BUFFERS, &e->drv.inner));
+    if (keep_bytes >= 0)
+        check("driver", shr_software_driver_create(NULL, (uint64_t)keep_bytes, keep_bytes ? 4 * ROWS : 0, MAX_BUFFERS,
+                                                   &e->drv.inner));
     else
         e->drv.inner.execute = draw_nothing, e->drv.inner.caps.max_buffers = MAX_BUFFERS;
     e->wrap = e->drv.inner;
@@ -386,6 +394,23 @@ static void op_scroll(void *arg) {
     settle(t->e->ctx);
 }
 
+/* The same screen scrolled with shr_pl_lyr_tilemap_scroll(): one row up, the new bottom row written. */
+static void op_scroll_api(void *arg) {
+    term *t = arg;
+    check("scroll", shr_pl_lyr_tilemap_scroll(t->l, 0, ROWS, 1, (shr_text_style){0}));
+    ++t->shift;
+    for (int c = 0; c < COLS;) {
+        const char *s = t->sample[(unsigned)(ROWS - 1 + t->shift + c * 7) % (unsigned)t->nsample];
+        uint32_t span = (unsigned char)s[0] >= 0xEA ? 2 : 1;
+        if (c + (int)span > COLS) span = 1, s = " ";
+        shr_text_style st = {SHR_RGB(220, 220, 220), SHR_RGB(20, 20, (ROWS - 1 + t->shift) * 3 % 64), SHR_STYLE_BG};
+        check("set_cell", shr_pl_lyr_tilemap_set_cell(t->l, ROWS - 1, c, s, strlen(s), span, st));
+        c += (int)span;
+    }
+    shr_submit(t->e->ctx);
+    settle(t->e->ctx);
+}
+
 static void term_open(term *t, env *e, shr_pl_res_bitmap_font *font, const char *const *sample, int n,
                       const shr_color *background) {
     *t = (term){e, NULL, sample, n, 0};
@@ -502,20 +527,72 @@ static void bench_image(void) {
 /* ===== Whole terminal frames on the software driver ===== */
 
 static void bench_terminal(void) {
-    for (int fonts = 0; fonts < 2; fonts++)
-        for (int cache = 0; cache < 2; cache++) {
-            char name[96];
-            snprintf(name, sizeof(name), "terminal/scroll-%s-cache-%s", fonts ? "fonts" : "builtin", cache ? "on" : "off");
-            if (filter && !strstr(name, filter)) continue;
-            env e;
-            env_open(&e, cache ? 8l << 20 : 0);
-            shr_pl_res_bitmap_font *font = font_open(&e, fonts ? FONT_READ : FONT_BUILTIN);
-            term t;
-            term_open(&t, &e, font, mixed, 8, NULL);
-            run(name, op_scroll, &t, (double)W * H, "px");
-            shr_lyr_destroy(t.l);
-            env_close(&e, font);
-        }
+    for (int api = 0; api < 2; api++)
+        for (int fonts = 0; fonts < 2; fonts++)
+            for (int keep = 0; keep < 2; keep++) {
+                char name[96];
+                snprintf(name, sizeof(name), "terminal/scroll%s-%s-keeps-%s", api ? "-api" : "",
+                         fonts ? "fonts" : "builtin", keep ? "on" : "off");
+                if (filter && !strstr(name, filter)) continue;
+                env e;
+                env_open(&e, keep ? 4l * ROWS * W * CH * BPP : 0); /* a row per slot */
+                shr_pl_res_bitmap_font *font = font_open(&e, fonts ? FONT_READ : FONT_BUILTIN);
+                term t;
+                term_open(&t, &e, font, mixed, 8, NULL);
+                run(name, api ? op_scroll_api : op_scroll, &t, (double)W * H, "px");
+                shr_lyr_destroy(t.l);
+                env_close(&e, font);
+            }
+}
+
+/* ===== Glyph-heavy terminal frames (text_scenes.h) on the software driver ===== */
+
+typedef struct text_term {
+    env *e;
+    shr_lyr *l;
+    ts_prose prose;
+    uint32_t top;
+    bool code;
+} text_term;
+
+static void set_text(void *u, int32_t row, int32_t col, const char *t, uint32_t span, shr_text_style st) {
+    check("set_cell", shr_pl_lyr_tilemap_set_cell(((text_term *)u)->l, row, col, t, strlen(t), span, st));
+}
+
+static void op_text(void *arg) {
+    text_term *t = arg;
+    if (t->code)
+        ts_code_screen(++t->top, ROWS, COLS, set_text, t);
+    else
+        ts_prose_churn(&t->prose, ROWS, COLS, 1000, set_text, t);
+    shr_submit(t->e->ctx);
+    settle(t->e->ctx);
+}
+
+static void bench_text(void) {
+    static const char *const names[] = {"terminal/churn-ko", "terminal/code", "terminal/cjk-mix"};
+    for (int k = 0; k < 3; k++) {
+        if (filter && !strstr(names[k], filter)) continue;
+        env e;
+        env_open(&e, 4l * ROWS * W * CH * BPP); /* a row per slot */
+        shr_pl_res_bitmap_font_desc fd;
+        shr_pl_res_bitmap_font_desc_init(&fd);
+        fd.user = (void *)font_dir, fd.open = open_read, fd.locale = "ko";
+        shr_pl_res_bitmap_font *font;
+        check("font", shr_pl_res_bitmap_font_create(e.ctx, &fd, &font));
+        text_term t = {&e, NULL, {.rng = 0x2545F491u, .mix = k == 2, .left = -1}, 0, k == 1};
+        check("layer", shr_lyr_create(e.ctx, 1, (shr_rect){0, 0, W, H}, &t.l));
+        check("resize", shr_pl_lyr_tilemap_resize(t.l, font, ROWS, COLS, NULL));
+        if (t.code)
+            ts_code_screen(0, ROWS, COLS, set_text, &t);
+        else
+            ts_prose_screen(&t.prose, ROWS, COLS, set_text, &t);
+        shr_submit(e.ctx);
+        settle(e.ctx);
+        run(names[k], op_text, &t, (double)W * H, "px");
+        shr_lyr_destroy(t.l);
+        env_close(&e, font);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -539,5 +616,6 @@ int main(int argc, char **argv) {
     bench_font();
     bench_image();
     bench_terminal();
+    bench_text();
     return 0;
 }

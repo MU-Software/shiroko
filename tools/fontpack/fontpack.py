@@ -5,7 +5,10 @@
   fontpack.py build --cell WxH [PACKAGE ...]   build packages (default set) for one cell size into build/fonts;
       --out DIR --scalars 0041-005A,AC00       never downloads; --scalars builds reduced packages (fuzz seeds),
       --page-atlas WxH                         --page-atlas forces one page shape for both formats,
-      --method zstd|stored --store-index       --method stored stores every box, --store-index ctri/seqs/pool
+      --method zstd|stored --store-index       --method stored stores every box, --store-index ctri/seqs/pool,
+      --order hot|codepoint --rank FILE        --order places glyphs hot tiers first (default) or by scalar,
+                                               --rank orders each tier by first use in a UTF-8 text file
+                                               instead of the fetched frequencies (fonts.lock.json "order")
   fontpack.py builtin --cell WxH --out FILE.c  write the built-in package (ASCII + U+FFFD, stored) as a C array
       [--page-atlas WxH]
   fontpack.py verify FILE ...       check every box, page and glyph of packages
@@ -82,6 +85,22 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 ZSTD_WINDOW = 1 << 18
 MAX_CELL = (64, 127)  # glyph records: u8 width/height, i8 bearing/top for glyphs up to two cells wide
 SHAPING = {"direction": "ltr", "language": "und"}  # script per role; default features only
+# Glyph order (--order hot): hot tiers first, each in scalar order, so the glyphs of everyday text share few pages.
+# CJK: the legacy double-byte set of the locale by lead-byte rows (KS X 1001 punctuation, compatibility jamo and
+# Hangul, its other symbols, its Hanja; JIS X 0208 symbols, kana and level 1, then level 2; GB 2312 and Big5 levels
+# 1 and 2), from Python's codecs.
+LEGACY_TIERS = {"ko": ("euc-kr", (((0xA1, 0xA1), (0xA4, 0xA4), (0xB0, 0xC8)), ((0xA2, 0xAC),), ((0xCA, 0xFD),))),
+                "ja": ("euc-jp", (((0xA1, 0xCF),), ((0xD0, 0xF4),))),
+                "zh-Hans": ("gb2312", (((0xA1, 0xD7),), ((0xD8, 0xF7),))),
+                "zh-Hant": ("big5", (((0xA1, 0xC6),), ((0xC9, 0xF9),))),
+                "zh-HK": ("big5", (((0xA1, 0xC6),), ((0xC9, 0xF9),)))}
+# Other roles: scalar ranges (Nerd: glyph sets of the Nerd Fonts wiki, Material Design last).
+HOT_RANGES = {"latin": ((0x20, 0x7E), (0x2500, 0x259F), (0xA0, 0xFF), (0x2000, 0x206F), (0x2190, 0x21FF),
+                        (0x2200, 0x23FF), (0x25A0, 0x25FF), (0x100, 0x17F)),
+              "symbols": ((0x2800, 0x28FF), (0x25A0, 0x25FF), (0x2190, 0x21FF), (0x2300, 0x23FF), (0x2600, 0x27BF),
+                          (0x2B00, 0x2BFF), (0x1FB00, 0x1FBFF)),
+              "nerd": ((0xE0A0, 0xE0D7), (0xE5FA, 0xE6B7), (0xE700, 0xE8EF), (0xF000, 0xF2FF), (0xF400, 0xF533),
+                       (0xEA60, 0xEC1E), (0xF300, 0xF381), (0xE000, 0xF8FF))}
 
 
 class FormatError(Exception):
@@ -129,6 +148,10 @@ def atlas_stride(fmt, width):
     return width // 2 if fmt == FMT_A4 else width
 
 
+def order_path(name):
+    return (ucd.CACHE if LOCK["order"][name]["cache"] == "ucd" else SRC) / name
+
+
 def fetch(download=True):
     for name, f in LOCK["files"].items():
         dest = SRC / name
@@ -136,6 +159,14 @@ def fetch(download=True):
             pooch.retrieve(f["url"], f"sha256:{f['sha256']}", fname=dest.name, path=dest.parent, progressbar=False)
         elif not dest.exists() or hashlib.sha256(dest.read_bytes()).hexdigest() != f["sha256"]:
             sys.exit(f"missing or modified input {dest}; run `make fontpack-fetch`")
+    for name, f in LOCK["order"].items() if download else ():
+        dest = order_path(name)
+        try:
+            pooch.retrieve(f["url"], f"sha256:{f['sha256']}", fname=name, path=dest.parent, progressbar=False)
+        except (OSError, ValueError) as e:
+            dest.unlink(missing_ok=True)
+            print(f"warning: optional glyph order input {name} not fetched ({e}); "
+                  "the CJK packages fall back to the legacy sets' tiers in code order")
     tools = {"freetype": ".".join(map(str, freetype.version())), "harfbuzz": hb.version_string(),
              "fonttools": fontTools.version, "pillow": PIL.__version__}
     for k, v in LOCK["tools"].items():
@@ -648,13 +679,122 @@ def assemble(profile_id, features, meta, pages, method="zstd", store_index=False
     return head[:120] + struct.pack("<Q", xxh3(head[:120])) + sidx + body + tail
 
 
-def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, method="zstd", store_index=False):
+@functools.cache
+def legacy_tiers(locale):
+    """{scalar: tier} of the locale's legacy set."""
+    codec, rows = LEGACY_TIERS[locale]
+    out = {}
+    for tier, ranges in enumerate(rows):
+        for b in (b for lo, hi in ranges for b in range(lo << 8 | 0x40, hi + 1 << 8)):
+            try:
+                s = struct.pack(">H", b).decode(codec)
+            except UnicodeDecodeError:
+                continue
+            if len(s) == 1:
+                out.setdefault(ord(s), tier)
+    return out
+
+
+@functools.cache
+def order_input(name):
+    """Bytes of an optional order input (fonts.lock.json "order"), None when it was not fetched."""
+    path = order_path(name)
+    if not path.exists():
+        print(f"{path} not fetched: the CJK packages fall back to the legacy sets' tiers in code order "
+              "(run `make fontpack-fetch`)")
+        return None
+    data = path.read_bytes()
+    if sha256(data) != LOCK["order"][name]["sha256"]:
+        sys.exit(f"missing or modified input {path}; run `make fontpack-fetch`")
+    return data
+
+
+@functools.cache
+def unihan():
+    """{field: {scalar: value}} of the Unihan fields the CJK order uses, None without Unihan.zip."""
+    data = order_input("Unihan.zip")
+    if data is None:
+        return None
+    fields = {"kHanyuPinlu": {}, "kJoyoKanji": {}, "kKoreanEducationHanja": {}}
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for member in ("Unihan_OtherMappings.txt", "Unihan_Readings.txt"):
+            for line in z.read(member).decode().splitlines():
+                cp, field, value = line.split("\t", 2) if line.startswith("U+") else ("", "", "")
+                if field in fields:
+                    fields[field][int(cp[2:], 16)] = value
+    return fields
+
+
+def frequency_ranks(counts):
+    return {cp: r for r, (_, cp) in enumerate(sorted((-n, cp) for cp, n in counts.items()))}
+
+
+@functools.cache
+def cjk_order(locale):
+    """({scalar: tier}, {scalar: rank}, inputs of the tiers, inputs of the ranks) of a CJK locale for --order hot.
+    The legacy set's tiers; Unihan puts the Korean education Hanja (kKoreanEducationHanja) ahead of the other
+    KS X 1001 Hanja and the Jōyō kanji (kJoyoKanji 2010) into the first ja tier, ahead of the other level 1 kanji.
+    Ranks: ko punctuation and jamo, then Hangul by syllable frequency in the 2005 survey of the National Institute
+    of Korean Language; zh by kHanyuPinlu."""
+    tiers, ranks = dict(legacy_tiers(locale)), {}
+    u = unihan()
+    if u and locale == "ko":
+        edu = u["kKoreanEducationHanja"]
+        tiers.update({cp: 3 for cp, t in tiers.items() if t == 2 and cp not in edu})
+    elif u and locale == "ja":
+        joyo = {cp for cp, v in u["kJoyoKanji"].items() if v == "2010"}
+        tiers.update({cp: 0 if cp in joyo else 2 if t else int(0x4E00 <= cp <= 0x9FFF) for cp, t in tiers.items()})
+    elif u:
+        ranks = frequency_ranks({cp: sum(map(int, re.findall(r"\((\d+)\)", v)))
+                                 for cp, v in u["kHanyuPinlu"].items()})
+        return tiers, ranks, [], ["Unihan.zip"]
+    data = order_input("korean-frequency-2005.zip") if locale == "ko" else None
+    if data:
+        f = LOCK["order"]["korean-frequency-2005.zip"]
+        with zipfile.ZipFile(io.BytesIO(data), metadata_encoding=f["member_encoding"]) as z:
+            raw = z.read(f["member"])
+        if sha256(raw) != f["member_sha256"]:
+            sys.exit(f"{order_path('korean-frequency-2005.zip')}: {f['member']} does not match fonts.lock.json")
+        counts = {ord(s): int(n) for _, n, s in (line.split("\t") for line in
+                                                  raw.decode(f["member_encoding"]).splitlines()[1:])}
+        top = max(counts.values()) + 1
+        ranks = frequency_ranks(counts | {cp: top for cp, t in tiers.items() if t == 0 and not 0xAC00 <= cp <= 0xD7A3})
+    return tiers, ranks, ["Unihan.zip"] if u else [], ["korean-frequency-2005.zip"] if data else []
+
+
+def slot_order(pkg, key, ranked):
+    """Sort key of a slot for --order hot: its tier (emoji: single glyphs and VS16 forms, keycaps and flags,
+    skin tones, ZWJ sequences), then its rank in `ranked` (a single scalar), then its scalars."""
+    kind, v = key
+    if kind == "gid":
+        return (99,)
+    s = (v,) if kind == "cp" else v
+    if pkg["role"] == "emoji":
+        tier = (3 if 0x200D in s else 2 if any(0x1F3FB <= c <= 0x1F3FF for c in s)
+                else int(len(s) > 1 and s[-1] != 0xFE0F))
+    elif kind == "seq":
+        tier = 98
+    elif pkg["role"] == "cjk":
+        tier = cjk_order(pkg["locale"])[0].get(v, 9)
+    else:
+        tier = next((t for t, (lo, hi) in enumerate(HOT_RANGES[pkg["role"]]) if lo <= v <= hi), 9)
+    return tier, ranked.get(v, len(ranked)) if kind == "cp" else len(ranked), s
+
+
+def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, method="zstd", store_index=False,
+                  order="codepoint", ranked=None):
     role = pkg["role"]
     report = {"package": name, "role": role}
     regular = faces[pkg["faces"]["regular"]]
     cmap, seqs = plan_keys(profile, pkg, regular, scalars, ivd, report, keep)
 
     slot_keys = list(dict.fromkeys(list(cmap.values()) + [v[1] for v in seqs.values()]))
+    inputs = []
+    if order == "hot":
+        _, auto, inputs, rank_inputs = cjk_order(pkg["locale"]) if role == "cjk" else ({}, {}, [], [])
+        inputs = inputs + (["--rank"] if ranked else rank_inputs)
+        ranked = ranked or auto
+        slot_keys.sort(key=lambda k: slot_order(pkg, k, ranked or {}))
 
     latin_face = faces[CONFIG["packages"]["latin"]["faces"]["regular"]]
     baseline, underline, strike = size_metrics(latin_face, size)
@@ -724,6 +864,8 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
     pages, fill = pack_pages(glyph_records, fmt, shape)
     values = [n << 12 | r for n, page in enumerate(pages) for r in range(page[0])]
     glyph_of = {k: BLANK if r is None else values[r] for k, r in zip(slot_keys, record_of)}
+    hot = [glyph_of[k] >> 12 for k in slot_keys
+           if order == "hot" and glyph_of[k] < BLANK and slot_order(pkg, k, {})[0] == 0] + [-1]
 
     strings = bytearray()
 
@@ -765,7 +907,7 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
     report.update(file_bytes=len(blob), pages=len(pages), shape=f"{shape[0]}x{shape[1]}",
                   index_bytes=PTAB.unpack_from(blob, box_offset(blob, b"ptab") + 16)[0],
                   atlas_raw_bytes=sum(len(p[2]) for p in pages), atlas_fill=round(fill, 4), package_id=sha256(blob),
-                  scalars=len(cmap), sequences=len(seqs))
+                  scalars=len(cmap), sequences=len(seqs), order=order, order_inputs=inputs, hot_pages=max(hot) + 1)
     return blob, report
 
 
@@ -1126,7 +1268,14 @@ def write_licenses(out, names, reports):
         inventory["packages"][f"shiroko-{name}"] = {"license": key, "spdx": spdx_expression(lic), "rfn_checked": rfn,
                                                     "report": reports[name]}
     (lic_dir / "Unicode-3.0.txt").write_bytes((ROOT / "LICENSES/Unicode-3.0.txt").read_bytes())
-    notice += ["", "Unicode data: Copyright (c) Unicode, Inc. Unicode License v3 (LICENSES/Unicode-3.0.txt).", ""]
+    used = sorted({n for r in reports.values() for n in r["order_inputs"] if n in LOCK["order"]})
+    inventory["order_inputs"] = {n: {k: v for k, v in LOCK["order"][n].items() if k != "cache"} for n in used}
+    notice += ["", "Unicode data: Copyright (c) Unicode, Inc. Unicode License v3 (LICENSES/Unicode-3.0.txt)."
+               + (" Unihan (Unihan.zip) orders CJK glyphs." if "Unihan.zip" in used else ""), ""]
+    if "korean-frequency-2005.zip" in used:
+        ko = LOCK["order"]["korean-frequency-2005.zip"]
+        notice += ["The Hangul glyphs are ordered by the syllable frequencies of 현대 국어 사용 빈도 조사 2 (National "
+                   f"Institute of Korean Language, 2005), {ko['license']}, {ko['license_url']}:", ko["attribution"], ""]
     (out / "NOTICE").write_text("\n".join(notice) + "\n", encoding="utf-8")
     (out / "inventory.json").write_text(json.dumps(inventory, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -1145,7 +1294,7 @@ def publish(stage, out):
             os.replace(entry, target)
 
 
-def build(names, size, out=None, keep=None, method="zstd", store_index=False):
+def build(names, size, out=None, keep=None, method="zstd", store_index=False, order="hot", ranked=None):
     out = pathlib.Path(out).resolve() if out else OUT
     names = names or CONFIG["default"]
     unverified = unverified_components(names)
@@ -1164,7 +1313,7 @@ def build(names, size, out=None, keep=None, method="zstd", store_index=False):
         reports = {}
         for name in names:
             blob, report = build_package(name, CONFIG["packages"][name], profile, faces, providers[name], ivd, tools,
-                                         size, keep, method, store_index)
+                                         size, keep, method, store_index, order, ranked)
             try:
                 pkg = Package(blob, profile.id, profile.max_scalars)
             except FormatError as e:
@@ -1178,7 +1327,9 @@ def build(names, size, out=None, keep=None, method="zstd", store_index=False):
             preview(pkg, stage / f"shiroko-{name}.png", report)
             reports[name] = report
             print(f"{out / f'shiroko-{name}.shrf'}: {report['file_bytes']} bytes (index {report['index_bytes']}), "
-                  f"{report['pages']} pages of {report['shape']}, atlas fill {report['atlas_fill']:.1%}, "
+                  f"{report['pages']} pages of {report['shape']} ({report['hot_pages']} hot"
+                  f"{''.join('; ' + n for n in report['order_inputs'])}), "
+                  f"atlas fill {report['atlas_fill']:.1%}, "
                   f"{report['scalars']} scalars, {report['sequences']} sequences, clipped {report['clipped']}")
         write_licenses(stage, names, reports)
         (stage / "coverage.json").write_text(json.dumps(reports, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1305,6 +1456,8 @@ def install_notices(src, dest, packages):
         sys.exit(f"{', '.join(unknown)} not in {FONTS / 'fontpack.config.json'}: cannot tell the source faces to list")
     faces = {CONFIG["packages"][n.removeprefix("shiroko-")]["faces"]["regular"] for n in names}
     inventory["sources"] = {k: v for k, v in inventory.get("sources", {}).items() if k in faces}
+    inputs = {n for v in inventory["packages"].values() for n in v["report"].get("order_inputs", ())}
+    inventory["order_inputs"] = {k: v for k, v in inventory.get("order_inputs", {}).items() if k in inputs}
     replace_synced(dest / "inventory.json", (json.dumps(inventory, indent=2, ensure_ascii=False) + "\n").encode())
 
 
@@ -1621,6 +1774,8 @@ def main():
     b.add_argument("--page-atlas", type=atlas)
     b.add_argument("--method", choices=("zstd", "stored"), default="zstd")
     b.add_argument("--store-index", action="store_true")
+    b.add_argument("--order", choices=("hot", "codepoint"), default="hot")
+    b.add_argument("--rank", type=pathlib.Path)
     v = sub.add_parser("verify")
     v.add_argument("files", nargs="+")
     bi = sub.add_parser("builtin")
@@ -1643,7 +1798,10 @@ def main():
     if args.cmd == "fetch":
         fetch()
     elif args.cmd == "build":
-        build(args.packages, args.cell, args.out, args.scalars, args.method, args.store_index)
+        ranked = {}
+        for c in args.rank.read_text(encoding="utf-8") if args.rank else "":
+            ranked.setdefault(ord(c), len(ranked))
+        build(args.packages, args.cell, args.out, args.scalars, args.method, args.store_index, args.order, ranked)
     elif args.cmd == "builtin":
         builtin(args.cell, args.out)
     elif args.cmd == "verify":

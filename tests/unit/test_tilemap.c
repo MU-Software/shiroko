@@ -385,9 +385,14 @@ static size_t ncmds(const shr_lyr *l, int32_t row) {
     return g ? g->n : 0;
 }
 
+/* Command i of a row, unpacked; the last 8 stay valid. */
 static const shr__lcmd *cmd(const shr_lyr *l, int32_t row, size_t i) {
+    static shr__lcmd ring[8];
+    static unsigned next;
     ASSERT_EQ_LL(i < ncmds(l, row), 1);
-    return &group_of(l, row)->cmds[i];
+    shr__lcmd *c = &ring[next++ % 8];
+    *c = shr__group_cmd(group_of(l, row), i);
+    return c;
 }
 
 static size_t count_kind(const shr_lyr *l, int32_t row, uint8_t kind) {
@@ -520,6 +525,38 @@ TEST resize_switches_font(void) {
     PASS();
 }
 
+TEST cluster_glyphs_follow_a_font_switch(void) {
+    shr_lyr *l = open_grid(1, 8, NULL);
+    ASSERT_EQ_LL(set_cell(l, 0, 0, "a\xCC\x8A", 1, plain), SHR_OK);
+    ASSERT_EQ_LL(set_cell(l, 0, 1, "e\xCC\x81", 1, plain), SHR_OK); /* the font's second cluster */
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, 0, 0, 1, 8, plain), SHR_OK);
+    shr_pl_res_bitmap_font_desc fd;
+    shr_pl_res_bitmap_font_desc_init(&fd);
+    fd.open = font_dir_open;
+    shr_pl_res_bitmap_font *f2;
+    ASSERT_EQ_LL(shr_pl_res_bitmap_font_create(H.ctx, &fd, &f2), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(l, f2, 1, 8, NULL), SHR_OK);
+    ASSERT_EQ_LL(set_cell(l, 0, 2, "e\xCC\x81", 1, plain), SHR_OK); /* the new font's first */
+    ASSERT_EQ_LL(ncmds(l, 0), 1);
+    ASSERT_EQ_LL(cmd(l, 0, 0)->id, SHR_ID_CLUSTER);
+    ASSERT_EQ_LL(shr_pl_res_bitmap_font_destroy(H.font), SHR_OK);
+    H.font = f2;
+    close_grid(l);
+    PASS();
+}
+
+TEST texts_sharing_a_memo_slot_keep_their_glyphs(void) {
+    shr_lyr *l = open_grid(1, 8, NULL);
+    ASSERT_EQ_LL(set_cell(l, 0, 0, "ar", 1, plain), SHR_OK);
+    ASSERT_EQ_LL(set_cell(l, 0, 1, "bA", 1, plain), SHR_OK); /* the same slot */
+    ASSERT_EQ_LL(set_cell(l, 0, 2, "ar", 1, plain), SHR_OK);
+    ASSERT_EQ_LL(ncmds(l, 0), 3);
+    ASSERT(cmd(l, 0, 0)->id != cmd(l, 0, 1)->id);
+    ASSERT_EQ_LL(cmd(l, 0, 0)->id, cmd(l, 0, 2)->id);
+    close_grid(l);
+    PASS();
+}
+
 TEST set_cell_validates_placed_input(void) {
     char many[1 + 16 * 2]; /* e + 16 x U+0301: 17 scalars in 33 bytes */
     many[0] = 'e';
@@ -549,6 +586,8 @@ TEST set_cell_validates_placed_input(void) {
         {0, 0, "\t", 1, 1, 0, SHR_E_CONTROL_CHAR},
         {0, 0, "A\0", 2, 1, 0, SHR_E_CONTROL_CHAR},
         {0, 0, "\x7F", 1, 1, 0, SHR_E_CONTROL_CHAR},
+        {0, 0, "\x1F", 1, 1, 0, SHR_E_CONTROL_CHAR},
+        {0, 0, "\x80", 1, 1, 0, SHR_E_INVALID_UTF8},
         {0, 0, "\xC2\x85", 2, 1, 0, SHR_E_CONTROL_CHAR},
         {0, 0, many, 33, 1, 0, SHR_E_LIMIT}, /* the same cluster limit as set_text and measure */
     };
@@ -589,6 +628,8 @@ TEST set_cell_clears_the_wide_cells_it_overlaps(void) {
     ASSERT_EQ_LL(set_cell(l, 0, 5, "\xEA\xB0\x80", 2, plain), SHR_OK);
     ASSERT_EQ_LL(set_cell(l, 0, 3, "y", 3, plain), SHR_OK); /* its last cell hits the head */
     ASSERT_STR_EQ(row_text(l, 0), ".*-y--..");
+    ASSERT_EQ_LL(set_cell(l, 0, 5, "z", 1, plain), SHR_OK); /* on the last of three */
+    ASSERT_STR_EQ(row_text(l, 0), ".*-..z..");
     close_grid(l);
     PASS();
 }
@@ -829,6 +870,14 @@ TEST background_paints_cells_without_their_own(void) {
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(l, H.font, 2, 8, &red), SHR_OK);
     ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_CACHE_BEGIN), 1); /* opaque now */
     ASSERT_EQ_LL(ncmds(l, 1), 3);                             /* cache, one fill, end */
+    int glyphs = 0;
+    for (size_t i = 0; i < ncmds(l, 0); i++) {
+        const shr__lcmd *g = cmd(l, 0, i);
+        if (g->kind != SHR__LCMD_GLYPH) continue;
+        ASSERT(g->flags == SHR__LCMD_ON_FILL && g->bg == RED); /* on the layer background */
+        glyphs++;
+    }
+    ASSERT_EQ_LL(glyphs, 2);
     ASSERT_EQ_LL(cmd(l, 1, 1)->color, RED);
     uint64_t key = cmd(l, 1, 0)->key[0];
     const uint8_t *s = frame_of();
@@ -866,8 +915,9 @@ TEST row_commands_follow_cell_styles(void) {
     ASSERT_EQ_LL(bg->color, BLUE);
     ASSERT(memcmp(&bg->dst, &cell, sizeof(cell)) == 0);
     ASSERT_EQ_LL(g->kind, SHR__LCMD_GLYPH);
-    ASSERT_EQ_LL(g->flags, SHR__LCMD_DIM | SHR__LCMD_BLINK | SHR__LCMD_BOLD | SHR__LCMD_ITALIC);
+    ASSERT_EQ_LL(g->flags, SHR__LCMD_DIM | SHR__LCMD_BLINK | SHR__LCMD_BOLD | SHR__LCMD_ITALIC | SHR__LCMD_ON_FILL);
     ASSERT_EQ_LL(g->color, RED);
+    ASSERT_EQ_LL(g->bg, BLUE);
     ASSERT(g->res == res);
     ASSERT_EQ_LL(g->id, 'A');
     ASSERT(memcmp(&g->dst, &cell, sizeof(cell)) == 0);
@@ -887,15 +937,18 @@ TEST row_commands_follow_cell_styles(void) {
     ASSERT_EQ_LL(ncmds(l, 1), 1); /* concealed: background only */
     ASSERT_EQ_LL(set_cell(l, 1, 3, "B", 1, (shr_text_style){RED, 0, SHR_STYLE_BOLD | SHR_STYLE_ITALIC}), SHR_OK);
     ASSERT_EQ_LL(ncmds(l, 1), 2);
-    ASSERT_EQ_LL(cmd(l, 1, 1)->flags, SHR__LCMD_BOLD | SHR__LCMD_ITALIC);
+    ASSERT_EQ_LL(cmd(l, 1, 1)->flags, SHR__LCMD_BOLD | SHR__LCMD_ITALIC); /* no background under it */
+    ASSERT_EQ_LL(cmd(l, 1, 1)->bg, 0);
     ASSERT_EQ_LL(cmd(l, 1, 1)->anchor.x, 3 * CW);
-    ASSERT_EQ_LL(cmd(l, 1, 1)->anchor.y, CH);
+    ASSERT_EQ_LL(cmd(l, 1, 1)->anchor.y, 0); /* row coordinates, the group at the row's y */
+    ASSERT_EQ_LL(group_of(l, 1)->oy, CH);
     ASSERT_EQ_LL(cmd(l, 1, 1)->id, 'B');
 
     ASSERT_EQ_LL(set_cell(l, 2, 0, "", 2, (shr_text_style){RED, 0, SHR_STYLE_UNDERLINE}), SHR_OK);
     ASSERT_EQ_LL(ncmds(l, 2), 1); /* no glyph, just the line */
     ASSERT_EQ_LL(cmd(l, 2, 0)->dst.x1, 2 * CW);
-    ASSERT_EQ_LL(cmd(l, 2, 0)->dst.y0, 2 * CH + lm.underline_y);
+    ASSERT_EQ_LL(cmd(l, 2, 0)->dst.y0, lm.underline_y);
+    ASSERT_EQ_LL(group_of(l, 2)->oy, 2 * CH);
     close_grid(l);
     PASS();
 }
@@ -982,23 +1035,74 @@ TEST row_key_follows_every_input(void) {
     PASS();
 }
 
+/* Keys depend on what a context did alone, not on contexts before it: keep decisions repeat. */
+TEST row_keys_repeat_in_a_new_context(void) {
+    const key_case base = {1, 1, on_blue, "A", RED, false, false};
+    XXH128_hash_t k[2];
+    for (int i = 0; i < 2; i++) {
+        shr_lyr *l = open_grid(1, 8, NULL);
+        k[i] = row_key(l, NULL, base);
+        close_grid(l);
+    }
+    ASSERT(XXH128_isEqual(k[0], k[1]));
+    PASS();
+}
+
 TEST only_changed_rows_are_rebuilt(void) {
     shr_lyr *l = open_grid(3, 8, NULL);
     ASSERT_EQ_LL(set_text(l, 0, 0, "a\nb\nc", plain, 0, NULL), SHR_OK);
-    const shr__lcmd *p0 = group_of(l, 0)->cmds, *p1 = group_of(l, 1)->cmds, *p2 = group_of(l, 2)->cmds;
+    const shr__rcmd *p0 = group_of(l, 0)->rows, *p1 = group_of(l, 1)->rows, *p2 = group_of(l, 2)->rows;
     ASSERT_EQ_LL(set_cell(l, 1, 1, "x", 1, plain), SHR_OK);
-    ASSERT(group_of(l, 0)->cmds == p0);
-    ASSERT(group_of(l, 1)->cmds != p1);
-    ASSERT(group_of(l, 2)->cmds == p2);
-    p1 = group_of(l, 1)->cmds;
+    ASSERT(group_of(l, 0)->rows == p0);
+    ASSERT(group_of(l, 1)->rows != p1);
+    ASSERT(group_of(l, 2)->rows == p2);
+    p1 = group_of(l, 1)->rows;
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, 2, 0, 1, 1, plain), SHR_OK);
-    ASSERT(group_of(l, 0)->cmds == p0);
-    ASSERT(group_of(l, 1)->cmds == p1);
+    ASSERT(group_of(l, 0)->rows == p0);
+    ASSERT(group_of(l, 1)->rows == p1);
     ASSERT(group_of(l, 2) == NULL);
     ASSERT_EQ_LL(set_text(l, 0, 2, "y\n\nz", plain, 0, NULL), SHR_OK); /* row 1 lies between but is untouched */
-    ASSERT(group_of(l, 0)->cmds != p0);
-    ASSERT(group_of(l, 1)->cmds == p1);
+    ASSERT(group_of(l, 0)->rows != p0);
+    ASSERT(group_of(l, 1)->rows == p1);
     ASSERT_STR_EQ(row_text(l, 2), "..z.....");
+    close_grid(l);
+    PASS();
+}
+
+TEST unchanged_cells_leave_their_row_clean(void) {
+    shr_lyr *l = open_grid(1, 8, NULL);
+    ASSERT_EQ_LL(set_cell(l, 0, 0, "a", 1, plain), SHR_OK);
+    ASSERT_EQ_LL(set_cell(l, 0, 2, "\xEA\xB0\x80", 2, on_blue), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, 4, NULL, 0, 1, plain), SHR_OK);
+    const char *marks = "e\xCC\x81\xCC\x81\xCC\x81\xCC\x81"; /* beyond 8 bytes */
+    ASSERT_EQ_LL(set_cell(l, 0, 7, marks, 1, plain), SHR_OK);
+    const shr__rcmd *p = group_of(l, 0)->rows;
+    ASSERT_EQ_LL(set_cell(l, 0, 0, "a", 1, plain), SHR_OK);
+    ASSERT_EQ_LL(set_cell(l, 0, 2, "\xEA\xB0\x80", 2, on_blue), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, 4, NULL, 0, 1, plain), SHR_OK);
+    ASSERT_EQ_LL(set_cell(l, 0, 7, marks, 1, plain), SHR_OK);
+    ASSERT(group_of(l, 0)->rows == p);
+    const struct {
+        int32_t col;
+        const char *s;
+        uint32_t span;
+        shr_text_style st;
+    } changes[] = {
+        {0, "b", 1, plain},                                      /* text */
+        {0, "b", 1, {RED, 0, 0}},                                /* foreground */
+        {0, "b", 1, {RED, 0, SHR_STYLE_BG}},                     /* flags */
+        {0, "b", 1, {RED, BLUE, SHR_STYLE_BG}},                  /* background */
+        {0, "b", 1, {RED, BLUE, SHR_STYLE_BG | SHR_STYLE_BOLD}}, /* flags */
+        {4, "c", 1, plain},                       /* length */
+        {4, "c", 2, plain},                       /* span */
+        {3, "", 1, {0, 0, 0}},                    /* a continuation, otherwise alike */
+    };
+    for (size_t i = 0; i < sizeof(changes) / sizeof(changes[0]); i++) {
+        ASSERT_EQ_LL(set_cell(l, 0, changes[i].col, changes[i].s, changes[i].span, changes[i].st), SHR_OK);
+        ASSERT(group_of(l, 0)->rows != p);
+        p = group_of(l, 0)->rows;
+    }
+    ASSERT_STR_EQ(row_text(l, 0), "b...c-.*");
     close_grid(l);
     PASS();
 }
@@ -1055,6 +1159,104 @@ TEST styled_wide_glyph_stays_in_its_cells(void) {
     PASS();
 }
 
+static shr_status scroll(shr_lyr *l, int32_t top, int32_t bottom, int32_t n, shr_text_style st) {
+    return shr_pl_lyr_tilemap_scroll(l, top, bottom, n, st);
+}
+
+/* Row r: its letter in column 0, a wide cell in columns 2-3, each row of its own colour. */
+static void lettered(shr_lyr *l, int32_t rows) {
+    for (int32_t r = 0; r < rows; r++) {
+        const shr_text_style st = {WHITE, SHR_RGB(0, 0, 40 * r), SHR_STYLE_BG};
+        ASSERT_EQ_LL(set_cell(l, r, 0, (char[]){(char)('A' + r), 0}, 1, st), SHR_OK);
+        ASSERT_EQ_LL(set_cell(l, r, 2, "\xEA\xB0\x80", 2, st), SHR_OK);
+    }
+}
+
+TEST scroll_moves_rows_and_clears_the_uncovered_ones(void) {
+    shr_lyr *l = open_grid(5, 8, NULL), *other = new_layer();
+    lettered(l, 5);
+    ASSERT_EQ_LL(scroll(l, 0, 5, 2, on_blue), SHR_OK);
+    const char *up[5] = {"C.*-....", "D.*-....", "E.*-....", "........", "........"};
+    for (int32_t r = 0; r < 5; r++) ASSERT_STR_EQ(row_text(l, r), up[r]);
+    for (int32_t r = 0; r < 5; r++) ASSERT_EQ_LL(group_of(l, r)->oy, r * CH);
+    ASSERT_EQ_LL(cmd(l, 0, 0)->color, SHR_RGB(0, 0, 80)); /* C kept its style */
+    ASSERT_EQ_LL(ncmds(l, 3), 3); /* uncovered: cleared to the scroll's style, a cached run */
+    ASSERT_EQ_LL(cmd(l, 4, 1)->color, BLUE);
+    ASSERT_EQ_LL(scroll(l, 1, 4, -1, plain), SHR_OK); /* a region, down */
+    const char *down[5] = {"C.*-....", "........", "D.*-....", "E.*-....", "........"};
+    for (int32_t r = 0; r < 5; r++) ASSERT_STR_EQ(row_text(l, r), down[r]);
+    ASSERT(group_of(l, 1) == NULL); /* blank without a background */
+    ASSERT_EQ_LL(set_cell(l, 3, 5, "X", 1, plain), SHR_OK); /* a change not yet built moves along */
+    ASSERT_EQ_LL(scroll(l, 0, 4, 1, plain), SHR_OK);
+    ASSERT_STR_EQ(row_text(l, 2), "E.*-.X..");
+    ASSERT_STR_EQ(row_text(l, 3), "........");
+    ASSERT_EQ_LL(scroll(l, 0, 5, 0, plain), SHR_OK);
+    ASSERT_EQ_LL(scroll(l, 2, 2, 1, plain), SHR_OK);
+    ASSERT_STR_EQ(row_text(l, 1), "D.*-....");
+    ASSERT_EQ_LL(scroll(l, 1, 3, INT32_MIN, on_blue), SHR_OK); /* the whole region: cleared */
+    ASSERT_EQ_LL(cmd(l, 1, 1)->color, BLUE);
+    ASSERT_EQ_LL(cmd(l, 2, 1)->color, BLUE);
+    ASSERT_EQ_LL(scroll(l, 0, 5, 5, plain), SHR_OK);
+    for (int32_t r = 0; r < 5; r++) ASSERT(group_of(l, r) == NULL);
+    ASSERT_EQ_LL(scroll(NULL, 0, 1, 1, plain), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(scroll(other, 0, 1, 1, plain), SHR_E_STATE);
+    ASSERT_EQ_LL(scroll(l, 0, 1, 1, (shr_text_style){0, 0, 1u << 8}), SHR_E_UNKNOWN_STYLE);
+    ASSERT_EQ_LL(scroll(l, -1, 1, 1, plain), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(scroll(l, 2, 1, 1, plain), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(scroll(l, 0, 6, 1, plain), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_lyr_destroy(other), SHR_OK);
+    close_grid(l);
+    PASS();
+}
+
+static int moves_seen;
+
+static shr_status count_moves(void *user, const shr_surface *dst, const shr_draw_cmd *c, size_t n, shr_fence f) {
+    for (size_t i = 0; i < n; i++) moves_seen += c[i].kind == SHR_CMD_COPY && c[i].src.pixels == dst->pixels;
+    return md_execute(user, dst, c, n, f);
+}
+
+static void tweak_moves(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    (void)d;
+    drv->caps.flags = SHR_DRIVER_CHEAP_MOVE;
+    drv->execute = count_moves;
+}
+
+/* Scrolled frames show what a full redraw of the scrolled grid shows: the whole grid moves in both directions; a
+ * region of two rows is drawn again (moving one row of two saves too little). */
+TEST scrolled_frames_match_a_redraw(void) {
+    harness_open(&H, SHR_OUTPUT_RELEASE_ON_PRESENT | SHR_OUTPUT_PRESERVES_CONTENT, tweak_moves);
+    harness_font(&H);
+    shr_lyr *l = new_layer();
+    const shr_color dark = SHR_RGB(10, 20, 30);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(l, H.font, 3, 8, &dark), SHR_OK);
+    lettered(l, 3);
+    frame_of();
+    moves_seen = 0;
+    static uint8_t moved[sizeof(H.out.shown)];
+    const int32_t tops[4] = {0, 0, 1, 0}, bottoms[4] = {3, 3, 3, 2}, ns[4] = {1, -1, 1, -1};
+    for (int step = 0; step < 4; step++) {
+        ASSERT_EQ_LL(scroll(l, tops[step], bottoms[step], ns[step], plain), SHR_OK);
+        ASSERT_EQ_LL(set_cell(l, ns[step] > 0 ? bottoms[step] - 1 : tops[step], 1, "\xF0\x9F\x98\x80", 2, on_blue), SHR_OK);
+        memcpy(moved, frame_of(), sizeof(moved));
+        ASSERT_EQ_LL(shr_request_redraw(H.ctx), SHR_OK);
+        settle(H.ctx);
+        ASSERT(memcmp(moved, H.out.shown, sizeof(moved)) == 0);
+        ASSERT_EQ_LL(moves_seen, step < 2 ? step + 1 : 2);
+    }
+    for (int step = 0; step < 2; step++) { /* two scrolls before a submit: the row the first uncovered moves too */
+        ASSERT_EQ_LL(scroll(l, 0, 3, 1, plain), SHR_OK);
+        ASSERT_EQ_LL(set_cell(l, 2, 3, step ? "B" : "A", 1, on_blue), SHR_OK);
+    }
+    memcpy(moved, frame_of(), sizeof(moved));
+    ASSERT_EQ_LL(moves_seen, 4);
+    ASSERT_EQ_LL(shr_request_redraw(H.ctx), SHR_OK);
+    settle(H.ctx);
+    ASSERT(memcmp(moved, H.out.shown, sizeof(moved)) == 0);
+    close_grid(l);
+    PASS();
+}
+
 TEST calls_are_refused_while_shutting_down(void) {
     shr_lyr *l = open_grid(1, 1, NULL);
     ASSERT_EQ_LL(shr_begin_shutdown(H.ctx), SHR_OK);
@@ -1064,6 +1266,7 @@ TEST calls_are_refused_while_shutting_down(void) {
     ASSERT_EQ_LL(set_text(l, 0, 0, "A", plain, 0, &err), SHR_E_STATE);
     ASSERT_EQ_LL(err.status, SHR_E_STATE);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, 0, 0, 1, 1, plain), SHR_E_STATE);
+    ASSERT_EQ_LL(scroll(l, 0, 1, 1, plain), SHR_E_STATE);
     close_grid(l);
     PASS();
 }
@@ -1089,6 +1292,7 @@ static shr_status oom_op(int op, shr_lyr *l, shr_pl_res_bitmap_font *font) {
     case 1: return shr_pl_lyr_tilemap_clear(l, 2, 0, 1, 7, rich);
     case 2: return shr_pl_lyr_tilemap_set_cell(l, 1, 2, family, sizeof(family) - 1, 2, rich);
     case 3: return shr_pl_lyr_tilemap_set_text(l, 0, 1, text, sizeof(text) - 1, rich, &run, 1, SHR_TEXT_WRAP, NULL);
+    case 4: return shr_pl_lyr_tilemap_scroll(l, 0, 3, 1, rich); /* builds the changed rows first */
     default: return shr_pl_lyr_tilemap_resize(l, font, 2, 6, &bg);
     }
 }
@@ -1102,25 +1306,139 @@ static void assert_same_rows(const shr_lyr *a, const shr_lyr *b) {
         ASSERT_EQ_LL(ga->id, gb->id);
         ASSERT_EQ_LL(ga->n, gb->n);
         for (size_t k = 0; k < ga->n; k++) {
-            const shr__lcmd *x = &ga->cmds[k], *y = &gb->cmds[k];
+            const shr__lcmd xa = shr__group_cmd(ga, k), ya = shr__group_cmd(gb, k), *x = &xa, *y = &ya;
             ASSERT_EQ_LL(x->kind, y->kind);
             ASSERT_EQ_LL(x->flags, y->flags);
             ASSERT_EQ_LL(memcmp(&x->dst, &y->dst, sizeof(x->dst)), 0);
-            ASSERT_EQ_LL(memcmp(&x->anchor, &y->anchor, sizeof(x->anchor)), 0);
             ASSERT_EQ_LL(x->color, y->color);
-            ASSERT_EQ_LL(x->res == y->res, 1);
-            ASSERT_EQ_LL(x->id, y->id);
-            ASSERT_EQ_LL(x->key[0], y->key[0]);
-            ASSERT_EQ_LL(x->key[1], y->key[1]);
+            if (x->kind == SHR__LCMD_GLYPH) {
+                ASSERT_EQ_LL(memcmp(&x->anchor, &y->anchor, sizeof(x->anchor)), 0);
+                ASSERT_EQ_LL(x->bg, y->bg);
+                ASSERT_EQ_LL(x->res == y->res, 1);
+                ASSERT_EQ_LL(x->id, y->id);
+            }
+            if (x->kind == SHR__LCMD_CACHE_BEGIN) {
+                ASSERT_EQ_LL(x->key[0], y->key[0]);
+                ASSERT_EQ_LL(x->key[1], y->key[1]);
+            }
         }
     }
 }
 
+TEST long_text_is_freed_however_it_is_covered(void) {
+    const char *family = "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7"; /* on the heap */
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(1, 8, use_fail_alloc);
+    const struct {
+        int32_t col;
+        const char *s;
+        uint32_t span;
+        shr_text_style st;
+    } cells[] = {
+        {2, family, 2, plain}, {3, "x", 1, plain},      /* on its continuation */
+        {0, family, 2, plain}, {0, family, 2, on_blue}, /* the same footprint */
+        {1, "x", 1, plain},                             /* on its continuation again */
+        {4, family, 2, plain}, {3, "x", 2, plain},      /* its last cell hits the head */
+        {0, family, 3, plain}, {0, "x", 8, plain},
+    };
+    for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++)
+        ASSERT_EQ_LL(set_cell(l, 0, cells[i].col, cells[i].s, cells[i].span, cells[i].st), SHR_OK);
+    ASSERT_STR_EQ(row_text(l, 0), "x-------");
+    ASSERT_EQ_LL(set_text(l, 0, 0, family, plain, 0, NULL), SHR_OK);
+    ASSERT_EQ_LL(set_cell(l, 0, 1, "x", 1, plain), SHR_OK);
+    ASSERT_STR_EQ(row_text(l, 0), ".x......");
+    close_grid(l);
+    ASSERT_EQ_LL(g_fa.live, 0);
+    PASS();
+}
+
+/* set_text keeps the memory it places cells in: calls placing no more cells than an earlier one allocate nothing. */
+TEST set_text_reuses_its_memory(void) {
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(2, 8, use_fail_alloc);
+    ASSERT_EQ_LL(set_text(l, 0, 0, "abcdefgh\nabcd", plain, 0, NULL), SHR_OK);
+    g_fa.budget = 0;
+    ASSERT_EQ_LL(set_text(l, 0, 0, "ab\xE1", plain, 0, NULL), SHR_E_INVALID_UTF8);
+    ASSERT_EQ_LL(set_text(l, 1, 2, "xy", on_blue, 0, NULL), SHR_OK);
+    ASSERT_EQ_LL(set_text(l, 0, 4, "\xEA\xB0\x80z\tq", plain, SHR_TEXT_WRAP, NULL), SHR_OK);
+    g_fa.budget = -1;
+    ASSERT_STR_EQ(row_text(l, 0), "abcd*-z.");
+    ASSERT_STR_EQ(row_text(l, 1), "abxyq...");
+    close_grid(l);
+    ASSERT_EQ_LL(g_fa.live, 0);
+    PASS();
+}
+
+/* Row `row` shows `s` and nothing else, written cell by cell. */
+static void put_row(shr_lyr *l, int32_t row, const char *s, shr_text_style st) {
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, row, 0, 1, HW / CW, plain), SHR_OK);
+    for (int32_t c = 0; s[c]; c++) ASSERT_EQ_LL(set_cell(l, row, c, (char[]){s[c], 0}, 1, st), SHR_OK);
+}
+
+/* Rebuilt, scrolled and emptied rows leave their memory to the rows built next: once rows were as long as they get,
+ * rebuilding them allocates nothing. A row longer than 2 * cols + 2 commands grows the largest class; all of the memory
+ * goes with the layer. */
+TEST rebuilt_rows_reuse_their_memory(void) {
+    static const char *const lines[] = {"ab", "abcdefgh", "", "abcde"};
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(4, 8, use_fail_alloc);
+    for (int pass = 0; pass < 12; pass++) {
+        if (pass == 8) g_fa.budget = 0;
+        put_row(l, 0, lines[pass % 4], plain);
+        put_row(l, 1, lines[(pass + 1) % 4], on_blue);
+        ASSERT_EQ_LL(scroll(l, 0, 4, 1 + pass % 2, plain), SHR_OK);
+        put_row(l, 3, lines[(pass + 2) % 4], plain);
+        ASSERT_EQ_LL(l->flush(l->state), SHR_OK);
+    }
+    ASSERT_STR_EQ(row_text(l, 3), "abcdefgh");
+    ASSERT(group_of(l, 0)->cap == 16 && group_of(l, 3)->cap == 16 && l->class_cap[2] == 18);
+    g_fa.budget = -1;
+    const shr_text_style lined = {WHITE, BLUE, SHR_STYLE_BG | SHR_STYLE_UNDERLINE | SHR_STYLE_STRIKE};
+    put_row(l, 2, "abcdefgh", lined); /* 27 commands */
+    ASSERT(group_of(l, 2)->cap == 32 && group_of(l, 3)->cap == 16 && l->class_cap[1] == 16);
+    put_row(l, 3, "xy", plain);
+    ASSERT_EQ_LL(group_of(l, 3)->cap, 16);
+    close_grid(l);
+    ASSERT_EQ_LL(g_fa.live, 0);
+    PASS();
+}
+
+/* Rows take memory of their size class, the largest 2 * cols + 2 commands from the start: the first build allocates once
+ * per row, and rows changing between short, plain and styled allocate nothing once each class had its most. */
+TEST rows_take_memory_of_their_class(void) {
+    static const char *const texts[3] = {"ab", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN", "abcdefghijklmnopqrstuvwxyzABCD"};
+    const shr_text_style lined = {WHITE, BLUE, SHR_STYLE_BG | SHR_STYLE_UNDERLINE};
+    const shr_text_style styles[3] = {plain, on_blue, lined}; /* 2, 41 and 61 commands */
+    static const size_t caps[3] = {16, 48, 82};
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(4, 40, use_fail_alloc);
+    ASSERT(l->class_cap[0] == 16 && l->class_cap[1] == 48 && l->class_cap[2] == 82);
+    for (int pass = 0; pass < 12; pass++) {
+        if (pass == 6) g_fa.budget = 0;
+        for (int32_t r = 0; r < 4; r++) {
+            ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, r, 0, 1, 40, plain), SHR_OK);
+            for (int32_t c = 0; texts[(r + pass) % 3][c]; c++)
+                ASSERT_EQ_LL(set_cell(l, r, c, (char[]){texts[(r + pass) % 3][c], 0}, 1, styles[(r + pass) % 3]), SHR_OK);
+        }
+        ASSERT_EQ_LL(l->flush(l->state), SHR_OK);
+        size_t held = 0;
+        for (int32_t r = 0; r < 4; r++) {
+            size_t cap = group_of(l, r)->cap;
+            ASSERT_EQ_LL(cap, caps[(r + pass) % 3]);
+            held += cap * sizeof(shr__rcmd) + (cap + SHR__BLOCK - 1) / SHR__BLOCK * sizeof(shr_rect);
+        }
+        if (pass == 0) ASSERT_EQ_LL(l->held, held); /* nothing idle: no memory was replaced */
+    }
+    close_grid(l);
+    ASSERT_EQ_LL(g_fa.live, 0);
+    PASS();
+}
+
 /* Each operation, then the row rebuild at submit, fails at every allocation in turn: it reports
- * SHR_E_NO_MEMORY, repeating it succeeds and the rows end up as without failures (rows that failed to
- * rebuild stay dirty for the next submit). */
+ * SHR_E_NO_MEMORY, repeating a failed operation succeeds and the rows end up as without failures (rows that failed
+ * to rebuild stay dirty for the next submit). */
 TEST out_of_memory_is_recoverable(void) {
-    for (int op = 0; op < 5; op++) {
+    for (int op = 0; op < 6; op++) {
         shr_status st = SHR_E_NO_MEMORY;
         for (long budget = 0; st == SHR_E_NO_MEMORY; budget++) {
             g_fa = (fail_alloc){-1, 0};
@@ -1138,10 +1456,11 @@ TEST out_of_memory_is_recoverable(void) {
             }
             g_fa.budget = budget;
             st = oom_op(op, l, f2);
-            if (st == SHR_OK) st = l->flush(l->state);
+            bool done = st == SHR_OK; /* a scroll is not repeated */
+            if (done) st = l->flush(l->state);
             g_fa.budget = -1;
             ASSERT(st == SHR_OK || st == SHR_E_NO_MEMORY);
-            if (st != SHR_OK) ASSERT_EQ_LL(oom_op(op, l, f2), SHR_OK);
+            if (!done) ASSERT_EQ_LL(oom_op(op, l, f2), SHR_OK);
             ASSERT_EQ_LL(oom_op(op, ref, f2), SHR_OK);
             assert_same_rows(ref, l);
             shr_lyr_destroy(ref);
@@ -1174,6 +1493,8 @@ int main(int argc, char **argv) {
     RUN_TEST(resize_refuses_layers_owned_elsewhere);
     RUN_TEST(resize_keeps_overlapping_cells_and_drops_cut_wide_cells);
     RUN_TEST(resize_switches_font);
+    RUN_TEST(cluster_glyphs_follow_a_font_switch);
+    RUN_TEST(texts_sharing_a_memo_slot_keep_their_glyphs);
     RUN_TEST(set_cell_validates_placed_input);
     RUN_TEST(set_cell_clears_the_wide_cells_it_overlaps);
     RUN_TEST(set_text_continues_lines_at_the_start_column);
@@ -1190,10 +1511,18 @@ int main(int argc, char **argv) {
     RUN_TEST(row_commands_follow_cell_styles);
     RUN_TEST(cache_hint_only_for_rows_covered_by_backgrounds);
     RUN_TEST(row_key_follows_every_input);
+    RUN_TEST(row_keys_repeat_in_a_new_context);
     RUN_TEST(only_changed_rows_are_rebuilt);
+    RUN_TEST(unchanged_cells_leave_their_row_clean);
     RUN_TEST(frames_show_backgrounds_glyphs_and_lines);
     RUN_TEST(styled_wide_glyph_stays_in_its_cells);
+    RUN_TEST(scroll_moves_rows_and_clears_the_uncovered_ones);
+    RUN_TEST(scrolled_frames_match_a_redraw);
     RUN_TEST(calls_are_refused_while_shutting_down);
+    RUN_TEST(long_text_is_freed_however_it_is_covered);
+    RUN_TEST(set_text_reuses_its_memory);
+    RUN_TEST(rebuilt_rows_reuse_their_memory);
+    RUN_TEST(rows_take_memory_of_their_class);
     RUN_TEST(out_of_memory_is_recoverable);
     GREATEST_MAIN_END();
 }

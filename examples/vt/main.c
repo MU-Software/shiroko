@@ -264,14 +264,17 @@ int main(int argc, char **argv) {
     app a = {.pixels = calloc((size_t)W * H, BPP)};
     a.term_alloc = (GhosttyAllocator){&a.term_mem, &G_VTABLE};
     a.rs_alloc = (GhosttyAllocator){&a.rs_mem, &G_VTABLE};
-    shr_allocator sa = {&a.shr_mem, s_alloc, s_free};
+    shr_allocator sa = {&a.shr_mem, s_alloc, s_free, 0};
     shr_text_limits limits;
     shr_pl_lyr_tilemap_limits_get(&limits);
     a.buf_len = limits.max_cell_bytes;
     a.buf = malloc(a.buf_len);
 
     shr_framebuffer_driver drv;
-    check("driver", shr_software_driver_create(&sa, 1u << 20, 256, &drv));
+    /* Keeps for the rows of three screens, each in a slot of one row. */
+    uint32_t keeps = 3 * (H / SHR_CELL_HEIGHT);
+    uint64_t slot = (W * SHR_CELL_HEIGHT * BPP + 127) / 128 * 128;
+    check("driver", shr_software_driver_create(&sa, keeps * slot, keeps, 256, &drv));
     shr_output out;
     shr_output_init(&out);
     out.user = &a, out.flags = SHR_OUTPUT_RELEASE_ON_PRESENT | SHR_OUTPUT_PRESERVES_CONTENT;

@@ -7,7 +7,8 @@ struct shr_pl_res_image {
     shr__buf buf[2];
     int cur;
     shr_rect behind;
-    const shr__buf *pinned; /* by the frame in flight; one frame at a time, resolving all its commands at once */
+    shr__buf *pinned; /* by the frame in flight, one at a time; it resolves to it throughout, band after band */
+    shr__resolved resolved;
     uint64_t last_frame;
     size_t bytes;
 };
@@ -33,12 +34,13 @@ static void img_copy(shr__buf *b, shr_rect rect, const uint8_t *src, size_t stri
     for (int32_t y = rect.y0; y < rect.y1; y++, dst += b->mem.stride, src += stride) memcpy(dst, src, row);
 }
 
-static shr_status img_resolve(shr__res *res, uint64_t id, uint64_t frame, shr__resolved *out) {
+static shr_status img_resolve(shr__res *res, uint64_t id, uint64_t frame, const shr__resolved **out) {
     shr_pl_res_image *img = (shr_pl_res_image *)res;
     (void)id;
     if (frame != img->last_frame) img->last_frame = frame, img->pinned = &img->buf[img->cur];
-    shr__buf *b = &img->buf[img->cur];
-    *out = (shr__resolved){b, {0, 0, b->mem.width, b->mem.height}, {0, 0}, false, 0, 0};
+    shr__buf *b = img->pinned;
+    img->resolved = (shr__resolved){b, {0, 0, b->mem.width, b->mem.height}, {0, 0}, false, 0, 0};
+    *out = &img->resolved;
     return SHR_OK;
 }
 

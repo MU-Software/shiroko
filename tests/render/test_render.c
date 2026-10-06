@@ -2,9 +2,11 @@
  * software: XXH3-128 of each output per scene, cell size and screen format against golden.txt (SHR_UPDATE_GOLDEN=1
  *   rewrites this build's entries; exit 77 when the file has none for this cell size), and reftest pairs exactly.
  * GPU backends: every scene against the software image within the scene's fuzzy limit, and reftest pairs fuzzily.
- * Options (before greatest's own, e.g. -t <name>): --backend software|angle, --golden, --reftest, --export (PNG of
- * every scene into the output directory), --out DIR, --frames N (times the first frame, update included, then N
- * full redraws per scene; -t filters by substring). Mismatches write expected/actual/diff PNGs into <out>/failures. */
+ * Bands: every composing scene and the band scenes drawn band by band in each band mode equal their composition.
+ * Options (before greatest's own, e.g. -t <name>): --backend software|angle|angle-keeps (ANGLE with keeps),
+ * --golden, --reftest, --export (PNG of every scene into the output directory), --out DIR, --frames N (times the first
+ * frame, update included, then N full redraws per scene; -t filters by substring). Mismatches write
+ * expected/actual/diff PNGs into <out>/failures. */
 #define _POSIX_C_SOURCE 200809L
 #include "check.h"
 #include "render.h"
@@ -38,7 +40,11 @@ typedef struct backend {
     void (*finish)(void); /* waits until the device finished everything submitted (frame timing) */
 } backend;
 
-static shr_status sw_driver_create(shr_framebuffer_driver *out) { return shr_software_driver_create(NULL, 1u << 20, 256, out); }
+/* Keep slots hold a row of the widest scene, 64 cells, in either format. */
+#define KEEP_SLOT ((64u * SHR_CELL_WIDTH * SHR_CELL_HEIGHT * 4 + 127) / 128 * 128)
+static shr_status sw_driver_create(shr_framebuffer_driver *out) {
+    return shr_software_driver_create(NULL, 128ull * KEEP_SLOT, 128, 256, out);
+}
 
 static shr_status sw_surface_create(shr_framebuffer_driver *d, int32_t w, int32_t h, shr_pixel_format f, shr_surface *out) {
     (void)d;
@@ -71,7 +77,12 @@ static const backend software = {"software",         sw_driver_create, shr_softw
                                  sw_surface_destroy, sw_surface_read,  no_finish};
 
 #ifdef SHR_RENDER_ANGLE
-static shr_status angle_driver_create(shr_framebuffer_driver *out) { return shr_angle_driver_create(NULL, 0, 256, out); }
+static shr_status angle_driver_create(shr_framebuffer_driver *out) {
+    return shr_angle_driver_create(NULL, 0, 0, 0, 256, out);
+}
+static shr_status angle_keeps_create(shr_framebuffer_driver *out) {
+    return shr_angle_driver_create(NULL, 0, 128ull * KEEP_SLOT, 128, 256, out);
+}
 static void angle_finish(void) { glFinish(); }
 static const backend angle = {"angle",
                               angle_driver_create,
@@ -80,7 +91,24 @@ static const backend angle = {"angle",
                               shr_angle_surface_destroy,
                               shr_angle_surface_read,
                               angle_finish};
+static uint64_t keep_stores, keep_draws; /* angle-keeps: summed over its drivers */
+static const backend angle_keeps = {"angle-keeps",
+                                    angle_keeps_create,
+                                    shr_angle_driver_destroy,
+                                    shr_angle_surface_create,
+                                    shr_angle_surface_destroy,
+                                    shr_angle_surface_read,
+                                    angle_finish};
 #endif
+
+/* Band composition for the scenes rendered next: count 0 = off; the height is clamped to the screen. */
+typedef struct band_mode {
+    uint32_t count;
+    int32_t height;
+    uint32_t align;
+} band_mode;
+
+static band_mode band;
 
 /* ===== Options ===== */
 
@@ -106,7 +134,7 @@ typedef struct run {
     stage s;
     shr_framebuffer_driver drv;
     bool has_drv;
-    shr_surface out, comp;
+    shr_surface out, comp, bands[2];
     int presents;
     uint32_t flags;
     char log[256];
@@ -168,9 +196,14 @@ static shr_status run_open(run *r, const backend *b, const scene *sc, int page) 
     r->has_drv = true;
     if (!stage_ok(s, b->surface_create(&r->drv, quarter ? sc->h : sc->w, quarter ? sc->w : sc->h, of, &r->out), "output"))
         return s->st;
-    bool composing = sc->rotation || of != SHR_PIXEL_FORMAT || (sc->screen_flags & SHR_SCREEN_COMPOSITION);
+    bool composing = !band.count && (sc->rotation || of != SHR_PIXEL_FORMAT || (sc->screen_flags & SHR_SCREEN_COMPOSITION));
     if (composing && !stage_ok(s, b->surface_create(&r->drv, sc->w, sc->h, SHR_PIXEL_FORMAT, &r->comp), "composition"))
         return s->st;
+    for (uint32_t i = 0; i < band.count; i++) /* CPU memory for every backend: sources are parts of them */
+        if (!stage_ok(s, sw_surface_create(NULL, sc->w, band.height < sc->h ? band.height : sc->h, SHR_PIXEL_FORMAT,
+                                           &r->bands[i]),
+                      "band"))
+            return s->st;
     shr_output output;
     shr_output_init(&output);
     output.user = r, output.acquire = out_acquire, output.present = out_present, output.discard = out_discard;
@@ -186,7 +219,9 @@ static shr_status run_open(run *r, const backend *b, const scene *sc, int page) 
     shr_screen_desc sd;
     shr_screen_desc_init(&sd);
     sd.width = sc->w, sd.height = sc->h, sd.rotation = sc->rotation, sd.output_format = sc->output_format;
-    sd.flags = sc->screen_flags, sd.composition = composing ? &r->comp : NULL, sd.clear = SHR_RGB(0x1E, 0x1F, 0x29);
+    sd.flags = band.count ? 0 : sc->screen_flags, sd.composition = composing ? &r->comp : NULL;
+    sd.clear = SHR_RGB(0x1E, 0x1F, 0x29);
+    sd.bands = band.count ? r->bands : NULL, sd.band_count = band.count, sd.band_align = band.align;
     if (!stage_ok(s, shr_screen_configure(s->ctx, &sd), "screen_configure")) return s->st;
     shr_pl_res_bitmap_font_desc fd;
     shr_pl_res_bitmap_font_desc_init(&fd);
@@ -220,7 +255,14 @@ static void run_close(run *r) {
         if (!done) stage_ok(s, SHR_E_STATE, "context did not shut down");
     }
     if (r->comp.byte_length || r->comp.resource_id) r->b->surface_destroy(&r->drv, &r->comp);
+    for (int i = 0; i < 2; i++)
+        if (r->bands[i].byte_length) sw_surface_destroy(NULL, &r->bands[i]);
     if (r->out.byte_length || r->out.resource_id) r->b->surface_destroy(&r->drv, &r->out);
+#ifdef SHR_RENDER_ANGLE
+    shr_angle_stats st;
+    if (r->has_drv && r->b == &angle_keeps && shr_angle_driver_stats(&r->drv, &st) == SHR_OK)
+        keep_stores += st.keep_stores, keep_draws += st.keep_draws;
+#endif
     if (r->has_drv) r->b->driver_destroy(&r->drv);
 }
 
@@ -469,14 +511,14 @@ TEST golden_test(void *arg) {
 
 /* ===== Reftests and GPU comparison ===== */
 
-static fuzz fuzz_of(const item *it) {
+static fuzz fuzz_of(const scene *sc) {
     if (opt.backend == &software) return (fuzz){0, 0};
-    fuzz f = it->sc->gpu;
+    fuzz f = sc->gpu;
     if (f.max_delta || f.max_pixels || SHR_PIXEL_FORMAT == SHR_FORMAT_RGBX8888) return f;
     /* RGB565 blends: the GPU may blend 16-bit targets at reduced precision, one step off on under 1 % of the
      * pixels (Metal); an RGB565 screen converted to RGBX8888 scales the step to 9. */
-    bool widened = it->sc->output_format == SHR_FORMAT_RGBX8888;
-    uint64_t pixels = (uint64_t)it->sc->w * (uint64_t)it->sc->h;
+    bool widened = sc->output_format == SHR_FORMAT_RGBX8888;
+    uint64_t pixels = (uint64_t)sc->w * (uint64_t)sc->h;
     return (fuzz){widened ? 9u : 1u, pixels / 50};
 }
 
@@ -489,7 +531,7 @@ TEST reftest_test(void *arg) {
     if (!a || !b) FAILm("reftest names an unknown scene");
     if (item_render(a, why, sizeof(why)) != SHR_OK || item_render(b, why, sizeof(why)) != SHR_OK) FAILm(why);
     diffstat d = compare(&b->pic, &a->pic);
-    fuzz f = fuzz_of(a);
+    fuzz f = fuzz_of(a->sc);
     if (within(d, f)) PASS();
     save_failure(a->name, &b->pic, &a->pic);
     fprintf(stderr, "reftest %s == %s: %llu pixels differ, max delta %u (allowed %u on %llu)\n", rt->test, rt->ref,
@@ -502,11 +544,110 @@ TEST gpu_test(void *arg) {
     static char why[512];
     if (item_render(it, why, sizeof(why)) != SHR_OK) FAILm(why);
     diffstat d = compare(&it->sw, &it->pic);
-    fuzz f = fuzz_of(it);
+    fuzz f = fuzz_of(it->sc);
     printf("%s: %llu pixels differ from software, max delta %u\n", it->name, (unsigned long long)d.pixels, d.max_delta);
     if (within(d, f)) PASS();
     save_failure(it->name, &it->sw, &it->pic);
     FAILm("differs from the software image beyond the fuzzy limit (images in failures/)");
+}
+
+/* ===== Band composition ===== */
+
+/* Heights that divide no screen of the catalog, one-pixel bands, 16-pixel bands aligned like the Tab5 PPA needs. */
+static const band_mode band_modes[] = {{1, 16, 0}, {2, 16, 0}, {1, 16, 16}, {2, 16, 16}, {1, 7, 0},
+                                       {2, 13, 0}, {2, 1, 0},  {1, 40, 8},  {2, 1 << 20, 0}};
+
+static bool composes(const scene *sc) {
+    return sc->rotation || (sc->output_format && sc->output_format != SHR_PIXEL_FORMAT) ||
+           (sc->screen_flags & SHR_SCREEN_COMPOSITION);
+}
+
+/* Scenes for band edges only (no goldens): opaque tilemap rows (cache pairs) and a sprite off the band grid. */
+#define BAND_BG SHR_RGB(0x28, 0x2A, 0x36)
+
+static shr_status bands_build(stage *s) {
+    const shr_color bg = BAND_BG;
+    shr_lyr *g = stage_grid(s, 0, (shr_rect){3, 5, 3 + 30 * CW, 5 + 9 * CH}, &bg);
+    for (int32_t r = 0; r < 9; r++)
+        stage_text(s, g, r, 0, "band rows \xEA\xB0\x80 \xE2\x94\x80 \xF0\x9F\x98\x80 abc",
+                   (shr_text_style){SHR_RGB(0xF8, 0xF8, 0xF2), SHR_RGB(0x44, 0x47, 0x5A),
+                                    r % 3 ? SHR_STYLE_BG : SHR_STYLE_BOLD | SHR_STYLE_ITALIC},
+                   0);
+    uint8_t px[40 * 50 * 4];
+    for (int i = 0; i < 40 * 50; i++)
+        px[4 * i] = (uint8_t)(i * 7), px[4 * i + 1] = (uint8_t)(i / 40 * 5), px[4 * i + 2] = 200, px[4 * i + 3] = (uint8_t)(i % 40 * 6);
+    shr_pl_res_image *img = stage_image(s, 40, 50, px);
+    shr_lyr *sp = stage_layer(s, 1, (shr_rect){37, 21, 77, 71});
+    if (sp) {
+        shr_lyr_cmd_begin(sp);
+        stage_ok(s, shr_lyr_cmd_image(sp, img, (shr_rect){0, 0, 40, 50}, (shr_point){0, 0}), "cmd_image");
+        stage_ok(s, shr_lyr_cmd_commit(sp), "commit");
+    }
+    return s->st;
+}
+
+static shr_status bands_update(stage *s) {
+    shr_lyr *g = s->nlayers > 1 ? s->layers[0] : NULL;
+    stage_cell(s, g, 2, 4, "X", 1, (shr_text_style){SHR_RGB(0xFF, 0x79, 0xC6), 0, SHR_STYLE_BOLD});
+    stage_cell(s, g, 6, 20, "\xED\x95\x9C", 2, (shr_text_style){SHR_RGB(0x50, 0xFA, 0x7B), BAND_BG, SHR_STYLE_BG});
+    if (s->nlayers > 1) stage_ok(s, shr_lyr_set_rect(s->layers[1], (shr_rect){90, 47, 130, 97}), "set_rect");
+    return s->st;
+}
+
+#define OTHER_FORMAT (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? SHR_FORMAT_RGBX8888 : SHR_FORMAT_RGB565)
+
+#define N_BAND_SCENES (sizeof(band_scenes) / sizeof(band_scenes[0]))
+
+static const scene band_scenes[] = {
+    {.name = "bands-rot90cw", .w = 256, .h = 160, .rotation = SHR_ROTATE_90_CW, .build = bands_build, .update = bands_update},
+    {.name = "bands-rot180", .w = 256, .h = 160, .rotation = SHR_ROTATE_180, .build = bands_build, .update = bands_update},
+    {.name = "bands-rot90ccw", .w = 256, .h = 160, .rotation = SHR_ROTATE_90_CCW, .build = bands_build, .update = bands_update},
+    {.name = "bands-format", .w = 256, .h = 160, .output_format = OTHER_FORMAT, .build = bands_build, .update = bands_update},
+    {.name = "bands-rot90cw-unpreserved", .w = 256, .h = 160, .rotation = SHR_ROTATE_90_CW, .flags = PRESERVE_NONE,
+     .build = bands_build, .update = bands_update},
+};
+
+/* Every band mode draws the composed scene (software: byte for byte; GPU: within its fuzzy limit), after a full
+ * redraw too (row cache hits). */
+static bool band_same(const scene *sc, int page, const picture *ref, char *why, size_t why_len) {
+    for (size_t m = 0; m < sizeof(band_modes) / sizeof(band_modes[0]); m++) {
+        band = band_modes[m];
+        if (band.align && (sc->w % (int32_t)band.align || sc->h % (int32_t)band.align || band.height % (int32_t)band.align))
+            continue;
+        picture pic;
+        double t[2];
+        shr_status st = render(opt.backend, sc, page, &pic, t, 1, why, why_len);
+        band = (band_mode){0, 0, 0};
+        diffstat d = st == SHR_OK ? compare(ref, &pic) : (diffstat){0, 0};
+        bool same = st == SHR_OK && within(d, fuzz_of(sc));
+        if (!same)
+            fprintf(stderr, "%s: band mode %u x %d align %u %s (%llu pixels, max delta %u)\n", sc->name,
+                    band_modes[m].count, band_modes[m].height, band_modes[m].align,
+                    st == SHR_OK ? "differs from the composition" : why, (unsigned long long)d.pixels, d.max_delta);
+        if (!same && st == SHR_OK) save_failure(sc->name, ref, &pic);
+        free(pic.px);
+        if (!same) return false;
+    }
+    return true;
+}
+
+TEST band_test(void *arg) {
+    item *it = arg;
+    static char why[512];
+    if (item_render(it, why, sizeof(why)) != SHR_OK) FAILm(why);
+    if (!band_same(it->sc, it->page, &it->pic, why, sizeof(why))) FAILm("band composition differs or failed");
+    PASS();
+}
+
+TEST band_scene_test(void *arg) {
+    const scene *sc = arg;
+    static char why[512];
+    picture ref;
+    if (render(opt.backend, sc, 1, &ref, NULL, 0, why, sizeof(why)) != SHR_OK) FAILm(why);
+    bool same = band_same(sc, 1, &ref, why, sizeof(why));
+    free(ref.px);
+    if (!same) FAILm("band composition differs or failed");
+    PASS();
 }
 
 /* ===== Frame timing ===== */
@@ -559,6 +700,7 @@ int main(int argc, char **argv) {
             opt.backend = !strcmp(name, "software") ? &software : NULL;
 #ifdef SHR_RENDER_ANGLE
             if (!strcmp(name, "angle")) opt.backend = &angle;
+            if (!strcmp(name, "angle-keeps")) opt.backend = &angle_keeps;
 #endif
             if (!opt.backend) {
                 fprintf(stderr, "unknown backend %s\n", name);
@@ -583,7 +725,7 @@ int main(int argc, char **argv) {
     if (!opt.golden && !opt.reftest) opt.golden = opt.reftest = true;
 #ifdef SHR_RENDER_ANGLE
     shr_angle_offscreen *gl = NULL;
-    if (opt.backend == &angle) {
+    if (opt.backend == &angle || opt.backend == &angle_keeps) {
         if (shr_angle_offscreen_create(16, 16, &gl) != SHR_OK) {
             fprintf(stderr, "no ANGLE offscreen context\n");
             return EXIT_FAILURE;
@@ -606,6 +748,15 @@ int main(int argc, char **argv) {
             else if (opt.golden)
                 RUN_TEST1(golden_test, &items[i]);
         }
+        for (volatile size_t i = 0; opt.golden && i < item_count; i++) {
+            if (!composes(items[i].sc)) continue;
+            greatest_set_test_suffix(items[i].name);
+            RUN_TEST1(band_test, &items[i]);
+        }
+        for (volatile size_t i = 0; opt.golden && i < N_BAND_SCENES; i++) {
+            greatest_set_test_suffix(band_scenes[i].name);
+            RUN_TEST1(band_scene_test, (void *)&band_scenes[i]);
+        }
         for (volatile size_t i = 0; opt.reftest && i < reftest_count; i++) {
             greatest_set_test_suffix(reftests[i].test);
             RUN_TEST1(reftest_test, (void *)&reftests[i]);
@@ -613,6 +764,12 @@ int main(int argc, char **argv) {
         if (opt.golden && opt.backend == &software && getenv("SHR_UPDATE_GOLDEN")) golden_update();
         GREATEST_PRINT_REPORT();
         result = !greatest_all_passed() ? EXIT_FAILURE : golden_skipped ? 77 : EXIT_SUCCESS;
+#ifdef SHR_RENDER_ANGLE
+        if (opt.backend == &angle_keeps) {
+            printf("keeps: %llu stored, %llu drawn\n", (unsigned long long)keep_stores, (unsigned long long)keep_draws);
+            if (!keep_stores || !keep_draws) result = EXIT_FAILURE;
+        }
+#endif
     }
     for (size_t i = 0; i < item_count; i++) free(items[i].pic.px), free(items[i].sw.px);
     free(items), free(golden), free(results);

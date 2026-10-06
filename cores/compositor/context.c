@@ -41,8 +41,7 @@ void **shr__ctx_plugin_slot(shr_context *ctx, const void *kind) {
 shr_status shr__res_attach(shr_context *ctx, shr__res *res, const shr__res_ops *ops) {
     if (!ctx || !res || !ops || !ops->resolve || !ops->free) return SHR_E_INVALID_ARG;
     if (shr__ctx_refused(ctx)) return SHR_E_STATE;
-    static _Atomic uint64_t serial;
-    *res = (shr__res){ops, ctx, 0, false, atomic_fetch_add(&serial, 1) + 1, ctx->resources};
+    *res = (shr__res){ops, ctx, 0, false, ++ctx->res_serial, ctx->resources};
     ctx->resources = res;
     return SHR_OK;
 }
@@ -135,10 +134,16 @@ static void context_free(shr_context *ctx) {
     shr__vec_free(&f->resolved, &al);
     shr__vec_free(&f->prologue, &al);
     shr__vec_free(&f->planned, &al);
+    shr__vec_free(&f->kept, &al);
+    shr__vec_free(&f->batches, &al);
     composition_free(ctx);
-    uint32_t nb = ctx->driver.caps.max_buffers;
-    SHR_FREE_ARRAY(&al, ctx->slots, shr__slot, nb);
-    SHR_FREE_ARRAY(&al, ctx->released, uint32_t, nb);
+    uint32_t nb = ctx->driver.caps.max_buffers, nk = ctx->driver.caps.max_keeps;
+    SHR_FREE_HOT_ARRAY(&al, ctx->slots, shr__slot, nb);
+    SHR_FREE_HOT_ARRAY(&al, ctx->released, uint32_t, nb);
+    SHR_FREE_HOT_ARRAY(&al, ctx->keeps, shr__keep, nk);
+    SHR_FREE_HOT_ARRAY(&al, ctx->keep_released, uint32_t, nk);
+    SHR_FREE_HOT_ARRAY(&al, ctx->keep_heads, uint32_t, (size_t)ctx->keep_mask + 1);
+    SHR_FREE_HOT_ARRAY(&al, ctx->seen, shr__seen, ctx->seen_mask + 1);
     shr__free(&al, ctx->io, ctx->nio * sizeof(shr__io), SHR_ALIGNOF(shr__io), SHR_ALLOC_DESCRIPTOR);
     shr__free(&al, ctx->events, ctx->event_cap * sizeof(shr_event), SHR_ALIGNOF(shr_event), SHR_ALLOC_DESCRIPTOR);
     shr__free(&al, ctx->unreleased, ctx->desc.max_unreleased_frames * sizeof(uint64_t), 8, SHR_ALLOC_DESCRIPTOR);
@@ -155,7 +160,7 @@ shr_status shr_create(const shr_context_desc *d, shr_context **out) {
         d->event_capacity < 2 || d->event_capacity - 2 < d->max_unreleased_frames || !d->max_reads ||
         (unsigned)d->blink.restart > SHR_BLINK_RESTART_ON_SUBMIT || (unsigned)o->timestamp > SHR_TIMESTAMP_COMPOSITOR ||
         (o->flags & ~(uint32_t)(SHR_OUTPUT_RELEASE_ON_PRESENT | SHR_OUTPUT_PRESERVES_CONTENT)) ||
-        (!d->now_ns && (d->io_retry_ns || d->io_timeout_ns || drv->caps.timeout_ns)) ||
+        (!d->now_ns && (d->io_retry_ns || d->io_timeout_ns || d->min_frame_interval_ns || drv->caps.timeout_ns)) ||
         !shr__alloc_init(&al, d->allocator))
         return SHR_E_INVALID_ARG;
     if (d->max_reads > 0xFFFF) return SHR_E_LIMIT;
@@ -176,25 +181,40 @@ shr_status shr_create(const shr_context_desc *d, shr_context **out) {
     ctx->frame.target_rec = -1;
     atomic_init(&ctx->fence_state, 0);
     for (int i = 0; i < SHR_TARGETS; i++) {
-        SHR_VEC_INIT(&ctx->targets[i].damage.rects, shr_rect);
-        SHR_VEC_INIT(&ctx->targets[i].provisional, shr_rect);
+        SHR_VEC_INIT_HOT(&ctx->targets[i].damage.rects, shr_rect);
+        SHR_VEC_INIT_HOT(&ctx->targets[i].provisional, shr_rect);
     }
-    SHR_VEC_INIT(&ctx->staged.rects, shr_rect);
-    SHR_VEC_INIT(&ctx->frame.cmds, shr_draw_cmd);
-    SHR_VEC_INIT(&ctx->frame.damage, shr_rect);
-    SHR_VEC_INIT(&ctx->frame.provisional, shr_rect);
-    SHR_VEC_INIT(&ctx->frame.resolved, shr__res *);
-    SHR_VEC_INIT(&ctx->frame.prologue, shr_draw_cmd);
-    SHR_VEC_INIT(&ctx->frame.planned, shr__planned);
+    SHR_VEC_INIT_HOT(&ctx->staged.rects, shr_rect);
+    SHR_VEC_INIT_HOT(&ctx->frame.cmds, shr_draw_cmd);
+    SHR_VEC_INIT_HOT(&ctx->frame.damage, shr_rect);
+    SHR_VEC_INIT_HOT(&ctx->frame.provisional, shr_rect);
+    SHR_VEC_INIT_HOT(&ctx->frame.resolved, shr__res *);
+    SHR_VEC_INIT_HOT(&ctx->frame.prologue, shr_draw_cmd);
+    SHR_VEC_INIT_HOT(&ctx->frame.planned, shr__planned);
+    SHR_VEC_INIT_HOT(&ctx->frame.kept, shr__kept);
+    SHR_VEC_INIT_HOT(&ctx->frame.batches, shr__batch);
     ctx->io = shr__calloc(&al, ctx->nio, sizeof(shr__io), SHR_ALIGNOF(shr__io), SHR_ALLOC_DESCRIPTOR);
     ctx->events = shr__calloc(&al, ctx->event_cap, sizeof(shr_event), SHR_ALIGNOF(shr_event), SHR_ALLOC_DESCRIPTOR);
     ctx->unreleased = shr__calloc(&al, d->max_unreleased_frames, sizeof(uint64_t), 8, SHR_ALLOC_DESCRIPTOR);
-    ctx->slots = SHR_NEW_ARRAY(&al, shr__slot, drv->caps.max_buffers);
-    ctx->released = SHR_NEW_ARRAY(&al, uint32_t, drv->caps.max_buffers);
-    if (!ctx->io || !ctx->events || !ctx->unreleased || !ctx->slots || !ctx->released) {
+    ctx->slots = SHR_NEW_HOT_ARRAY(&al, shr__slot, drv->caps.max_buffers);
+    ctx->released = SHR_NEW_HOT_ARRAY(&al, uint32_t, drv->caps.max_buffers);
+    uint32_t chains = 1u << (31 - __builtin_clz(drv->caps.max_keeps | 1)); /* at most two keeps per chain */
+    ctx->keep_mask = chains - 1;
+    ctx->keep_budget = drv->caps.keep_bytes ? drv->caps.keep_bytes : UINT64_MAX;
+    ctx->keep_store_bytes = SHR__KEEP_STORE_BYTES;
+    ctx->keep_credit = (uint32_t)((uint64_t)drv->caps.max_keeps * 2 / 3);
+    ctx->keeps = SHR_NEW_HOT_ARRAY(&al, shr__keep, drv->caps.max_keeps);
+    ctx->keep_released = SHR_NEW_HOT_ARRAY(&al, uint32_t, drv->caps.max_keeps);
+    ctx->keep_heads = SHR_NEW_HOT_ARRAY(&al, uint32_t, chains);
+    ctx->seen = SHR_NEW_HOT_ARRAY(&al, shr__seen, (size_t)chains * 8);
+    ctx->seen_mask = (size_t)chains * 8 - 1; /* 4-8 per keep */
+    if (!ctx->io || !ctx->events || !ctx->unreleased || !ctx->slots || !ctx->released || !ctx->keeps ||
+        !ctx->keep_released || !ctx->keep_heads || !ctx->seen) {
         context_free(ctx);
         return SHR_E_NO_MEMORY;
     }
+    for (uint32_t i = 0; i < drv->caps.max_keeps; i++) /* the driver may hold anything there */
+        ctx->keeps[i].releasing = true, ctx->keep_released[ctx->nkeep_released++] = i + 1;
     for (uint32_t i = 0; i < ctx->nio; i++) atomic_init(&ctx->io[i].state, 0);
     *out = ctx;
     return SHR_OK;
@@ -230,22 +250,27 @@ void shr__targets_invalidate(shr_context *ctx) {
         t->used = false;
         t->damage.rects.len = 0;
         t->damage.full = false;
+        t->damage.nmoves = 0;
         t->provisional.len = 0;
     }
     ctx->last_provisional = false;
 }
 
-/* Adjacent or overlapping rectangles merge; beyond SHR_MAX_DAMAGE the cheapest merge is taken. */
+static inline int32_t area32(shr_rect r) { return (r.x1 - r.x0) * (r.y1 - r.y0); }
+
+/* Adjacent or overlapping rectangles merge; beyond SHR_MAX_DAMAGE the cheapest merge is taken. Areas on the screen
+ * (at most 16384 x 16384 px) fit in 32 bits. */
 void shr__damage_add(const shr_context *ctx, shr__damage *d, shr_rect r) {
     r = shr__rect_intersect(r, (shr_rect){0, 0, ctx->screen.width, ctx->screen.height});
     if (d->full || shr__rect_empty(r)) return;
     shr_rect *v = d->rects.data;
     size_t best = 0;
-    int64_t best_growth = INT64_MAX;
+    int32_t area = area32(r), best_growth = INT32_MAX;
     for (size_t i = 0; i < d->rects.len; i++) {
-        int64_t growth = shr__rect_area(shr__rect_union(v[i], r)) - shr__rect_area(v[i]);
-        if (growth <= shr__rect_area(r)) {
-            v[i] = shr__rect_union(v[i], r);
+        shr_rect u = shr__rect_union(v[i], r);
+        int32_t growth = area32(u) - area32(v[i]);
+        if (growth <= area) {
+            v[i] = u;
             return;
         }
         if (growth < best_growth) best = i, best_growth = growth;
@@ -261,6 +286,27 @@ void shr__damage_add(const shr_context *ctx, shr__damage *d, shr_rect r) {
         d->full = true;
 }
 
+void shr__moves_drop(const shr_context *ctx, shr__damage *d) {
+    for (uint32_t i = 0; i < d->nmoves; i++) shr__damage_add(ctx, d, d->moves[i].area);
+    d->nmoves = 0;
+}
+
+void shr__damage_move(const shr_context *ctx, shr__damage *d, shr__move m) {
+    shr__move *last = &d->moves[d->nmoves - !!d->nmoves];
+    int32_t dy = last->dy + m.dy;
+    bool merge = d->nmoves && !memcmp(&last->area, &m.area, sizeof(m.area)) && (last->dy ^ m.dy) >= 0 &&
+                 2 * (int64_t)(dy < 0 ? -dy : dy) < (int64_t)m.area.y1 - m.area.y0;
+    if (!merge && d->nmoves == SHR_MAX_MOVES) shr__moves_drop(ctx, d);
+    for (size_t i = 0, n = d->rects.len; i < n; i++) {
+        shr_rect r = shr__rect_intersect(*SHR_VEC_AT(&d->rects, shr_rect, i), m.area);
+        shr__damage_add(ctx, d, shr__rect_intersect(shr__rect_move(r, 0, m.dy), m.area));
+    }
+    if (merge)
+        last->dy = dy;
+    else
+        d->moves[d->nmoves++] = m;
+}
+
 void shr__damage_targets(shr_context *ctx, shr_rect r) {
     for (int i = 0; i < SHR_TARGETS; i++)
         if (ctx->targets[i].used) shr__damage_add(ctx, &ctx->targets[i].damage, r);
@@ -274,8 +320,25 @@ shr_status shr_screen_configure(shr_context *ctx, const shr_screen_desc *d) {
         (out_fmt != SHR_FORMAT_RGB565 && out_fmt != SHR_FORMAT_RGBX8888) || (unsigned)d->rotation > SHR_ROTATE_90_CCW ||
         (d->flags & ~(uint32_t)SHR_SCREEN_COMPOSITION))
         return SHR_E_INVALID_ARG;
-    bool composing = d->rotation != SHR_ROTATE_NONE || out_fmt != fmt || (d->flags & SHR_SCREEN_COMPOSITION) ||
-                     d->composition;
+    bool composing = !d->band_count && (d->rotation != SHR_ROTATE_NONE || out_fmt != fmt ||
+                                        (d->flags & SHR_SCREEN_COMPOSITION) || d->composition);
+    /* A band's ROTATE sources start at multiples of `a` rows and columns into it. */
+    const shr_driver_caps *k = &ctx->driver.caps;
+    int32_t a = d->band_align ? (int32_t)d->band_align : 1;
+    size_t at;
+    if (d->band_count > 2 || (d->band_count && (!d->bands || d->composition || d->flags)) || d->band_align > 16384 ||
+        (d->band_count && (d->width % a || d->height % a)))
+        return SHR_E_INVALID_ARG;
+    for (uint32_t i = 0; i < d->band_count; i++) {
+        const shr_surface *b = &d->bands[i];
+        if (shr_surface_validate(b) != SHR_OK || b->width != d->width || b->height != d->bands[0].height ||
+            b->height <= 0 || b->height > d->height || b->height % a || b->format != fmt)
+            return SHR_E_INVALID_ARG;
+        shr_format_row_bytes(fmt, a, &at);
+        if (b->domain == SHR_MEMORY_DEVICE || !shr__driver_reaches(k, b) ||
+            (k->address_align && (at % k->address_align || (size_t)a * b->stride % k->address_align)))
+            return SHR_E_UNSUPPORTED;
+    }
     if (d->rotation != SHR_ROTATE_NONE && out_fmt != fmt) return SHR_E_UNSUPPORTED;
     if (ctx->frame.running || ctx->frame.state == FRAME_ISOLATED) return SHR_E_WOULD_BLOCK;
     shr_surface comp = {0};
@@ -296,15 +359,33 @@ shr_status shr_screen_configure(shr_context *ctx, const shr_screen_desc *d) {
         comp = (shr_surface){px, d->width, d->height, row, len, fmt, 1, dom, 0};
         owned = true;
     }
-    if (composing && !shr__driver_reaches(&ctx->driver.caps, &comp)) { /* every frame would fail */
+    /* With bands one band's commands at a time, in a list reserved up front: two per cell of a band (a FILL and a
+     * GLYPH), and room for its buffer commands and conversions. */
+    shr__vec cmds;
+    SHR_VEC_INIT(&cmds, shr_draw_cmd);
+    cmds.kind = SHR__HOT;
+    size_t cells = d->band_count ? (size_t)((d->width + SHR_CELL_WIDTH - 1) / SHR_CELL_WIDTH) *
+                                       (size_t)((d->bands[0].height + SHR_CELL_HEIGHT - 1) / SHR_CELL_HEIGHT)
+                                 : 0;
+    shr_status st = SHR_OK;
+    if (composing && !shr__driver_reaches(&ctx->driver.caps, &comp)) /* every frame would fail */
+        st = SHR_E_UNSUPPORTED;
+    else if (d->band_count && !shr__vec_reserve(&cmds, &ctx->al, 2 * cells + 32))
+        st = SHR_E_NO_MEMORY;
+    if (st != SHR_OK) {
         if (owned) shr__free(&ctx->al, comp.pixels, comp.byte_length, 64, alloc_kind(comp.domain));
-        return SHR_E_UNSUPPORTED;
+        return st;
     }
     shr__frame_abandon(ctx);
     composition_free(ctx);
+    shr__vec_free(&ctx->frame.cmds, &ctx->al);
+    ctx->frame.cmds = cmds;
     ctx->screen = *d;
     ctx->screen.output_format = out_fmt;
     ctx->screen.composition = NULL;
+    ctx->screen.bands = NULL;
+    ctx->band_count = d->band_count;
+    for (uint32_t i = 0; i < d->band_count; i++) ctx->bands[i] = d->bands[i];
     ctx->composing = composing;
     ctx->composition = comp;
     ctx->composition_owned = owned;
@@ -500,6 +581,24 @@ shr_status shr_surface_validate(const shr_surface *s) SHR_NONBLOCKING {
 shr_status shr_image_validate(const shr_image *m) SHR_NONBLOCKING {
     return m ? buffer_check(m->pixels, m->width, m->height, m->stride, m->byte_length, m->format, m->domain)
              : SHR_E_INVALID_ARG;
+}
+
+_Static_assert(sizeof(shr_draw_cmd) == 64, "commands are 64 bytes on every ABI");
+
+shr_status shr_image_ref_get(const shr_image_ref *ref, shr_image *out) SHR_NONBLOCKING {
+    if (!ref || !out) return SHR_E_INVALID_ARG;
+    shr_pixel_format f = (shr_pixel_format)ref->format;
+    shr_memory_domain dom = (shr_memory_domain)ref->domain;
+    uint64_t len = ref->width > 0 && ref->height > 0 && dom != SHR_MEMORY_DEVICE
+                       ? (uint64_t)(ref->height - 1) * ref->stride + row_bytes(f, ref->width)
+                       : 0;
+#if SIZE_MAX < UINT64_MAX
+    if (len > SIZE_MAX) return SHR_E_OVERFLOW;
+#endif
+    shr_image m = {ref->pixels, ref->width, ref->height, ref->stride, (size_t)len, f, dom};
+    shr_status st = shr_image_validate(&m);
+    if (st == SHR_OK) *out = m;
+    return st;
 }
 
 static bool buf_format(shr_pixel_format f) {

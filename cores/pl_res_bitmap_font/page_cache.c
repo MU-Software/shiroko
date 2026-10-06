@@ -255,6 +255,37 @@ void shr__pages_schedule(shr_pl_res_bitmap_font *f) {
     f->wants.len = k;
 }
 
+int shr__preload_role(const shr_pl_res_bitmap_font *f) {
+    if (f->wants.len || f->preloading || f->delivered) return 0; /* frames first, one page per pump */
+    for (int r = ROLE_LATIN; r < ROLE_COUNT; r++) {
+        const shr__pkg *pkg = &f->pkg[r];
+        if (pkg->state == PKG_READY && pkg->preload_next < pkg->preload && pkg->preload_next < pkg->npages &&
+            (pkg->mapped || !f->blocked))
+            return r;
+    }
+    return 0;
+}
+
+/* Starts the next page of a preload unless it exists already or the cache has no room for it without evicting
+ * (which ends the preload); a page whose read cannot start is left to the frames. */
+void shr__pages_preload(shr_pl_res_bitmap_font *f) {
+    int role = shr__preload_role(f);
+    if (!role) return;
+    shr__pkg *pkg = &f->pkg[role];
+    uint32_t i = pkg->preload_next++;
+    const uint8_t *e = pkg->ptab + SHR_PKG_PTAB * (uint64_t)i;
+    uint64_t need = (uint64_t)pkg->atlas_h * pkg->stride + 16ull * shr__rd16(e + 20) + shr__rd32(e + 16) * !pkg->mapped;
+    if (f->page_bytes + need > f->cache_bytes) pkg->preload = 0;
+    if (pkg->pages[i] || !pkg->preload) return;
+    shr__page *p = SHR_NEW(&f->al, shr__page);
+    if (!p) return;
+    *p = (shr__page){.pkg = pkg, .index = i};
+    pkg->pages[i] = p;
+    page_load(f, p, shr__font_now(f));
+    if (p->state == PAGE_LOADING) f->preloading = p;
+    page_forget(f, p);
+}
+
 static uint32_t seq_find(const shr__pkg *pkg, const uint32_t *cps, size_t n) {
     uint32_t lo = 0, hi = pkg->nseqs;
     while (lo < hi) {

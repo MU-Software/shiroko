@@ -7,9 +7,9 @@
  * and (0x80) with 0x08 reads that never complete (the watchdog cancels them), else reads returning different
  * bytes each time. Byte 1: RESEAL recomputes the page, index entry, index and header checksums of the package
  * before it is served (so mutations reach the decoders and record checks), MISALIGN maps it at an odd address
- * (else 256-aligned, so stored pages can be drawn in place). Invariants: no out-of-bounds access, every frame
- * rasters (bad packages or pages fall back), both paths draw the same pixels while reads are faithful, each
- * opened source is closed. */
+ * (else 256-aligned, so stored pages can be drawn in place), PRELOAD preloads all its pages first. Invariants: no
+ * out-of-bounds access, every frame rasters (bad packages or pages fall back), both paths draw the same pixels while
+ * reads are faithful, each opened source is closed. */
 #include "fuzz_common.h"
 #include "shr_hash.h"
 
@@ -26,7 +26,9 @@ static const char *const others[3] = {
     "\xF0\x9F\x98\x9F\xF0\x9F\x98\x98\xF0\x9F\x98\x9A\xF0\x9F\x98\x94"}; /* U+1F61F, 1F618, 1F61A, 1F614 */
 
 enum { ASYNC = 0x08, BOLD_ITALIC = 0x10, TINY_CACHE = 0x20, FAIL_FIRST = 0x40, ODD = 0x80 };
-enum { RESEAL = 0x01, MISALIGN = 0x02 };
+enum { RESEAL = 0x01, MISALIGN = 0x02, PRELOAD = 0x04 };
+
+static bool preload;
 
 /* The smallest page side >= n, as the seed shape picks it. */
 static uint32_t side(uint32_t n) {
@@ -130,7 +132,7 @@ static uint8_t mapped_pixels[sizeof(out.pixels)];
 static void render(pkg_source *src, uint8_t mode) {
     memset(&out, 0, sizeof(out));
     shr_framebuffer_driver drv;
-    FUZZ_CHECK(shr_software_driver_create(NULL, 0, 64, &drv) == SHR_OK);
+    FUZZ_CHECK(shr_software_driver_create(NULL, 0, 0, 64, &drv) == SHR_OK);
     if ((mode & 7) >= 5) drv.caps.stride_align = 16;
     shr_output o;
     fuzz_output_init(&out, &o, 0);
@@ -155,6 +157,10 @@ static void render(pkg_source *src, uint8_t mode) {
     fd.user = src, fd.open = src_open;
     shr_pl_res_bitmap_font *font;
     FUZZ_CHECK(shr_pl_res_bitmap_font_create(ctx, &fd, &font) == SHR_OK);
+    if (preload) {
+        FUZZ_CHECK(shr_pl_res_bitmap_font_preload(font, src->name, UINT32_MAX) == SHR_OK);
+        settle(ctx, src);
+    }
     shr_lyr *l;
     FUZZ_CHECK(shr_lyr_create(ctx, 0, (shr_rect){0, 0, FUZZ_W, FUZZ_H}, &l) == SHR_OK);
     FUZZ_CHECK(shr_pl_lyr_tilemap_resize(l, font, 3, FUZZ_W / SHR_CELL_WIDTH, NULL) == SHR_OK);
@@ -218,6 +224,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     FUZZ_CHECK(buf);
     memcpy(pkg, data + 2, n);
     if (flags & RESEAL) reseal(pkg, n);
+    preload = flags & PRELOAD;
     const char *name = roles[(mode & 7) % 5];
     pkg_source src = {.data = pkg, .size = n, .name = name, .mapped = true};
     render(&src, mode);

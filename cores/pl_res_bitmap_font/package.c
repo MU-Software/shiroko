@@ -7,7 +7,7 @@ void shr__pkg_release(shr__pkg *pkg) {
     shr__free(&f->al, pkg->buf, pkg->buf_len, 8, SHR_ALLOC_PAYLOAD);
     shr__free(&f->al, pkg->meta, pkg->meta_len, 64, SHR_ALLOC_PAYLOAD);
     if (pkg->src.close) SHR_HOST(f->res.ctx, pkg->src.close(pkg->src.user));
-    *pkg = (shr__pkg){.font = f, .role = pkg->role, .state = pkg->state, .retry = pkg->retry};
+    *pkg = (shr__pkg){.font = f, .role = pkg->role, .state = pkg->state, .retry = pkg->retry, .preload = pkg->preload};
 }
 
 static void pkg_fail(shr__pkg *pkg, shr_status st, const char *why) {
@@ -306,12 +306,16 @@ static void pkg_mapped(shr__pkg *pkg) {
         pkg_fail(pkg, st, why);
 }
 
-static void pkg_open(shr__pkg *pkg) {
+void shr__pkg_name(const shr__pkg *pkg, char name[40]) {
     static const char *const names[ROLE_COUNT] = {NULL, "latin", "cjk-", "symbols", "emoji", "nerd"};
-    shr_pl_res_bitmap_font *f = pkg->font;
-    const char *parts[4] = {"shiroko-", names[pkg->role], pkg->role == ROLE_CJK ? f->locale : "", ".shrf"};
-    char name[40];
+    const char *parts[4] = {"shiroko-", names[pkg->role], pkg->role == ROLE_CJK ? pkg->font->locale : "", ".shrf"};
     for (size_t i = 0, at = 0; i < 4; at += strlen(parts[i++])) memcpy(name + at, parts[i], strlen(parts[i]) + 1);
+}
+
+static void pkg_open(shr__pkg *pkg) {
+    shr_pl_res_bitmap_font *f = pkg->font;
+    char name[40];
+    shr__pkg_name(pkg, name);
     shr_asset_source src = {0};
     shr_status st = SHR_E_NOT_FOUND;
     if (f->open) SHR_HOST(f->res.ctx, st = f->open(f->user, name, &src));

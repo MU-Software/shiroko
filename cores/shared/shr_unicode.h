@@ -138,10 +138,11 @@ static inline void shr__classify(const uint32_t *cps, size_t n, shr__cluster_cla
         *out = (shr__cluster_class){1, SHR_CLUSTER_REPLACEMENT, SHR_GLYPH_REPLACEMENT, 0};
         return;
     }
-    bool selected = n >= 2 && shr__emoji_vs_registered(cps[0]); /* base, selector, then only marks or ignorables */
+    bool emo = n >= 2 && (shr__uprops(cps[0]) & SHR_UP_EMOJI); /* selector bases and emoji sequences start with one */
+    bool selected = emo && shr__emoji_vs_registered(cps[0]); /* base, selector, then only marks or ignorables */
     for (size_t i = 2; selected && i < n; i++) selected = (shr__uprops(cps[i]) & (SHR_UP_MARK | SHR_UP_DI)) != 0;
     bool emoji = n == 1 ? (first_props & SHR_UP_EPRES) != 0
-                        : (selected && cps[1] == SHR_VS16) || shr__emoji_sequence(cps, n);
+                        : (selected && cps[1] == SHR_VS16) || (emo && shr__emoji_sequence(cps, n));
     if (emoji) {
         bool single = bases == 1 && n <= 2;
         *out = (shr__cluster_class){2, SHR_CLUSTER_EMOJI, single ? SHR_GLYPH_SCALAR : SHR_GLYPH_SEQUENCE,

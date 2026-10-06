@@ -43,6 +43,7 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "SHIROKO_PORT_ANGLE": "ON",
         "SHIROKO_EXAMPLE_DESKTOP": "ON",
+        "SHIROKO_PIXEL_FORMAT": "RGBX8888",
         "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets"
       }
     }

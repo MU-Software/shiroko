@@ -18,8 +18,9 @@ static struct {
     shr_draw_cmd pro[64];
     size_t npro;
     int frames, logs, kinds[16];
-    uint64_t damaged, commands; /* of the last RASTER_BEGIN */
+    uint64_t damaged, commands; /* of the last RASTER_BEGIN, RASTER_END */
     uint64_t submit_id;         /* of the last SUBMIT */
+    uint64_t converted;         /* of the last CONVERT */
     int syncs;
     const void *sync_addr[8];
     size_t sync_len[8];
@@ -29,8 +30,10 @@ static struct {
 static void rec_trace(void *user, const shr_trace_event *ev) {
     (void)user;
     rec.kinds[ev->kind]++;
-    if (ev->kind == SHR_TRACE_RASTER_BEGIN) rec.frames++, rec.commands = ev->value0, rec.damaged = ev->value1;
+    if (ev->kind == SHR_TRACE_RASTER_BEGIN) rec.frames++, rec.damaged = ev->value1;
+    if (ev->kind == SHR_TRACE_RASTER_END) rec.commands = ev->value0;
     if (ev->kind == SHR_TRACE_SUBMIT) rec.submit_id = ev->id;
+    if (ev->kind == SHR_TRACE_CONVERT) rec.converted = ev->value0;
 }
 
 static void rec_log(void *user, shr_status st, const char *msg) {
@@ -100,13 +103,13 @@ typedef struct fake {
     shr_status io_st;
 } fake;
 
-static shr_status fk_resolve(shr__res *r, uint64_t id, uint64_t frame, shr__resolved *out) {
+static shr_status fk_resolve(shr__res *r, uint64_t id, uint64_t frame, const shr__resolved **out) {
     fake *f = (fake *)r;
     (void)frame;
     f->resolves++;
     if (!id) return SHR_E_NOT_FOUND;
     if (f->st != SHR_OK) return f->st;
-    *out = f->px;
+    *out = &f->px;
     return SHR_OK;
 }
 static void fk_end(shr__res *r, uint64_t frame) { (void)frame, ((fake *)r)->ends++; }
@@ -154,6 +157,20 @@ static shr__lcmd glyph(fake *f, int32_t x, int32_t y, shr_color color) {
 
 static shr__lcmd fill(shr_rect r, shr_color color) {
     return (shr__lcmd){.kind = SHR__LCMD_FILL, .dst = r, .color = color};
+}
+
+static const uint64_t nokey[2];
+
+/* `c` (x on cell edges) as a row command. */
+static shr__rcmd row_of(shr__lcmd c) {
+    bool glyph = c.kind == SHR__LCMD_GLYPH;
+    return (shr__rcmd){(uint16_t)(c.dst.x0 / SHR_CELL_WIDTH), (uint16_t)(c.dst.x1 / SHR_CELL_WIDTH), (uint8_t)c.dst.y0,
+                       (uint8_t)c.dst.y1, c.kind, (uint8_t)c.flags, c.color, glyph ? c.id : 0, glyph ? c.bg : 0};
+}
+
+/* Row group `id` at oy from n row commands copied. */
+static shr_status rows_set(shr_lyr *l, uint32_t id, int32_t oy, shr__res *res, shr__rcmd *c, size_t n) {
+    return shr__lyr_row_commit(l, id, oy, res, nokey, c, n);
 }
 
 /* ---- helpers ---- */
@@ -239,7 +256,7 @@ TEST test_init_functions(void) {
     ASSERT(d.blink.start_visible && !d.blink.interval_ns && !d.driver && !d.output && !d.now_ns && !d.allocator);
     ASSERT(d.event_capacity == 64 && d.max_unreleased_frames == 2 && d.max_commands == 16384 && d.max_reads == 4);
     ASSERT(d.page_cache_bytes == 3u << 20 && d.image_bytes == 4u << 20 && d.io_retry_limit == 3);
-    ASSERT(d.io_retry_ns == 50 * MS && d.io_timeout_ns == 1000 * MS);
+    ASSERT(d.io_retry_ns == 50 * MS && d.io_timeout_ns == 1000 * MS && !d.min_frame_interval_ns);
     shr_screen_desc sd;
     shr_output o;
     shr_asset_source s;
@@ -269,8 +286,8 @@ TEST test_create_rejects_invalid_descriptors(void) {
     ASSERT(ctx == NULL);
     ASSERT_EQ_LL(shr_create(&d, NULL), SHR_E_INVALID_ARG);
     fail_alloc f = {-1, 0};
-    const shr_allocator half[2] = {{&f, fa_alloc, NULL}, {&f, NULL, fa_free}};
-    for (int i = 0; i < 20; i++) {
+    const shr_allocator half[3] = {{&f, fa_alloc, NULL, 0}, {&f, NULL, fa_free, 0}, {&f, fa_alloc, fa_free, 1}};
+    for (int i = 0; i < 22; i++) {
         shr_context_desc dd = d;
         shr_framebuffer_driver drv = h.driver;
         shr_output o = out;
@@ -294,12 +311,14 @@ TEST test_create_rejects_invalid_descriptors(void) {
         case 14: dd.now_ns = NULL, dd.io_timeout_ns = 0; break;
         case 15: dd.now_ns = NULL, dd.io_retry_ns = 0; break;
         case 16: dd.now_ns = NULL, dd.io_retry_ns = dd.io_timeout_ns = 0, drv.caps.timeout_ns = 1; break;
-        case 17: dd.allocator = &half[0]; break;
-        case 18: dd.allocator = &half[1]; break;
+        case 17: dd.now_ns = NULL, dd.io_retry_ns = dd.io_timeout_ns = 0, dd.min_frame_interval_ns = 1; break;
+        case 18: dd.allocator = &half[0]; break;
+        case 19: dd.allocator = &half[1]; break;
+        case 20: dd.allocator = &half[2]; break; /* an unknown flag */
         default: dd.max_reads = 0x10000; break;
         }
         ctx = (shr_context *)&h;
-        ASSERT_EQ_LL(shr_create(&dd, &ctx), i < 19 ? SHR_E_INVALID_ARG : SHR_E_LIMIT);
+        ASSERT_EQ_LL(shr_create(&dd, &ctx), i < 21 ? SHR_E_INVALID_ARG : SHR_E_LIMIT);
         ASSERT(ctx == NULL);
     }
     d.max_reads = 0xFFFF, d.event_capacity = d.max_unreleased_frames + 2;
@@ -453,6 +472,96 @@ TEST test_screen_configure_validation(void) {
     PASS();
 }
 
+_Alignas(64) static uint8_t band_px[2][HW * 16 * 4 + 64];
+
+static shr_surface band_surface(int i, shr_memory_domain dom) {
+    return (shr_surface){band_px[i], HW, 16, HW * SCREEN_BPP, HW * 16 * SCREEN_BPP, SHR_PIXEL_FORMAT, 1, dom, 0};
+}
+
+static shr_status configure_bands(shr_context *ctx, shr_surface *b, uint32_t count, uint32_t align) {
+    shr_screen_desc sd;
+    shr_screen_desc_init(&sd);
+    sd.width = HW, sd.height = HH, sd.bands = b, sd.band_count = count, sd.band_align = align;
+    return shr_screen_configure(ctx, &sd);
+}
+
+TEST test_screen_configure_bands(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_rec);
+    shr_surface good = {band_px[0], HW, 16, HW * SCREEN_BPP, sizeof(band_px[0]), SHR_PIXEL_FORMAT, 1, 0, 0};
+    shr_surface b[2] = {good, good};
+    b[1].pixels = band_px[1];
+    shr_screen_desc sd;
+    shr_screen_desc_init(&sd);
+    sd.width = HW, sd.height = HH, sd.bands = b, sd.band_count = 3;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    sd.band_count = 1, sd.bands = NULL;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    sd.bands = b, sd.composition = &comp_good;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    sd.composition = NULL, sd.flags = SHR_SCREEN_COMPOSITION;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    sd.flags = 0, sd.band_align = 32; /* HH is not a multiple */
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    sd.band_align = 1u << 31;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    sd.band_align = 3; /* nor HW */
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    sd.band_align = 16, b[0].height = 8; /* nor the bands */
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    b[0] = good, b[0].pixels = NULL;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    b[0] = good;
+    sd.band_align = 0, sd.band_count = 2, b[1].height = 8;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    b[1] = good, b[1].width = HW - 1;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    b[1] = good, b[1].format = OTHER_FORMAT, b[1].stride = HW * 4;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    b[1] = good, b[1].domain = SHR_MEMORY_DEVICE, b[1].resource_id = 1;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_UNSUPPORTED);
+    b[1] = good, b[1].pixels = band_px[1];
+    b[0].height = b[1].height = 0;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    b[0] = b[1] = good, b[1].pixels = band_px[1];
+    sd.height = 15; /* bands taller than the screen */
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_E_INVALID_ARG);
+    sd.height = HH, sd.band_align = 16, sd.rotation = SHR_ROTATE_180;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_OK);
+    shr_lyr *l = solid(ctx, 0, (shr_rect){0, 0, HW, 20}, RED);
+    frame(ctx);
+    /* Three bands (one per 16 rows), each drawn into the bands in turn and rotated by its own batch. */
+    ASSERT_EQ_LL(h.drv.calls, 6);
+    ASSERT_EQ_LL(rec.cmds[0].kind, SHR_CMD_ROTATE);
+    ASSERT_EQ_LL(px(h.out.shown, HW - 1, HH - 1), RED);
+    ASSERT_EQ_LL(px(h.out.shown, 0, 0), 0u);
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+static void tweak_align32(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_rec(d, drv);
+    drv->caps.address_align = 32;
+}
+
+/* ROTATE sources start in a band at multiples of band_align (or 1) columns and rows: address_align must divide both
+ * steps in bytes. */
+TEST test_band_sources_aligned(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_align32);
+    shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 8), 8 * SCREEN_BPP % 32 ? SHR_E_UNSUPPORTED : SHR_OK);
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 16), SHR_OK);
+    b[1].stride += 1, b[1].byte_length += 16; /* 16 rows of it are not a multiple of 32 bytes */
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 16), SHR_E_UNSUPPORTED);
+    b[1] = band_surface(1, 0), b[1].pixels = band_px[1] + 2;
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 16), SHR_E_UNSUPPORTED);
+    harness_close(&h);
+    PASS();
+}
+
 static struct {
     fail_alloc f;
     int dma;
@@ -461,7 +570,7 @@ static void *dma_count_alloc(void *user, size_t size, size_t align, shr_alloc_ki
     dma_alloc.dma += kind == SHR_ALLOC_DMA;
     return fa_alloc(user, size, align, kind);
 }
-static shr_allocator dma_allocator = {&dma_alloc.f, dma_count_alloc, fa_free};
+static shr_allocator dma_allocator = {&dma_alloc.f, dma_count_alloc, fa_free, 0};
 
 static void tweak_dma_only(shr_context_desc *d, shr_framebuffer_driver *drv) {
     tweak_rec(d, drv);
@@ -507,6 +616,30 @@ TEST test_dma_only_composition(void) {
     destroy_layers(&l, 1);
     harness_close(&h);
     ASSERT_EQ_LL(dma_alloc.f.live, 0);
+    PASS();
+}
+
+/* With bands, each destination is synced once per frame (only the driver writes it after that), each ROTATE source
+ * before its batch; CONVERT is traced once for all bands. */
+TEST test_band_sync_and_trace(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_dma_only);
+    h.out.domain = SHR_MEMORY_DMA;
+    shr_surface b[2] = {band_surface(0, SHR_MEMORY_DMA), band_surface(1, SHR_MEMORY_DMA)};
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_OK);
+    shr_lyr *l = solid(ctx, 0, FULL, GREEN);
+    frame(ctx);
+    ASSERT_EQ_LL(h.out.presents, 1);
+    ASSERT_EQ_LL(px(h.out.shown, HW - 1, HH - 1), GREEN);
+    /* band 0, the output and the first source; band 1 and its source; band 0 again, only its source */
+    ASSERT_EQ_LL(rec.syncs, 6);
+    ASSERT(rec.sync_addr[0] == band_px[0] && rec.sync_addr[1] == h.out.bufs[h.out.last_buf] &&
+           rec.sync_addr[2] == band_px[0] && rec.sync_addr[3] == band_px[1] && rec.sync_addr[5] == band_px[0]);
+    ASSERT_EQ_LL(rec.sync_len[1], sizeof(h.out.bufs[0]));
+    ASSERT_EQ_LL(rec.kinds[SHR_TRACE_CONVERT], 1);
+    ASSERT_EQ_LL(rec.converted, 2 * HW * HH * SCREEN_BPP);
+    destroy_layers(&l, 1);
+    harness_close(&h);
     PASS();
 }
 
@@ -614,6 +747,25 @@ TEST test_buffer_validation(void) {
     m.format = (shr_pixel_format)0;
     ASSERT_EQ_LL(shr_image_validate(&m), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_image_validate(NULL), SHR_E_INVALID_ARG);
+    /* A command's image spans what its rows reach, nothing when it is empty or DEVICE. */
+    shr_image_ref r = {buf, 3, 2, 8, SHR_FORMAT_RGB565, 0, 0};
+    ASSERT_EQ_LL(shr_image_ref_get(&r, &m), SHR_OK);
+    ASSERT(m.pixels == buf && m.width == 3 && m.height == 2 && m.stride == 8 && m.byte_length == 14 &&
+           m.format == SHR_FORMAT_RGB565 && m.domain == 0);
+    const shr_image_ref none[3] = {{buf, 0, 2, 8, SHR_FORMAT_A8, 0, 0}, {buf, 3, 0, 8, SHR_FORMAT_A8, 0, 0},
+                                   {buf, 3, 2, 0, SHR_FORMAT_A8, SHR_MEMORY_DEVICE, 0}};
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ_LL(shr_image_ref_get(&none[i], &m), SHR_OK);
+        ASSERT_EQ_LL(m.byte_length, 0);
+    }
+    shr_image keep = m;
+    r.stride = 4; /* rows overlap */
+    ASSERT_EQ_LL(shr_image_ref_get(&r, &m), SHR_E_INVALID_ARG);
+    r.stride = 8, r.format = 0;
+    ASSERT_EQ_LL(shr_image_ref_get(&r, &m), SHR_E_INVALID_ARG);
+    ASSERT(!memcmp(&keep, &m, sizeof(m))); /* left as it was */
+    ASSERT_EQ_LL(shr_image_ref_get(NULL, &m), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_image_ref_get(&r, NULL), SHR_E_INVALID_ARG);
     PASS();
 }
 
@@ -745,7 +897,8 @@ static void probe(unsigned kind) {
         shr_screen_configure(ctx, &sd), shr_lyr_create(ctx, 0, r, &l), shr_lyr_set_rect(host.lyr, r),
         shr_lyr_set_z(host.lyr, 5), shr_lyr_set_visible(host.lyr, false), shr_lyr_destroy(host.lyr),
         shr_lyr_cmd_begin(host.lyr), shr_lyr_cmd_fill(host.lyr, r, 0), shr_lyr_cmd_commit(host.lyr),
-        shr__lyr_group_set(host.lyr, 1, &c, 1), shr__lyr_groups_clear(host.lyr),
+        shr__lyr_group_set(host.lyr, 1, &c, 1), shr__lyr_row_commit(host.lyr, 1, 0, NULL, nokey, shr__lyr_row_begin(host.lyr, 1), 1),
+        shr__lyr_groups_clear(host.lyr, 0),
         shr__lyr_attach(host.lyr, &host, NULL, NULL, NULL), shr__res_attach(ctx, &f.res, &fk_ops),
         shr__ctx_read(ctx, &f.res, &src, 0, 0, NULL, 0), shr_pl_res_image_create(ctx, 1, 1, &rgba, 4, &img),
         shr_pl_res_image_update(host.img, r, &rgba, 4), shr_pl_res_image_update(host.img, none, NULL, 0),
@@ -1688,15 +1841,257 @@ TEST test_blink_outside_screen_draws_nothing(void) {
     PASS();
 }
 
+static void tweak_cap(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_rec(d, drv);
+    d->min_frame_interval_ns = 20 * MS;
+}
+
+static void recolor(shr_lyr *l, shr_color color) {
+    shr__lcmd c = fill(FULL, color);
+    paint(l, 1, &c);
+    ASSERT_EQ_LL(shr_submit(l->ctx), SHR_OK);
+}
+
+/* Frames start at least min_frame_interval_ns apart; what changed meanwhile is drawn by the next one. */
+TEST test_frame_cap(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_cap);
+    shr_lyr *l = solid(ctx, 0, FULL, RED);
+    frame(ctx);
+    ASSERT_EQ_LL(h.out.presents, 1);
+    ASSERT_EQ_LL(deadline(ctx), SHR_DEADLINE_NONE);
+    fake_now = 5 * MS;
+    recolor(l, GREEN);
+    shr_pump(ctx);
+    ASSERT_EQ_LL(h.out.presents, 1);
+    ASSERT_EQ_LL(deadline_at(ctx), 20 * MS);
+    fake_now = 12 * MS;
+    recolor(l, BLUE);
+    shr_pump(ctx);
+    ASSERT_EQ_LL(deadline_at(ctx), 20 * MS);
+    fake r;
+    fake_attach(&r, ctx, &fk_ops);
+    r.deadline = 15 * MS; /* the earliest timer wins */
+    ASSERT_EQ_LL(deadline_at(ctx), 15 * MS);
+    r.deadline = 25 * MS;
+    ASSERT_EQ_LL(deadline_at(ctx), 20 * MS);
+    r.deadline = 0;
+    fake_now = 20 * MS;
+    ASSERT_EQ_LL(deadline(ctx), SHR_DEADLINE_NOW);
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 2 && rec.frames == 2 && px(h.out.shown, 0, 0) == BLUE);
+    for (uint64_t id = 1; id <= 2; id++) {
+        ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED).frame_id, id);
+        ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_FRAME_RELEASED).frame_id, id);
+    }
+    ASSERT_EQ_LL(shr_poll_event(ctx, &(shr_event){0}), SHR_E_NOT_FOUND);
+    ASSERT_EQ_LL(deadline(ctx), SHR_DEADLINE_NONE);
+
+    /* Neither a frame the output already shows nor one the output refused moves the next start. */
+    fake_now = 45 * MS;
+    ASSERT_EQ_LL(shr_submit(ctx), SHR_OK);
+    shr_pump(ctx);
+    ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_FRAME_SUPERSEDED).frame_id, 3);
+    fake_now = 46 * MS;
+    h.out.acquire_result = SHR_E_WOULD_BLOCK;
+    recolor(l, RED);
+    shr_pump(ctx);
+    h.out.acquire_result = SHR_OK;
+    ASSERT_EQ_LL(shr_output_ready(ctx), SHR_OK);
+    ASSERT_EQ_LL(deadline(ctx), SHR_DEADLINE_NOW);
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 3 && px(h.out.shown, 0, 0) == RED);
+    fake_now = 50 * MS;
+    recolor(l, GREEN);
+    ASSERT_EQ_LL(deadline_at(ctx), 66 * MS);
+    fake_now = 66 * MS;
+    settle(ctx);
+    ASSERT(h.out.presents == 4 && px(h.out.shown, 0, 0) == GREEN);
+    r.res.dead = true;
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+static void tweak_blink_cap(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_blink(d, drv);
+    d->min_frame_interval_ns = 30 * MS;
+}
+
+/* A capped blink frame shows the phase of its start; phases that pass while it waits draw nothing. */
+TEST test_frame_cap_blink(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_blink_cap);
+    shr_lyr *l = blink_layer(ctx, FULL), *s = solid(ctx, 1, (shr_rect){40, 0, 48, 16}, RED);
+    frame(ctx);
+    ASSERT_EQ_LL(px(h.out.shown, 0, 0), WHITE);
+    ASSERT_EQ_LL(deadline_at(ctx), 100 * MS); /* the blink phase comes after the next allowed start */
+    fake_now = 90 * MS;
+    ASSERT_EQ_LL(shr_lyr_set_visible(s, false), SHR_OK);
+    frame(ctx);
+    ASSERT_EQ_LL(h.out.presents, 2);
+    ASSERT_EQ_LL(deadline_at(ctx), 120 * MS); /* the next allowed start comes after the blink phase */
+    fake_now = 110 * MS;
+    shr_pump(ctx);
+    ASSERT_EQ_LL(h.out.presents, 2);
+    ASSERT_EQ_LL(deadline_at(ctx), 120 * MS);
+    fake_now = 120 * MS;
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 3 && px(h.out.shown, 0, 0) == 0 && px(h.out.shown, 20, 0) == WHITE);
+    fake_now = 195 * MS;
+    ASSERT_EQ_LL(shr_lyr_set_visible(s, true), SHR_OK);
+    frame(ctx);
+    ASSERT(h.out.presents == 4 && px(h.out.shown, 0, 0) == 0 && px(h.out.shown, 40, 0) == RED);
+    ASSERT_EQ_LL(deadline_at(ctx), 225 * MS);
+    fake_now = 301 * MS; /* hidden again */
+    ASSERT_EQ_LL(deadline_at(ctx), 400 * MS);
+    shr_pump(ctx);
+    ASSERT_EQ_LL(h.out.presents, 4);
+    fake_now = 400 * MS;
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 5 && px(h.out.shown, 0, 0) == WHITE);
+    destroy_layers(&l, 1);
+    destroy_layers(&s, 1);
+    harness_close(&h);
+    PASS();
+}
+
 static uint32_t max_cmds;
 static void tweak_max_cmds(shr_context_desc *d, shr_framebuffer_driver *drv) {
     tweak_rec(d, drv);
     d->max_commands = max_cmds;
 }
 
-/* The limit applies while commands are emitted: clear, cache begin, fill, cache end, glyph. */
+/* A band frame fails cleanly wherever memory or the command limit runs out. */
+TEST test_band_frame_failures(void) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool done = false;
+        for (uint32_t n = 1; !done; n++) {
+            harness h;
+            max_cmds = n;
+            shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, mode ? tweak_max_cmds : tweak_oom);
+            shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+            ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_OK);
+            shr_lyr *l = solid(ctx, 0, (shr_rect){0, 8, HW, HH}, GREEN);
+            if (!mode) oom.budget = n - 1;
+            frame(ctx);
+            oom.budget = -1;
+            shr_event ev = {0};
+            ASSERT_EQ_LL(shr_poll_event(ctx, &ev), SHR_OK);
+            done = ev.kind == SHR_EVENT_PRESENT_ACCEPTED;
+            if (!done) ASSERT(ev.kind == SHR_EVENT_PRESENT_FAILED && ev.status == (mode ? SHR_E_LIMIT : SHR_E_NO_MEMORY));
+            if (done) ASSERT(px(h.out.shown, 0, 7) == 0 && px(h.out.shown, HW - 1, HH - 1) == GREEN);
+            destroy_layers(&l, 1);
+            harness_close(&h);
+        }
+    }
+    PASS();
+}
+
+static struct {
+    fail_alloc f;
+    size_t size;
+    shr_alloc_kind kind;
+} kind_alloc;
+static void *kind_count_alloc(void *user, size_t size, size_t align, shr_alloc_kind kind) {
+    void *p = fa_alloc(user, size, align, kind);
+    if (p) kind_alloc.size = size, kind_alloc.kind = kind;
+    return p;
+}
+static shr_allocator kind_allocator = {&kind_alloc.f, kind_count_alloc, fa_free, 0};
+
+static void tweak_kind_alloc(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_rec(d, drv);
+    kind_alloc.f = (fail_alloc){-1, 0};
+    d->allocator = &kind_allocator;
+}
+
+/* Configuring bands reserves one band's commands as descriptor memory; without it the configuration stays. Commands
+ * carry strides in 32 bits: a wider one is out of the driver's reach. */
+TEST test_band_command_list(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_kind_alloc);
+    shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+    shr_lyr *l = solid(ctx, 0, FULL, GREEN);
+    kind_alloc.f.budget = 0;
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_E_NO_MEMORY);
+    kind_alloc.f.budget = -1;
+    frame(ctx);
+    ASSERT(h.drv.calls == 1 && px(h.out.shown, HW - 1, HH - 1) == GREEN); /* still without bands */
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_OK);
+    size_t cells = (HW + SHR_CELL_WIDTH - 1) / SHR_CELL_WIDTH * ((16 + SHR_CELL_HEIGHT - 1) / SHR_CELL_HEIGHT);
+    ASSERT(kind_alloc.kind == SHR_ALLOC_PAYLOAD && kind_alloc.size == (2 * cells + 32) * sizeof(shr_draw_cmd));
+    frame(ctx);
+    ASSERT(h.drv.calls == 7 && px(h.out.shown, HW - 1, HH - 1) == GREEN);
+    shr_surface wide = band_surface(1, 0);
+    wide.stride = (size_t)1 << 32, wide.byte_length = 15 * wide.stride + HW * SCREEN_BPP; /* never read */
+    b[1] = wide;
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(configure(ctx, SHR_ROTATE_NONE, 0, 0, NULL), SHR_OK); /* back to the payload list */
+    frame(ctx);
+    ASSERT(h.drv.calls == 8 && px(h.out.shown, HW - 1, HH - 1) == GREEN);
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    ASSERT_EQ_LL(kind_alloc.f.live, 0);
+    PASS();
+}
+
+/* An allocator asking for hints gets the band command list as hot memory. */
+TEST test_band_command_list_hot(void) {
+    kind_allocator.flags = SHR_ALLOC_HOT;
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_kind_alloc);
+    kind_allocator.flags = 0;
+    shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_OK);
+    ASSERT_EQ_LL(kind_alloc.kind, SHR_ALLOC_PAYLOAD | SHR_ALLOC_HOT);
+    harness_close(&h);
+    ASSERT_EQ_LL(kind_alloc.f.live, 0);
+    PASS();
+}
+
+static void tweak_two_ids(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_rec(d, drv);
+    drv->caps.max_buffers = 2;
+}
+
+/* A band's commands are built once the band before ran, yet buffer ids stay held for the frame: no band evicts a
+ * buffer an earlier band drew from, also one that took the id of a buffer it evicted. */
+TEST test_band_buffers_held_for_frame(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_two_ids);
+    shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_OK);
+    fake r[5]; /* X, Y, then A, B and C, which draws nothing */
+    for (int i = 0; i < 5; i++) fake_attach(&r[i], ctx, &fk_ops);
+    memset(r[4].cov, 0, sizeof(r[4].cov));
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    const shr__lcmd old[2] = {glyph(&r[0], 0, 0, RED), glyph(&r[1], 8, 0, RED)};
+    paint(l, 2, old);
+    frame(ctx);
+    drain(ctx);
+    /* A takes the id of X in band 0, B that of Y in band 1; C finds none in band 2. */
+    const shr__lcmd cur[4] = {glyph(&r[2], 0, 0, GREEN), glyph(&r[3], 0, 16, BLUE), glyph(&r[4], 0, 32, RED),
+                              glyph(&r[2], 8, 32, GREEN)};
+    paint(l, 4, cur);
+    frame(ctx);
+    ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_LIMIT);
+    ASSERT_EQ_LL(h.drv.calls, 6 + 4); /* bands 0 and 1 ran */
+    const shr__lcmd again[3] = {glyph(&r[2], 0, 0, GREEN), glyph(&r[3], 0, 16, BLUE), glyph(&r[2], 8, 32, GREEN)};
+    paint(l, 3, again);
+    frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(px(h.out.shown, 0, 0) == GREEN && px(h.out.shown, 0, 16) == BLUE && px(h.out.shown, 8, 32) == GREEN);
+    destroy_layers(&l, 1);
+    for (int i = 0; i < 5; i++) r[i].res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* The limit applies while commands are emitted: clear, fill, glyph (a driver keeping nothing gets no keep group). */
 TEST test_command_limit_fails_frame(void) {
-    for (max_cmds = 1; max_cmds <= 5; max_cmds++) {
+    for (max_cmds = 1; max_cmds <= 3; max_cmds++) {
         harness h;
         shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_max_cmds);
         fake r;
@@ -1710,7 +2105,7 @@ TEST test_command_limit_fails_frame(void) {
         ASSERT_EQ_LL(shr__lyr_group_set(l, 0, cached, 3), SHR_OK);
         ASSERT_EQ_LL(shr__lyr_group_set(l, 1, &g, 1), SHR_OK);
         frame(ctx);
-        if (max_cmds < 5)
+        if (max_cmds < 3)
             ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_LIMIT);
         else
             expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
@@ -2601,7 +2996,7 @@ TEST test_layer_arguments(void) {
     ASSERT_EQ_LL(shr_lyr_cmd_commit(l), SHR_OK);
     ASSERT_EQ_LL(shr__lyr_group_set(NULL, 0, NULL, 0), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, NULL, 1), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr__lyr_groups_clear(NULL), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr__lyr_groups_clear(NULL, 0), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr__lyr_attach(NULL, &h, NULL, NULL, NULL), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr__lyr_attach(l, NULL, NULL, NULL, NULL), SHR_E_INVALID_ARG);
     ASSERT(!shr__lyr_state(NULL, &h) && !shr__lyr_state(l, NULL) && !shr__lyr_state(l, &h));
@@ -2633,6 +3028,85 @@ TEST test_layer_out_of_memory(void) {
     ASSERT_EQ_LL(shr_lyr_cmd_commit(l), SHR_OK); /* still building after the failures */
     frame(ctx);
     ASSERT_EQ_LL(px(h.out.shown, 0, 0), RED);
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
+#define GROUP_BYTES(n) ((n) * sizeof(shr__rcmd) + ((n) + SHR__BLOCK - 1) / SHR__BLOCK * sizeof(shr_rect))
+
+/* Group memory comes in three classes up to the most commands asked for: idle memory of the group's class first, else
+ * new memory while the layer holds less than its peak + 1 largest groups, past that idle memory of a larger class, else
+ * new memory after freeing idle smaller memory. More commands than the largest class grow the classes by a quarter at
+ * least; memory of a size no class has any more is freed when it comes back. */
+TEST test_group_memory_classes(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_oom);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    shr__rcmd c[130];
+    for (int i = 0; i < 130; i++)
+        c[i] = (shr__rcmd){(uint16_t)(i % 8), (uint16_t)(i % 8 + 1), (uint8_t)(i / 8), (uint8_t)(i / 8 + 1),
+                           SHR__LCMD_FILL, 0, (shr_color)(i + 1), 0, 0};
+    shr__rcmd *a = shr__lyr_row_begin(l, 0); /* at least one command: classes of 16 */
+    ASSERT(a && l->class_cap[0] == 16 && l->class_cap[2] == 16);
+    ASSERT_EQ_LL(shr__lyr_groups_clear(l, 10), SHR_OK); /* fewer than 16: all classes alike */
+    ASSERT(l->class_cap[0] == 10 && l->class_cap[1] == 10 && l->class_cap[2] == 10 && l->held == 0);
+    ASSERT_EQ_LL(shr__lyr_groups_clear(l, 64), SHR_OK);
+    ASSERT(l->class_cap[0] == 16 && l->class_cap[1] == 32 && l->class_cap[2] == 64);
+
+    /* No group yet: room for one largest. */
+    a = shr__lyr_row_begin(l, 10);
+    oom.budget = 0;
+    ASSERT(shr__lyr_row_begin(l, 16) == a && l->spare_cap == 16); /* the lent memory again */
+    oom.budget = 1;
+    shr__rcmd *b = shr__lyr_row_begin(l, 20); /* a goes idle */
+    ASSERT(b && l->spare_cap == 32 && l->spares[0] == a);
+    ASSERT_EQ_LL(oom.budget, 0);
+    oom.budget = 1;
+    shr__rcmd *d = shr__lyr_row_begin(l, 50); /* over the limit with b idle too: both freed */
+    ASSERT(d && l->spare_cap == 64 && !l->spares[0] && !l->spares[1] && l->held == GROUP_BYTES(64));
+    ASSERT_EQ_LL(oom.budget, 0);
+    ASSERT(shr__lyr_row_begin(l, 10) == d && l->spare_cap == 64); /* borrowed: no room for new memory */
+    oom.budget = -1;
+    ASSERT_EQ_LL(rows_set(l, 0, 0, NULL, c, 10), SHR_OK); /* only the group list allocates */
+    ASSERT(SHR_VEC_AT(&l->groups, shr__group, 0)->rows == d && l->held == GROUP_BYTES(64));
+
+    /* Peak 1, then 2: new memory of each class; then idle memory of the class. */
+    ASSERT_EQ_LL(rows_set(l, 1, 0, NULL, c, 20), SHR_OK);
+    ASSERT_EQ_LL(rows_set(l, 0, 0, NULL, c + 1, 10), SHR_OK);
+    ASSERT(SHR_VEC_AT(&l->groups, shr__group, 0)->cap == 16 && SHR_VEC_AT(&l->groups, shr__group, 1)->cap == 32);
+    ASSERT(l->spares[2] == d && l->held == GROUP_BYTES(16) + GROUP_BYTES(32) + GROUP_BYTES(64));
+    oom.budget = 0;
+    ASSERT_EQ_LL(rows_set(l, 2, 0, NULL, c, 50), SHR_OK);
+    ASSERT_EQ_LL(SHR_VEC_AT(&l->groups, shr__group, 2)->rows, d);
+    oom.budget = -1;
+
+    /* Rebuilt groups that change class allocate nothing once each class had its most. */
+    static const size_t sizes[3] = {10, 20, 50};
+    for (int pass = 0; pass < 9; pass++) {
+        if (pass == 3) oom.budget = 0;
+        for (uint32_t g = 0; g < 3; g++) ASSERT_EQ_LL(rows_set(l, g, 0, NULL, c + pass % 2, sizes[(g + pass) % 3]), SHR_OK);
+    }
+    oom.budget = -1;
+    ASSERT(l->held <= 4 * GROUP_BYTES(64));
+
+    /* Growth: by a quarter, then to what was asked; memory of old sizes is freed when it comes back. */
+    ASSERT_EQ_LL(rows_set(l, 0, 0, NULL, c, 10), SHR_OK);
+    ASSERT_EQ_LL(rows_set(l, 1, 0, NULL, c, 20), SHR_OK);
+    ASSERT_EQ_LL(rows_set(l, 2, 0, NULL, c, 50), SHR_OK);
+    ASSERT_EQ_LL(rows_set(l, 3, 0, NULL, c, 70), SHR_OK);
+    ASSERT(l->class_cap[0] == 16 && l->class_cap[1] == 48 && l->class_cap[2] == 80);
+    ASSERT(!l->spares[0] && !l->spares[1] && !l->spares[2]);
+    long live = oom.live;
+    ASSERT_EQ_LL(rows_set(l, 0, 0, NULL, c + 1, 10), SHR_OK); /* 16 still a class: kept */
+    ASSERT_EQ_LL(oom.live, live + 1);
+    ASSERT_EQ_LL(rows_set(l, 1, 0, NULL, c + 1, 20), SHR_OK); /* 32 is not: freed */
+    ASSERT_EQ_LL(rows_set(l, 2, 0, NULL, c + 1, 50), SHR_OK); /* nor 64 */
+    ASSERT_EQ_LL(oom.live, live + 1);
+    ASSERT_EQ_LL(rows_set(l, 3, 0, NULL, c, 120), SHR_OK);
+    ASSERT_EQ_LL(l->class_cap[2], 128);
     destroy_layers(&l, 1);
     harness_close(&h);
     ASSERT_EQ_LL(oom.live, 0);
@@ -2729,6 +3203,27 @@ TEST test_app_layer_diff(void) {
     PASS();
 }
 
+/* Changes of one group in place are damaged in GROUP_RUNS (8) separate rects, then the rest of the middle as one. */
+TEST test_group_damage_runs(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, 0, NULL);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    shr__lcmd c[20];
+    for (int i = 0; i < 20; i++) c[i] = fill((shr_rect){i * 3, 0, i * 3 + 1, 1}, RED);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, c, 20), SHR_OK);
+    ctx->staged.rects.len = 0;
+    for (int i = 0; i < 20; i++) c[i].color = GREEN;
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, c, 20), SHR_OK);
+    ASSERT_EQ_LL(ctx->staged.rects.len, 9);
+    for (int i = 0; i < 8; i++) ASSERT_EQ_LL(SHR_VEC_AT(&ctx->staged.rects, shr_rect, i)->x0, i * 3);
+    const shr_rect *rest = SHR_VEC_AT(&ctx->staged.rects, shr_rect, 8);
+    ASSERT(rest->x0 == 24 && rest->x1 == 58 && rest->y0 == 0 && rest->y1 == 1);
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
 TEST test_command_diff_compares_every_field(void) {
     harness h;
     shr_context *ctx = harness_open(&h, 0, NULL);
@@ -2741,17 +3236,76 @@ TEST test_command_diff_compares_every_field(void) {
     shr__lcmd v[11];
     for (int i = 0; i < 11; i++) v[i] = base;
     v[0].kind = SHR__LCMD_IMAGE, v[1].flags = SHR__LCMD_DIM, v[2].dst.x1 = 7, v[3].anchor.x = 1, v[4].anchor.y = 1;
-    v[5].color = RED, v[6].res = &r2.res, v[7].id = 2, v[8].key[0] = 1, v[9].key[1] = 1;
+    v[5].color = RED, v[6].res = &r2.res, v[7].id = 2, v[8].bg = RED, v[9].dst.y0 = 1;
     for (int i = 0; i < 11; i++) {
         ASSERT_EQ_LL(shr__lyr_group_set(l, 0, &base, 1), SHR_OK);
         ctx->staged.rects.len = 0;
         ASSERT_EQ_LL(shr__lyr_group_set(l, 0, &v[i], 1), SHR_OK);
         ASSERT_EQ_LL(ctx->staged.rects.len > 0, i < 10);
     }
+    /* Other kinds compare only what they draw with. */
+    const shr__lcmd fb = fill(FULL, WHITE), begin = {.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, 8, 16}, .key = {1, 2}},
+                    end = {.kind = SHR__LCMD_CACHE_END};
+    shr__lcmd f1 = fb, f2 = fb, k1[3] = {begin, fb, end}, k2[3] = {begin, fb, end}, k3[3] = {begin, fb, end};
+    f1.dst.x0 = 1, f2.id = 9, k1[0].key[1] = 3, k2[0].key[0] = 3, k3[2].id = 9;
+    const struct {
+        const shr__lcmd *a, *b;
+        size_t n;
+        bool replaced;
+    } kinds[] = {{&fb, &f1, 1, true}, {&fb, &f2, 1, false}, {(shr__lcmd[]){begin, fb, end}, k1, 3, true},
+                 {(shr__lcmd[]){begin, fb, end}, k2, 3, true}, {(shr__lcmd[]){begin, fb, end}, k3, 3, false}};
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        ASSERT_EQ_LL(shr__lyr_group_set(l, 0, kinds[i].a, kinds[i].n), SHR_OK);
+        const shr__lcmd *was = SHR_VEC_AT(&l->groups, shr__group, 0)->cmds;
+        ASSERT_EQ_LL(shr__lyr_group_set(l, 0, kinds[i].b, kinds[i].n), SHR_OK);
+        ASSERT_EQ_LL(SHR_VEC_AT(&l->groups, shr__group, 0)->cmds != was, kinds[i].replaced);
+    }
     ASSERT_EQ_LL(shr_lyr_set_visible(l, false), SHR_OK);
     ctx->staged.rects.len = 0;
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, &v[5], 1), SHR_OK);
     ASSERT_EQ_LL(ctx->staged.rects.len, 0); /* hidden layers record no damage */
+    destroy_layers(&l, 1);
+    r.res.dead = r2.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+TEST test_group_resource_counts(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    fake r, r2;
+    fake_attach(&r, ctx, &fk_ops);
+    fake_attach(&r2, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    const shr__lcmd one[3] = {glyph(&r, 0, 0, WHITE), fill((shr_rect){0, 0, 4, 4}, RED), glyph(&r, 8, 0, WHITE)};
+    const shr__lcmd mixed[3] = {glyph(&r, 0, 0, WHITE), glyph(&r2, 8, 0, WHITE), glyph(&r, 16, 0, WHITE)};
+    const shr__lcmd plain = fill((shr_rect){40, 40, 44, 44}, RED);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, one, 3), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 1, mixed, 3), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 2, &plain, 1), SHR_OK);
+    ASSERT(r.res.users == 4 && r2.res.users == 1);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, mixed, 3), SHR_OK);
+    ASSERT(r.res.users == 4 && r2.res.users == 2);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 1, one, 3), SHR_OK);
+    ASSERT(r.res.users == 4 && r2.res.users == 1);
+    frame(ctx);
+    shr__res_changed(&r2.res, (shr_rect){0, 0, 8, 16}); /* only group 0 refers to it */
+    frame(ctx);
+    ASSERT_EQ_LL(rec.damaged, 8 * 16);
+    shr__rcmd *c = shr__lyr_row_begin(l, 1);
+    ASSERT(c != NULL);
+    *c = row_of(glyph(&r2, 24, 0, WHITE));
+    ASSERT_EQ_LL(shr__lyr_row_commit(l, 3, 0, &r2.res, nokey, c, 1), SHR_OK);
+    ASSERT_EQ_LL(r2.res.users, 2);
+    *(c = shr__lyr_row_begin(l, 1)) = row_of(glyph(&r2, 24, 0, WHITE));
+    ASSERT_EQ_LL(shr__lyr_row_commit(l, 3, 0, &r2.res, nokey, c, 1), SHR_OK); /* unchanged: freed */
+    *(c = shr__lyr_row_begin(l, 1)) = row_of(glyph(&r2, 24, 0, WHITE));
+    ASSERT_EQ_LL(shr__lyr_row_commit(l, 3, 0, NULL, nokey, c, 1), SHR_E_INVALID_ARG); /* a glyph without resource */
+    ASSERT_EQ_LL(shr__lyr_row_commit(l, 3, 0, NULL, nokey, shr__lyr_row_begin(l, 0), 0), SHR_OK);
+    ASSERT(r.res.users == 4 && r2.res.users == 1);
+    ASSERT_EQ_LL(shr__lyr_groups_clear(l, 0), SHR_OK);
+    ASSERT(r.res.users == 0 && r2.res.users == 0);
     destroy_layers(&l, 1);
     r.res.dead = r2.res.dead = true;
     harness_close(&h);
@@ -2776,7 +3330,7 @@ TEST test_groups_draw_in_id_order(void) {
     ASSERT_EQ_LL(shr__lyr_group_set(l, 3, NULL, 0), SHR_OK);
     frame(ctx);
     ASSERT_EQ_LL(px(h.out.shown, 0, 0), GREEN);
-    ASSERT_EQ_LL(shr__lyr_groups_clear(l), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_groups_clear(l, 0), SHR_OK);
     frame(ctx);
     ASSERT(rec.damaged == HW * HH && count_color(&h, 0) == HW * HH);
     for (uint32_t id = 40; id > 10; id -= 3) ASSERT_EQ_LL(shr__lyr_group_set(l, id, &blue, 1), SHR_OK);
@@ -2797,7 +3351,7 @@ TEST test_command_validation(void) {
     const shr__lcmd begin = {.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, 4, 4}}, end = {.kind = SHR__LCMD_CACHE_END};
     shr__lcmd flagged = fill(FULL, 0), no_res = {.kind = SHR__LCMD_GLYPH, .dst = {0, 0, 1, 1}};
     shr__lcmd no_img = no_res;
-    flagged.flags = 1u << 3, no_img.kind = SHR__LCMD_IMAGE;
+    flagged.flags = 1u << 4, no_img.kind = SHR__LCMD_IMAGE;
     const struct {
         shr__lcmd c[3];
         size_t n;
@@ -2817,7 +3371,7 @@ TEST test_command_validation(void) {
         ASSERT_EQ_LL(shr__lyr_group_set(l, 0, bad[i].c, bad[i].n), SHR_E_INVALID_ARG);
     const shr__lcmd good[4] = {begin, fill((shr_rect){0, 0, 4, 4}, RED), end, fill(FULL, 0)};
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, good, 4), SHR_OK);
-    flagged.flags = SHR__LCMD_DIM | SHR__LCMD_BOLD | SHR__LCMD_ITALIC | SHR__LCMD_BLINK;
+    flagged.flags = SHR__LCMD_DIM | SHR__LCMD_BOLD | SHR__LCMD_ITALIC | SHR__LCMD_ON_FILL | SHR__LCMD_BLINK;
     ASSERT_EQ_LL(shr__lyr_group_set(l, 1, &flagged, 1), SHR_OK);
     ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
     ASSERT_EQ_LL(shr__lyr_cmd_add(l, &begin), SHR_E_INVALID_ARG); /* one command is never a cache pair */
@@ -2903,7 +3457,22 @@ TEST test_extreme_coordinates_clamp(void) {
     ASSERT_EQ_LL(shr_submit(ctx), SHR_OK);
     settle(ctx);
     ASSERT_EQ_LL(px(h.out.shown, 0, 0), 0); /* both layers lie off screen */
+    fake r; /* glyphs placed past INT32_MAX, which 32 bits would wrap onto the screen, stay away */
+    fake_attach(&r, ctx, &fk_ops);
+    shr_lyr *g;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 1, FULL, &g), SHR_OK);
+    shr__lcmd far_glyphs[2] = {glyph(&r, 0, 0, RED), glyph(&r, 0, 0, RED)};
+    far_glyphs[0].anchor.x = INT32_MAX, far_glyphs[1].anchor.y = INT32_MIN;
+    r.px.offset = (shr_point){0, -1};
+    ASSERT_EQ_LL(shr_lyr_cmd_begin(g), SHR_OK);
+    for (int i = 0; i < 2; i++) ASSERT_EQ_LL(shr__lyr_cmd_add(g, &far_glyphs[i]), SHR_OK);
+    ASSERT_EQ_LL(shr_lyr_cmd_commit(g), SHR_OK);
+    ASSERT_EQ_LL(shr_submit(ctx), SHR_OK);
+    settle(ctx);
+    ASSERT(r.resolves >= 2 && px(h.out.shown, 0, 0) == 0);
+    destroy_layers(&g, 1);
     destroy_layers(l, 2);
+    r.res.dead = true;
     harness_close(&h);
     PASS();
 }
@@ -2935,7 +3504,7 @@ TEST test_resource_users_counted(void) {
     ASSERT_EQ_LL(shr__lyr_group_set(l, 1, &g, 1), SHR_OK);
     ASSERT_EQ_LL(shr__lyr_group_set(l, 2, &img, 1), SHR_OK);
     ASSERT_EQ_LL(r.res.users, 2);
-    ASSERT_EQ_LL(shr__lyr_groups_clear(l), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_groups_clear(l, 0), SHR_OK);
     ASSERT_EQ_LL(r.res.users, 0);
     ASSERT_EQ_LL(shr__lyr_group_set(l, 1, &g, 1), SHR_OK);
     ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
@@ -2947,13 +3516,6 @@ TEST test_resource_users_counted(void) {
     harness_close(&h);
     PASS();
 }
-
-static bool cache_hint_sent(void) {
-    for (size_t i = 0; i < rec.n; i++)
-        if (rec.cmds[i].kind == SHR_CMD_CACHE_BEGIN) return true;
-    return false;
-}
-
 
 static bool fill_sent(shr_color color, int32_t x, int32_t y) {
     for (size_t i = 0; i < rec.n; i++) {
@@ -2988,7 +3550,7 @@ TEST test_hidden_layers_skipped(void) {
     ASSERT(px(h.out.shown, 4, 4) == BLUE && px(h.out.shown, 40, 40) == WHITE);
 
     static const struct {
-        uint32_t flags;
+        uint16_t flags;
         bool visible, gap;
     } cases[] = {{SHR__LCMD_DIM, true, false}, {SHR__LCMD_BLINK, true, false}, {0, false, false}, {0, true, true}};
     for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
@@ -3010,7 +3572,7 @@ TEST test_hidden_layers_skipped(void) {
     ASSERT_EQ_LL(shr_lyr_set_visible(top, true), SHR_OK);
 
     shr__lcmd wide = fill((shr_rect){-8, 0, 64, 32}, BLUE); /* opaque only inside the layer */
-    ASSERT_EQ_LL(shr__lyr_groups_clear(top), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_groups_clear(top, 0), SHR_OK);
     ASSERT_EQ_LL(shr__lyr_group_set(top, 0, &wide, 1), SHR_OK);
     shr__lcmd spot[2] = {fill(FULL, RED), fill((shr_rect){40, 4, 48, 12}, RED)};
     paint(below, 2, spot);
@@ -3047,77 +3609,958 @@ TEST test_large_group_blocks_skipped(void) {
     PASS();
 }
 
-/* A hint covers a whole group drawn with final pixels; cache_clip says which part is written. */
-TEST test_cache_hints(void) {
+/* ---- keeps: the mock runs batches on a software driver keeping up to keep_max ids, each in a slot of keep_slot bytes
+ * (0: of its own size), and advertises keep_cap bytes and keep_slot as the largest keep ---- */
+
+static struct {
+    shr_draw_cmd cmds[1024]; /* every command of the batches since klog_reset(), prologues included */
+    size_t n;
+    int calls;
+    int block_at; /* refuse the call with this number (1-based), 0 = none */
+} klog;
+
+static uint32_t keep_max;
+static uint64_t keep_cap, keep_slot;
+static fail_alloc keep_mem; /* the keep driver's allocations */
+static shr_allocator keep_al;
+
+static shr_status klog_execute(void *user, const shr_surface *dst, const shr_draw_cmd *c, size_t n, shr_fence f) {
+    if (++klog.calls == klog.block_at) return SHR_E_WOULD_BLOCK;
+    for (size_t i = 0; i < n && klog.n < 1024; i++) klog.cmds[klog.n++] = c[i];
+    return rec_execute(user, dst, c, n, f);
+}
+
+static void keeps_on(shr_framebuffer_driver *drv) {
+    mock_driver *m = drv->user;
+    keep_mem = (fail_alloc){-1, 0};
+    keep_al = fail_allocator(&keep_mem);
+    ASSERT_EQ_LL(shr_software_driver_create(&keep_al, keep_slot * keep_max, keep_max, HBUFS, &m->sw), SHR_OK);
+    drv->caps.max_keeps = keep_max, drv->caps.keep_bytes = keep_cap, drv->caps.max_keep_bytes = keep_slot;
+    drv->execute = klog_execute;
+}
+
+static void tweak_keep(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_rec(d, drv);
+    keeps_on(drv);
+}
+
+static void tweak_keep_blink(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_blink(d, drv);
+    keeps_on(drv);
+}
+
+static void tweak_keep_cmds(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_keep(d, drv);
+    d->max_commands = max_cmds;
+}
+
+static void tweak_keep_oom(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_oom(d, drv);
+    keeps_on(drv);
+}
+
+static void klog_reset(void) { memset(&klog, 0, sizeof(klog)); }
+
+static int klog_count(shr_cmd_kind kind) {
+    int n = 0;
+    for (size_t i = 0; i < klog.n; i++) n += klog.cmds[i].kind == kind;
+    return n;
+}
+
+/* The nth command of `kind` (0-based). */
+static const shr_draw_cmd *klog_nth(shr_cmd_kind kind, int nth) {
+    for (size_t i = 0; i < klog.n; i++)
+        if (klog.cmds[i].kind == kind && !nth--) return &klog.cmds[i];
+    FAIL_WITH_LONGJMPm("command not sent");
+    return NULL;
+}
+
+/* A frame, after the events so far. */
+static void keep_frame(shr_context *ctx) {
+    drain(ctx);
+    klog_reset();
+    frame(ctx);
+}
+
+/* The whole screen again: what showed is seen a second time. */
+static void keep_again(shr_context *ctx) {
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    keep_frame(ctx);
+}
+
+/* A frame redrawing `r` as a layer change would. */
+static void keep_damage(shr_context *ctx, shr_rect r) {
+    shr__damage_add(ctx, &ctx->staged, r);
+    keep_frame(ctx);
+}
+
+static shr__keep_count kc(const shr_context *ctx) { return ctx->keep_count; }
+
+#define ROW_BYTES ((uint64_t)HW * 16 * SCREEN_BPP)
+
+/* A keep row of the layer at y: background `bg` with a glyph of `f` at x, keyed by both. */
+static void keep_row(shr_lyr *l, uint32_t group, fake *f, int32_t y, shr_color bg, int32_t x, uint32_t flags) {
+    uint64_t key = ((uint64_t)x << 32 | bg) + 1 + flags;
+    shr__lcmd c[4] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, y, HW, y + 16}, .key = {key, ~key}},
+                      fill((shr_rect){0, y, HW, y + 16}, bg), glyph(f, x, y, WHITE), {.kind = SHR__LCMD_CACHE_END}};
+    c[2].flags = (uint16_t)flags;
+    ASSERT_EQ_LL(shr__lyr_group_set(l, group, c, 4), SHR_OK);
+}
+
+/* What the output shows of a row drawn by keep_row(). */
+static bool row_shown(const harness *h, int32_t y, shr_color bg, int32_t x, bool glyph_shown) {
+    return px(h->out.shown, x + 3, y + 5) == (glyph_shown ? WHITE : bg) && px(h->out.shown, (x + 20) % HW, y + 9) == bg;
+}
+
+/* Rows are stored the second time they are drawn, then drawn from their keeps wherever their content shows, also in
+ * part and several times in a frame; content is resolved only when it is stored or drawn plainly. */
+TEST test_keep_rows(void) {
+    keep_max = 8, keep_cap = 0, keep_slot = 0;
     harness h;
-    shr_context *ctx = harness_open(&h, PRESERVED, tweak_blink);
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep);
     fake r;
     fake_attach(&r, ctx, &fk_ops);
     shr_lyr *l;
-    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, (shr_rect){8, 0, 40, 16}, &l), SHR_OK);
-    shr__lcmd cached[4] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, 32, 16}, .key = {7}},
-                           fill((shr_rect){0, 0, 32, 16}, BLUE), glyph(&r, 8, 0, WHITE), {.kind = SHR__LCMD_CACHE_END}};
-    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, cached, 4), SHR_OK);
-    frame(ctx);
-    const shr_rect group = {8, 0, 40, 16};
-    ASSERT_EQ_LL(rec.n, 5);
-    ASSERT(rec.cmds[1].kind == SHR_CMD_CACHE_BEGIN && rec.cmds[1].key[0] == 7 && rect_eq(rec.cmds[1].dst, group));
-    ASSERT(rect_eq(rec.cmds[1].cache_clip, group) && rec.cmds[4].kind == SHR_CMD_CACHE_END);
-    ASSERT(rect_eq(rec.cmds[3].dst, (shr_rect){16, 0, 24, 16}));
-
-    memset(h.out.bufs[0] + (5 * HW + 30) * SCREEN_BPP, 0x5A, SCREEN_BPP);
-    uint32_t canary = px(h.out.bufs[0], 30, 5);
-    shr_lyr *m;
-    ASSERT_EQ_LL(shr_lyr_create(ctx, 1, (shr_rect){10, 0, 12, 2}, &m), SHR_OK);
-    shr__lcmd half = fill((shr_rect){0, 0, 2, 2}, RED);
-    half.flags = SHR__LCMD_DIM; /* not opaque: the group below still draws */
-    paint(m, 1, &half);
-    frame(ctx); /* the group is drawn whole, only the damaged part is written */
-    ASSERT_EQ_LL(rec.n, 5); /* no clear: the cached group hides the damage */
-    ASSERT(rec.cmds[0].kind == SHR_CMD_CACHE_BEGIN && rect_eq(rec.cmds[0].cache_clip, (shr_rect){10, 0, 12, 2}));
-    ASSERT(rect_eq(rec.cmds[1].dst, group) && rec.cmds[3].kind == SHR_CMD_CACHE_END);
-    uint32_t mixed = px(h.out.shown, 10, 0);
-    ASSERT(px(h.out.shown, 30, 5) == canary && mixed != RED && mixed != BLUE && px(h.out.shown, 9, 0) == BLUE);
-
-    r.px.provisional = true; /* fallback pixels are not cached */
-    shr_request_redraw(ctx);
-    shr_pump(ctx);
-    ASSERT(!cache_hint_sent() && rec.n == 4); /* clear, fill, glyph, the other layer */
-    r.px.provisional = false;
-    shr_request_redraw(ctx);
-    shr_pump(ctx);
-    ASSERT(cache_hint_sent());
-
-    cached[2].flags = SHR__LCMD_BLINK; /* nor is content the blink phase hides */
-    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, cached, 4), SHR_OK);
-    frame(ctx);
-    ASSERT(cache_hint_sent());
-    fake_now = 150 * MS;
-    shr_pump(ctx);
-    ASSERT(!cache_hint_sent() && rec.n == 1 && px(h.out.shown, 16, 8) == BLUE); /* the layer hides the clear */
-
-    const shr_rect moved[2] = {{40, 0, 72, 16}, {8, 0, 24, 16}}; /* partly off the screen, or out of its layer */
-    for (int i = 0; i < 2; i++) {
-        int frames = rec.frames;
-        ASSERT_EQ_LL(shr_lyr_set_rect(l, moved[i]), SHR_OK);
-        frame(ctx);
-        ASSERT(rec.frames == frames + 1 && !cache_hint_sent());
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    const shr_color bg[5] = {RED, GREEN, BLUE, 0xFF00FFu, 0x00FFFFu};
+    for (int i = 0; i < 3; i++) keep_row(l, (uint32_t)i, &r, 16 * i, bg[i], 8 * i, 0);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT_EQ_LL(rec.npro, 9); /* the first frame releases every id; the glyph's buffer */
+    for (int i = 0; i < 8; i++) ASSERT(pro_is(i, SHR_CMD_KEEP_RELEASE, (uint32_t)i + 1));
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_FILL) == 3 && kc(ctx).direct == 3);
+    for (int i = 0; i < 3; i++) ASSERT(row_shown(&h, 16 * i, bg[i], 8 * i, true));
+    keep_again(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 3 && klog_count(SHR_CMD_KEEP_DRAW) == 3 && klog_count(SHR_CMD_FILL) == 3);
+    ASSERT(kc(ctx).stores == 3 && kc(ctx).direct == 0 && kc(ctx).hits == 0);
+    for (int i = 0; i < 3; i++) {
+        const shr_draw_cmd *b = klog_nth(SHR_CMD_KEEP_BEGIN, i), *d = klog_nth(SHR_CMD_KEEP_DRAW, i);
+        ASSERT(b->buffer == (uint32_t)i + 1 && rect_eq(b->dst, (shr_rect){0, 16 * i, HW, 16 * i + 16}));
+        ASSERT(d->buffer == b->buffer && rect_eq(d->dst, b->dst) && d->src_origin.x == 0 && d->src_origin.y == 0);
+        ASSERT(row_shown(&h, 16 * i, bg[i], 8 * i, true));
     }
-
-    /* A hint outside the damage is left out with its end. */
-    ASSERT_EQ_LL(shr_lyr_set_rect(l, (shr_rect){40, 20, 64, 48}), SHR_OK);
-    shr__lcmd far[4] = {cached[0], fill((shr_rect){0, 0, 4, 4}, BLUE), cached[3], fill((shr_rect){10, 10, 14, 14}, RED)};
-    far[0].dst = (shr_rect){0, 0, 4, 4};
+    /* Scrolled up a row: two rows draw the keeps of the rows below, the new one draws plainly; shown again, it is
+     * stored. */
+    int resolves = r.resolves;
+    for (int i = 0; i < 3; i++) keep_row(l, (uint32_t)i, &r, 16 * i, bg[i + 1], 8 * (i + 1), 0);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(rec.npro == 0 && klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_KEEP_DRAW) == 2);
+    ASSERT(klog_nth(SHR_CMD_KEEP_DRAW, 0)->buffer == 2 && klog_nth(SHR_CMD_KEEP_DRAW, 1)->buffer == 3);
+    ASSERT(r.resolves == resolves + 1 && kc(ctx).hits == 2 && kc(ctx).direct == 1);
+    for (int i = 0; i < 3; i++) ASSERT(row_shown(&h, 16 * i, bg[i + 1], 8 * (i + 1), true));
+    keep_again(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 1 && klog_nth(SHR_CMD_KEEP_BEGIN, 0)->buffer == 4);
+    /* Rows of equal content, the second time: stored once, drawn twice. */
+    keep_row(l, 0, &r, 0, bg[4], 40, 0);
+    keep_row(l, 1, &r, 16, bg[4], 40, 0);
+    keep_frame(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && kc(ctx).direct == 2);
+    ASSERT(row_shown(&h, 0, bg[4], 40, true) && row_shown(&h, 16, bg[4], 40, true));
+    keep_again(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 1 && klog_count(SHR_CMD_KEEP_DRAW) == 3);
+    uint32_t id = klog_nth(SHR_CMD_KEEP_BEGIN, 0)->buffer;
+    ASSERT(klog_nth(SHR_CMD_KEEP_DRAW, 0)->buffer == id && klog_nth(SHR_CMD_KEEP_DRAW, 1)->buffer == id);
+    /* Damage inside a row, twice: each part is drawn from the keep, nothing under the row. */
+    shr_lyr *m[2];
+    const shr_rect spots[2] = {{10, 2, 12, 4}, {50, 2, 52, 4}};
+    for (int k = 0; k < 2; k++) {
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 1, spots[k], &m[k]), SHR_OK);
+        shr__lcmd dim = fill((shr_rect){0, 0, 2, 2}, BLUE);
+        dim.flags = SHR__LCMD_DIM;
+        paint(m[k], 1, &dim);
+    }
+    keep_frame(ctx);
+    for (int k = 0; k < 2; k++) {
+        shr__lcmd dim = fill((shr_rect){0, 0, 2, 2}, k ? RED : GREEN);
+        dim.flags = SHR__LCMD_DIM;
+        paint(m[k], 1, &dim);
+    }
+    resolves = r.resolves;
+    keep_frame(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_DRAW) == 2 && klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_FILL) == 2);
+    for (int k = 0; k < 2; k++) {
+        const shr_draw_cmd *d = klog_nth(SHR_CMD_KEEP_DRAW, k);
+        ASSERT(d->buffer == id && rect_eq(d->dst, spots[k]) && d->src_origin.x == spots[k].x0 && d->src_origin.y == 2);
+    }
+    ASSERT(r.resolves == resolves && row_shown(&h, 0, bg[4], 40, true));
+    destroy_layers(m, 2);
+    keep_frame(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_DRAW) == 2 && klog_count(SHR_CMD_FILL) == 0);
+    /* Fallback pixels are not kept: the row draws plainly, then, once final and seen before, it is stored though only
+     * its glyph is redrawn. */
+    r.px.provisional = true;
+    keep_row(l, 2, &r, 32, bg[0], 16, 0);
+    keep_frame(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_KEEP_DRAW) == 0 && klog_count(SHR_CMD_GLYPH) == 1);
+    ASSERT(row_shown(&h, 32, bg[0], 16, true));
+    keep_again(ctx); /* seen, but provisional */
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_GLYPH) == 1 && kc(ctx).direct == 1);
+    r.px.provisional = false, r.changed = true;
+    klog_reset();
+    shr_pump(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 1 && klog_count(SHR_CMD_GLYPH) == 1 && klog_count(SHR_CMD_KEEP_DRAW) == 1);
+    ASSERT(rect_eq(klog_nth(SHR_CMD_KEEP_DRAW, 0)->dst, (shr_rect){16, 32, 24, 48}) && row_shown(&h, 32, bg[0], 16, true));
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    klog_reset();
+    shr_pump(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_KEEP_DRAW) == 3);
+    /* Rows outside their layer or the screen draw plainly. */
+    for (int k = 0; k < 2; k++) {
+        ASSERT_EQ_LL(shr_lyr_set_rect(l, k ? (shr_rect){8, 0, 72, 48} : (shr_rect){0, 0, 56, 48}), SHR_OK);
+        keep_frame(ctx);
+        ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_KEEP_DRAW) == 0 && klog_count(SHR_CMD_FILL) >= 3);
+    }
+    /* A keep group outside the damage is left out with its end. */
+    ASSERT_EQ_LL(shr_lyr_set_rect(l, FULL), SHR_OK);
+    shr__lcmd far[4] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, 4, 4}, .key = {9, 9}}, fill((shr_rect){0, 0, 4, 4}, BLUE),
+                        {.kind = SHR__LCMD_CACHE_END}, fill((shr_rect){10, 10, 14, 14}, RED)};
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, far, 4), SHR_OK);
-    frame(ctx);
+    keep_frame(ctx);
     far[3].color = GREEN;
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, far, 4), SHR_OK);
-    frame(ctx);
-    ASSERT(rec.n == 2 && rec.cmds[1].kind == SHR_CMD_FILL && rec.cmds[1].color == GREEN);
+    keep_frame(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_KEEP_DRAW) == 0 && klog_count(SHR_CMD_FILL) == 2);
+    ASSERT_EQ_LL(px(h.out.shown, 12, 12), GREEN);
     destroy_layers(&l, 1);
-    destroy_layers(&m, 1);
     r.res.dead = true;
     harness_close(&h);
+    PASS();
+}
+
+/* A keep group drawn from its keep is passed over to its end, in a group of two keep groups with commands before,
+ * between and after them: those still draw, in order. */
+TEST test_keep_hit_skips_to_its_end(void) {
+    keep_max = 8, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    const shr_rect a = {0, 0, HW, 16}, b = {0, 16, HW, 32};
+    const shr__lcmd c[11] = {fill((shr_rect){0, 32, 8, 40}, BLUE),
+                             {.kind = SHR__LCMD_CACHE_BEGIN, .dst = a, .key = {3, 4}},
+                             fill(a, RED),
+                             fill((shr_rect){0, 0, 8, 8}, GREEN),
+                             fill((shr_rect){8, 0, 16, 8}, BLUE),
+                             {.kind = SHR__LCMD_CACHE_END},
+                             fill((shr_rect){0, 40, 8, 48}, GREEN),
+                             {.kind = SHR__LCMD_CACHE_BEGIN, .dst = b, .key = {5, 6}},
+                             fill(b, GREEN),
+                             {.kind = SHR__LCMD_CACHE_END},
+                             fill((shr_rect){4, 20, 12, 28}, RED)};
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, c, 11), SHR_OK);
+    keep_frame(ctx);
+    keep_again(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 2);
+    keep_again(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_KEEP_DRAW) == 2 && klog_count(SHR_CMD_FILL) == 4);
+    ASSERT(px(h.out.shown, 2, 2) == GREEN && px(h.out.shown, 10, 2) == BLUE && px(h.out.shown, 20, 2) == RED);
+    ASSERT(px(h.out.shown, 2, 34) == BLUE && px(h.out.shown, 2, 42) == GREEN);
+    ASSERT(px(h.out.shown, 6, 22) == RED && px(h.out.shown, 20, 22) == GREEN);
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* Out of ids or bytes, a row replaces the least recently used keep the frame does not draw; when every keep is drawn
+ * by the frame (a refused store), or one row alone exceeds the bytes or the driver's largest keep, the row draws plainly.
+ * A keep replaced before a later frame drew it is a dead store. */
+TEST test_keep_eviction(void) {
+    static const struct {
+        uint32_t max;
+        uint64_t cap, slot;
+    } modes[] = {{2, 0, 0}, {4, 2 * ROW_BYTES, 0}, {4, ROW_BYTES - 1, 0}, {4, 0, ROW_BYTES - 128}, {2, 0, ROW_BYTES}};
+    for (int mode = 0; mode < 5; mode++) {
+        keep_max = modes[mode].max, keep_cap = modes[mode].cap, keep_slot = modes[mode].slot;
+        bool ids = keep_max == 2, none = mode == 2 || mode == 3; /* out of ids; no row fits */
+        harness h;
+        shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep);
+        fake r;
+        fake_attach(&r, ctx, &fk_ops);
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+        for (int i = 0; i < 3; i++) keep_row(l, (uint32_t)i, &r, 16 * i, i ? GREEN : RED, 8 * i, 0);
+        keep_frame(ctx);
+        expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+        keep_again(ctx);
+        expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+        int stored = none ? 0 : 2;
+        ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == stored && klog_count(SHR_CMD_KEEP_DRAW) == stored);
+        ASSERT(kc(ctx).stores == (uint32_t)stored && kc(ctx).refused == (mode < 2 || mode == 4) && kc(ctx).direct == 3u - stored);
+        keep_again(ctx); /* every keep drawn: nothing to evict */
+        ASSERT(rec.npro == 0 && klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_KEEP_DRAW) == stored);
+        keep_row(l, ids ? 0 : 2, &r, ids ? 0 : 32, BLUE, 24, 0);
+        keep_frame(ctx);
+        ASSERT_EQ_LL(klog_count(SHR_CMD_KEEP_BEGIN), 0);
+        keep_damage(ctx, (shr_rect){0, ids ? 0 : 32, 8, ids ? 16 : 48}); /* seen: stored, though damaged in part */
+        expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+        if (!none) { /* the oldest keep, row 0's, is replaced */
+            ASSERT(rec.npro == 0 && klog_nth(SHR_CMD_KEEP_BEGIN, 0)->buffer == 1);
+        } else {
+            ASSERT(rec.npro == 0 && klog_count(SHR_CMD_KEEP_BEGIN) == 0);
+        }
+        ASSERT(row_shown(&h, ids ? 0 : 32, BLUE, 24, true));
+        if (ids) { /* content evicted earlier in the frame is not drawn from its keep: stored again */
+            keep_row(l, 0, &r, 0, 0xFFFF00u, 48, 0);
+            keep_frame(ctx);
+            keep_again(ctx);
+            expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+            ASSERT(rec.npro == 0 && klog_count(SHR_CMD_KEEP_BEGIN) == 2 && kc(ctx).dead == 1);
+            ASSERT(klog_nth(SHR_CMD_KEEP_BEGIN, 0)->buffer == 2 && klog_nth(SHR_CMD_KEEP_BEGIN, 1)->buffer == 1);
+            ASSERT(row_shown(&h, 0, 0xFFFF00u, 48, true) && row_shown(&h, 16, GREEN, 8, true));
+        }
+        destroy_layers(&l, 1);
+        r.res.dead = true;
+        harness_close(&h);
+    }
+    PASS();
+}
+
+/* A row the bytes of the keeps the frame does not draw cannot take, or whose glyphs turn out provisional, leaves the
+ * keep it would replace held. */
+TEST test_keep_replacement(void) {
+    keep_max = 4, keep_cap = 2 * ROW_BYTES, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep);
+    fake r;
+    fake_attach(&r, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    keep_row(l, 0, &r, 0, RED, 0, 0);
+    keep_row(l, 1, &r, 16, GREEN, 8, 0);
+    keep_frame(ctx);
+    keep_again(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    /* Row 0 is drawn from its keep; two rows high, the new row, once seen, would need row 1's keep and row 0's. */
+    const shr_rect bars[2] = {{0, 16, HW, 32}, {0, 16, HW, 48}};
+    const shr__lcmd plain = fill(bars[0], BLUE),
+                    tall[3] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = bars[1], .key = {7, 7}}, fill(bars[1], RED),
+                               {.kind = SHR__LCMD_CACHE_END}};
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 1, &plain, 1), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 2, tall, 3), SHR_OK);
+    keep_frame(ctx);
+    keep_again(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(rec.npro == 0 && klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_KEEP_DRAW) == 1);
+    ASSERT_EQ_LL(kc(ctx).refused, 1);
+    ASSERT(px(h.out.shown, 4, 20) == RED && row_shown(&h, 0, RED, 0, true));
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 2, NULL, 0), SHR_OK);
+    keep_row(l, 1, &r, 16, GREEN, 8, 0);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_nth(SHR_CMD_KEEP_DRAW, 0)->buffer == 2);
+    ASSERT(row_shown(&h, 16, GREEN, 8, true) && ctx->keep_resident == 2 * ROW_BYTES);
+    /* Row 0's new glyph is provisional: its keep stays. */
+    r.px.provisional = true;
+    keep_row(l, 0, &r, 0, BLUE, 24, 0);
+    keep_frame(ctx);
+    keep_damage(ctx, (shr_rect){0, 0, HW, 16});
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_GLYPH) == 1 && row_shown(&h, 0, BLUE, 24, true));
+    ASSERT(kc(ctx).direct == 1 && kc(ctx).stores == 0);
+    r.px.provisional = false;
+    keep_row(l, 0, &r, 0, RED, 0, 0);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_nth(SHR_CMD_KEEP_DRAW, 0)->buffer == 1);
+    ASSERT(row_shown(&h, 0, RED, 0, true) && ctx->keep_resident == 2 * ROW_BYTES);
+    destroy_layers(&l, 1);
+    r.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* Content the blink phase hides is left out of a row's keep: each phase keeps its own. */
+TEST test_keep_blink_phases(void) {
+    keep_max = 4, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_blink);
+    fake r;
+    fake_attach(&r, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    /* Blinking glyphs at both ends: a phase change damages the whole row. */
+    shr__lcmd row[6] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, HW, 16}, .key = {5, 6}}, fill((shr_rect){0, 0, HW, 16}, RED),
+                        glyph(&r, 0, 0, WHITE), glyph(&r, 24, 0, WHITE), glyph(&r, HW - 8, 0, WHITE),
+                        {.kind = SHR__LCMD_CACHE_END}};
+    row[2].flags = row[4].flags = SHR__LCMD_BLINK;
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, row, 6), SHR_OK);
+    keep_frame(ctx);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_GLYPH) == 3 && row_shown(&h, 0, RED, 0, true));
+    for (int k = 1; k <= 5; k++) { /* each phase is stored when it shows again */
+        fake_now = (uint64_t)(100 * k + 50) * MS;
+        klog_reset();
+        shr_pump(ctx);
+        bool shown = !(k & 1), stored = k == 2 || k == 3;
+        ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == stored && klog_count(SHR_CMD_KEEP_DRAW) == (k >= 2));
+        ASSERT_EQ_LL(klog_count(SHR_CMD_GLYPH), k < 2 || stored ? (shown ? 3 : 1) : 0);
+        ASSERT(row_shown(&h, 0, RED, 0, shown) && row_shown(&h, 0, RED, 24, true));
+        if (k >= 2) ASSERT_EQ_LL(klog_nth(SHR_CMD_KEEP_DRAW, 0)->buffer, shown ? 1u : 2u);
+    }
+    destroy_layers(&l, 1);
+    r.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* After a failed batch the keeps are released before any is drawn again; out of memory for the keeps a batch stores,
+ * keeps take no more bytes than before it. */
+TEST test_keep_lost_batches(void) {
+    keep_max = 8, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep);
+    fake r;
+    fake_attach(&r, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    for (int i = 0; i < 3; i++) keep_row(l, (uint32_t)i, &r, 16 * i, i ? GREEN : RED, 8 * i, 0);
+    keep_frame(ctx);
+    keep_again(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    keep_row(l, 0, &r, 0, BLUE, 40, 0); /* seen before the failures */
+    keep_frame(ctx);
+    keep_row(l, 0, &r, 0, RED, 0, 0);
+    keep_frame(ctx);
+    /* Twice failing (the second frame stores again into an id it releases), then all four ids are released. */
+    keep_row(l, 0, &r, 0, BLUE, 40, 0);
+    h.drv.fail_next = 2;
+    keep_frame(ctx);
+    ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_DEVICE);
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    keep_frame(ctx);
+    ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_DEVICE);
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT_EQ_LL(klog_count(SHR_CMD_KEEP_RELEASE), 4);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 3 && klog_count(SHR_CMD_KEEP_DRAW) == 3 && row_shown(&h, 0, BLUE, 40, true));
+    /* Out of memory, a batch storing nothing leaves the bytes alone; one storing keeps lowers them to what was held. */
+    h.drv.fail_status = SHR_E_NO_MEMORY, h.drv.fail_next = 1;
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    keep_frame(ctx);
+    ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_NO_MEMORY);
+    ASSERT_EQ_LL(ctx->keep_budget, UINT64_MAX);
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT_EQ_LL(klog_count(SHR_CMD_KEEP_BEGIN), 3);
+    keep_row(l, 0, &r, 0, RED, 48, 0);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    keep_mem.budget = 0;
+    keep_damage(ctx, (shr_rect){0, 0, 8, 16});
+    ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_NO_MEMORY);
+    ASSERT_EQ_LL(ctx->keep_budget, 3 * ROW_BYTES);
+    keep_mem.budget = -1;
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    keep_row(l, 0, &r, 0, BLUE, 48, 0);
+    keep_frame(ctx);
+    keep_damage(ctx, (shr_rect){0, 0, 8, 16});
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(rec.npro == 0 && klog_count(SHR_CMD_KEEP_BEGIN) == 1 && klog_nth(SHR_CMD_KEEP_BEGIN, 0)->buffer <= 3);
+    ASSERT_EQ_LL(ctx->keep_resident, 3 * ROW_BYTES);
+    destroy_layers(&l, 1);
+    r.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* Bands 12 rows high cut the rows: a band stores the row it covers to the end of the band, later bands draw the rest
+ * of it. A row is held once the batch storing it was accepted: a frame dropped before that stores it again. */
+TEST test_keep_bands(void) {
+    keep_max = 8, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep);
+    shr_surface b[2] = {band_surface(0, SHR_MEMORY_CPU), band_surface(1, SHR_MEMORY_CPU)};
+    b[0].height = b[1].height = 12;
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_OK);
+    fake r;
+    fake_attach(&r, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    const shr_color bg[3] = {RED, GREEN, BLUE};
+    for (int i = 0; i < 3; i++) keep_row(l, (uint32_t)i, &r, 16 * i, bg[i], 8 * i, 0);
+    keep_frame(ctx);
+    ASSERT_EQ_LL(klog_count(SHR_CMD_KEEP_BEGIN), 0); /* a row seen in a band is not seen again in the next one */
+    ASSERT(kc(ctx).direct == 6 && kc(ctx).hits == 0 && kc(ctx).stores == 0);
+    keep_again(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 3 && klog_count(SHR_CMD_KEEP_DRAW) == 6 && klog.calls == 8);
+    ASSERT(kc(ctx).stores == 3 && kc(ctx).hits == 3 && kc(ctx).direct == 0); /* counted over all bands */
+    const shr_draw_cmd *b1 = klog_nth(SHR_CMD_KEEP_BEGIN, 1), *d1 = klog_nth(SHR_CMD_KEEP_DRAW, 1);
+    ASSERT(rect_eq(b1->dst, (shr_rect){0, 4, HW, 20}) && b1->buffer == 2); /* row 1 in band 1, reaching past it */
+    ASSERT(d1->buffer == 1 && rect_eq(d1->dst, (shr_rect){0, 0, HW, 4}) && d1->src_origin.y == 12);
+    for (int i = 0; i < 3; i++) ASSERT(row_shown(&h, 16 * i, bg[i], 8 * i, true));
+    /* Refused at band 1 while a newer state waits: row 1's store never ran, so it is stored again. */
+    for (int i = 0; i < 3; i++) keep_row(l, (uint32_t)i, &r, 16 * i, bg[(i + 1) % 3], 8 * i + 4, 0);
+    keep_frame(ctx);
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    drain(ctx);
+    klog_reset();
+    klog.block_at = 3;
+    ASSERT_EQ_LL(shr_submit(ctx), SHR_OK);
+    shr_pump(ctx);
+    ASSERT(klog.calls == 3 && klog_nth(SHR_CMD_KEEP_BEGIN, 0)->buffer == 4);
+    keep_row(l, 2, &r, 32, RED, 44, 0);
+    klog_reset();
+    frame(ctx);
+    expect_event(ctx, SHR_EVENT_FRAME_SUPERSEDED);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 1 && klog_nth(SHR_CMD_KEEP_DRAW, 0)->buffer == 4); /* row 0 was held */
+    ASSERT(rect_eq(klog_nth(SHR_CMD_KEEP_BEGIN, 0)->dst, (shr_rect){0, 4, HW, 20}));
+    ASSERT(row_shown(&h, 0, GREEN, 4, true) && row_shown(&h, 16, BLUE, 12, true) && row_shown(&h, 32, RED, 44, true));
+    /* Out of memory in band 0, which stores nothing (band 2 would): the bytes stay. */
+    keep_row(l, 2, &r, 32, GREEN, 36, 0);
+    keep_frame(ctx);
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    h.drv.fail_status = SHR_E_NO_MEMORY, h.drv.fail_next = 1;
+    keep_frame(ctx);
+    ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_NO_MEMORY);
+    ASSERT_EQ_LL(ctx->keep_budget, UINT64_MAX);
+    ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 3 && row_shown(&h, 32, GREEN, 36, true));
+    destroy_layers(&l, 1);
+    r.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* A frame stores eight groups, more while their bytes fit in keep_store_bytes (here less than one group, then twelve);
+ * those past it draw plainly and are stored when seen again. Keys sharing their first place in the seen table take
+ * their second. */
+TEST test_keep_store_budget(void) {
+    keep_max = 16, keep_cap = 0, keep_slot = 0;
+    size_t row;
+    shr_format_row_bytes(SHR_PIXEL_FORMAT, 8, &row);
+    static const uint32_t hits[2][4] = {{0, 0, 8, 16}, {0, 0, 12, 16}}, stores[2][4] = {{0, 8, 8, 0}, {0, 12, 4, 0}};
+    for (int mode = 0; mode < 2; mode++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep);
+        ctx->keep_store_bytes = mode ? 12 * row * 16 : 1;
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+        for (uint32_t i = 0; i < 16; i++) {
+            shr_rect r = {8 * (int32_t)(i % 8), 16 * (int32_t)(i / 8), 8 * (int32_t)(i % 8) + 8, 16 * (int32_t)(i / 8) + 16};
+            shr__lcmd c[3] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = r, .key = {(uint64_t)i << 32 | 5, 0x9E3779B9ull * (i + 1)}},
+                              fill(r, i & 1 ? RED : GREEN), {.kind = SHR__LCMD_CACHE_END}};
+            ASSERT_EQ_LL(shr__lyr_group_set(l, i, c, 3), SHR_OK);
+        }
+        for (int k = 0; k < 4; k++) {
+            keep_again(ctx);
+            expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+            shr__keep_count n = kc(ctx);
+            ASSERT(n.hits == hits[mode][k] && n.stores == stores[mode][k] && n.direct == 16 - hits[mode][k] - stores[mode][k]);
+            ASSERT(n.dead == 0 && n.refused == 0 && klog_count(SHR_CMD_KEEP_BEGIN) == (int)stores[mode][k]);
+            ASSERT(px(h.out.shown, 4, 4) == GREEN && px(h.out.shown, 12, 20) == RED);
+        }
+        destroy_layers(&l, 1);
+        harness_close(&h);
+    }
+    PASS();
+}
+
+/* ---- stores on credit: drivers with SHR_DRIVER_CHEAP_STORE ---- */
+
+static void tweak_keep_cheap(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_keep(d, drv);
+    drv->caps.flags |= SHR_DRIVER_CHEAP_STORE;
+}
+
+static const shr_color cell_colors[6] = {RED, GREEN, BLUE, 0xFF00FFu, 0x00FFFFu, 0xFFFF00u};
+
+/* Keep group `group`: cell `cell` of 8 x 16 (8 a row) filled with a colour of `key`. */
+static void keep_cell(shr_lyr *l, uint32_t group, uint32_t cell, uint64_t key) {
+    int32_t x = 8 * (int32_t)(cell % 8), y = 16 * (int32_t)(cell / 8);
+    shr_rect r = {x, y, x + 8, y + 16};
+    shr__lcmd c[3] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = r, .key = {key << 32 | 5, 0x9E3779B9ull * (key + 1)}},
+                      fill(r, cell_colors[key % 6]), {.kind = SHR__LCMD_CACHE_END}};
+    ASSERT_EQ_LL(shr__lyr_group_set(l, group, c, 3), SHR_OK);
+}
+
+static bool cell_shown(const harness *h, uint32_t cell, uint64_t key) {
+    return px(h->out.shown, 8 * (int32_t)(cell % 8) + 4, 16 * (int32_t)(cell / 8) + 8) == cell_colors[key % 6];
+}
+
+static bool keep_is(const shr_context *ctx, uint32_t hits, uint32_t stores, uint32_t direct, uint32_t credit) {
+    shr__keep_count n = kc(ctx);
+    return n.hits == hits && n.stores == stores && n.direct == direct && ctx->keep_credit == credit;
+}
+
+/* Past the stores of the store policy (here 8 a frame), and at first sight, a frame stores on credit: from 2/3 of the
+ * keep ids, one each, one back at every frame and two when a later frame first draws such a keep, up to the ids.
+ * Without the flag nothing changes. */
+TEST test_keep_credit(void) {
+    keep_max = 24, keep_cap = 0, keep_slot = 0;
+    static const uint32_t off[4][3] = {{0, 0, 12}, {0, 8, 4}, {8, 4, 0}, {12, 0, 0}}, /* hits, stores, direct */
+        on[4][4] = {{0, 1, 11, 0}, {1, 11, 0, 0}, {12, 0, 0, 7}, {12, 0, 0, 8}};      /* and the credit after */
+    for (int mode = 0; mode < 2; mode++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, PRESERVED, mode ? tweak_keep_cheap : tweak_keep);
+        ASSERT_EQ_LL(ctx->keep_credit, 16u);
+        ctx->keep_store_bytes = 1;
+        ctx->keep_credit = 0;
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+        for (uint32_t i = 0; i < 12; i++) keep_cell(l, i, i, i + 1);
+        for (int k = 0; k < 4; k++) {
+            keep_again(ctx);
+            expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+            ASSERT(mode ? keep_is(ctx, on[k][0], on[k][1], on[k][2], on[k][3])
+                        : keep_is(ctx, off[k][0], off[k][1], off[k][2], ctx->keep_credit));
+            ASSERT(kc(ctx).dead == 0 && kc(ctx).refused == 0 && cell_shown(&h, 0, 1) && cell_shown(&h, 11, 12));
+        }
+        if (mode) {
+            for (int k = 0; k < 20; k++) keep_again(ctx); /* 16 frames up to the ids */
+            ASSERT_EQ_LL(ctx->keep_credit, 24u);
+            keep_cell(l, 12, 12, 13);
+            keep_frame(ctx);
+            ASSERT(keep_is(ctx, 0, 1, 0, 23));
+            keep_again(ctx); /* the refund stops at the ids too */
+            ASSERT(keep_is(ctx, 13, 0, 0, 24));
+            ASSERT(cell_shown(&h, 12, 13));
+        }
+        destroy_layers(&l, 1);
+        harness_close(&h);
+    }
+    PASS();
+}
+
+/* A store on credit takes a free id or one of a keep stored on credit that no later frame drew, least recently used
+ * first; never a keep drawn since, nor one the store policy made. Out of credit a group draws plainly. */
+TEST test_keep_credit_evicts(void) {
+    keep_max = 6, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_cheap);
+    ASSERT_EQ_LL(ctx->keep_credit, 4u);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    keep_cell(l, 0, 7, 1);
+    keep_cell(l, 1, 6, 2);
+    ctx->keep_credit = 0;
+    keep_frame(ctx); /* 1 on credit, the other plainly */
+    ASSERT(keep_is(ctx, 0, 1, 1, 0));
+    keep_again(ctx); /* drawn from its keep: 2 back; the other one stored as the policy says */
+    ASSERT(keep_is(ctx, 1, 1, 0, 3));
+    keep_again(ctx); /* all from keeps: stores on credit again */
+    ASSERT(keep_is(ctx, 2, 0, 0, 4));
+    for (uint32_t i = 0; i < 4; i++) keep_cell(l, 2 + i, i, 10 + i);
+    keep_again(ctx);
+    ASSERT(keep_is(ctx, 2, 4, 0, 1));
+    for (uint32_t i = 0; i < 5; i++) keep_cell(l, 2 + i, i, 20 + i);
+    ctx->keep_credit = 6;
+    keep_frame(ctx); /* the four undrawn keeps give way, the older two drawn ones not; the fifth store finds none */
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(keep_is(ctx, 0, 4, 1, 2));
+    ASSERT(kc(ctx).dead == 4 && kc(ctx).refused == 1 && klog_count(SHR_CMD_KEEP_RELEASE) == 0);
+    for (uint32_t i = 0; i < 5; i++) ASSERT(cell_shown(&h, i, 20 + i));
+    ASSERT(cell_shown(&h, 6, 2) && cell_shown(&h, 7, 1));
+    keep_again(ctx);
+    ASSERT(keep_is(ctx, 6, 0, 1, 6));
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* Stores on credit only in the first two of frames in a row that draw a keep group without its keep: a group that
+ * changes every frame is not stored past them. A frame drawing all from keeps starts over. */
+TEST test_keep_credit_run(void) {
+    keep_max = 24, keep_cap = 0, keep_slot = 0;
+    static const uint32_t want[6][4] = {{0, 2, 0, 9}, {0, 2, 0, 8}, {0, 0, 2, 9}, {0, 2, 0, 10}, {2, 0, 0, 11},
+                                        {0, 2, 0, 10}}; /* hits, stores, direct, credit after */
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_cheap);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    keep_again(ctx);
+    keep_again(ctx);
+    ctx->keep_credit = 10;
+    for (int k = 0; k < 6; k++) {
+        if (k < 3 || k == 5)
+            for (uint32_t i = 0; i < 2; i++) keep_cell(l, i, i, 10 * (uint64_t)k + i);
+        keep_again(ctx);
+        drain(ctx);
+        ASSERT(keep_is(ctx, want[k][0], want[k][1], want[k][2], want[k][3]));
+        ASSERT(cell_shown(&h, 0, 10 * (uint64_t)(k < 3 ? k : k == 5 ? 5 : 2)));
+    }
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* A group with fallback pixels is not stored: its store on credit gives the credit back. */
+TEST test_keep_credit_provisional(void) {
+    keep_max = 4, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_cheap);
+    fake r;
+    fake_attach(&r, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    r.px.provisional = true;
+    keep_row(l, 0, &r, 0, RED, 8, 0);
+    keep_frame(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(keep_is(ctx, 0, 0, 1, 3));
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 0 && klog_count(SHR_CMD_GLYPH) == 1 && row_shown(&h, 0, RED, 8, true));
+    r.px.provisional = false, r.changed = true;
+    klog_reset();
+    shr_pump(ctx);
+    ASSERT(keep_is(ctx, 0, 1, 0, 4)); /* seen before: stored as the policy says */
+    ASSERT(klog_count(SHR_CMD_KEEP_BEGIN) == 1 && row_shown(&h, 0, RED, 8, true));
+    keep_again(ctx);
+    ASSERT(keep_is(ctx, 1, 0, 0, 4));
+    keep_row(l, 1, &r, 16, GREEN, 16, 0);
+    keep_frame(ctx);
+    ASSERT(keep_is(ctx, 0, 1, 0, 3));
+    destroy_layers(&l, 1);
+    r.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* A frame drawing more groups from its keeps than it draws or stores otherwise starts the run over: the one group that
+ * changes in each frame of a kept screen is stored on credit every time. */
+TEST test_keep_credit_mostly_kept(void) {
+    keep_max = 24, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_cheap);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    for (uint32_t i = 0; i < 4; i++) keep_cell(l, i, i, i + 1);
+    keep_again(ctx);
+    ASSERT(keep_is(ctx, 0, 4, 0, 13));
+    for (uint32_t k = 0; k < 4; k++) {
+        keep_cell(l, 0, 0, 10 + k);
+        keep_again(ctx);
+        ASSERT(keep_is(ctx, 3, 1, 0, 19) && cell_shown(&h, 0, 10 + k));
+    }
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* A pump finding nothing to do once a frame showed (no frame running, nothing submitted or due, no resource with work
+ * or a read in flight) makes the next frame store nothing on credit; stores at second sight stay. */
+TEST test_keep_credit_still(void) {
+    keep_max = 24, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_cheap);
+    fake r, bare;
+    fake_attach(&r, ctx, &fk_ops);
+    fake_attach(&bare, ctx, &bare_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    shr_pump(ctx);
+    ASSERT(!ctx->keep_still); /* nothing shown yet */
+    for (uint32_t i = 0; i < 2; i++) keep_cell(l, i, i, i + 1);
+    keep_frame(ctx);
+    ASSERT(keep_is(ctx, 0, 2, 0, 15));
+    r.work = true;
+    shr_pump(ctx);
+    ASSERT(!ctx->keep_still);
+    r.work = false;
+    src_log sl = {SHR_IN_PROGRESS, 0, 0, 0, 0};
+    shr_asset_source src = source(&sl, true);
+    uint8_t buf[4];
+    ASSERT_EQ_LL(shr__ctx_read(ctx, &r.res, &src, 0, 4, buf, 1), SHR_OK);
+    shr_pump(ctx);
+    ASSERT(!ctx->keep_still); /* a read in flight */
+    ASSERT_EQ_LL(shr_asset_complete(ctx, sl.req, SHR_OK), SHR_OK);
+    shr_pump(ctx);
+    ASSERT(!ctx->keep_still && r.io_n == 1); /* a read to deliver */
+    shr_pump(ctx);
+    ASSERT(ctx->keep_still);
+    for (uint32_t i = 0; i < 2; i++) keep_cell(l, i, i, i + 10);
+    keep_frame(ctx); /* plainly, credit left or not */
+    ASSERT(!ctx->keep_still && keep_is(ctx, 0, 0, 2, 16));
+    keep_again(ctx); /* seen again: stored as the policy says */
+    ASSERT(keep_is(ctx, 0, 2, 0, 17));
+    keep_again(ctx);
+    ASSERT(keep_is(ctx, 2, 0, 0, 18));
+    keep_cell(l, 0, 0, 20);
+    keep_again(ctx); /* on credit again */
+    ASSERT(keep_is(ctx, 1, 1, 0, 18) && cell_shown(&h, 0, 20) && cell_shown(&h, 1, 11));
+
+    h.drv.async = true; /* not while a frame runs, nor at the pump that ends it */
+    keep_again(ctx);
+    shr_pump(ctx);
+    ASSERT(!ctx->keep_still);
+    md_complete(&h.drv);
+    shr_pump(ctx);
+    ASSERT(!ctx->keep_still && h.out.presents == 6);
+    h.drv.async = false;
+    r.px.provisional = true; /* nor when a resource change makes a frame due */
+    keep_row(l, 2, &r, 32, RED, 8, 0);
+    keep_frame(ctx);
+    ASSERT(keep_is(ctx, 0, 0, 1, 22));
+    r.px.provisional = false, r.changed = true;
+    shr_pump(ctx);
+    ASSERT(!ctx->keep_still && ctx->keep_run == 1 && h.out.presents == 8);
+    destroy_layers(&l, 1);
+    r.res.dead = bare.res.dead = true;
+    harness_close(&h);
+
+    ctx = harness_open(&h, 0, tweak_one_frame); /* nor while a submitted frame waits for the output */
+    frame(ctx);
+    frame(ctx);
+    ASSERT(!ctx->keep_still && h.out.presents == 1);
+    ASSERT_EQ_LL(shr_output_released(ctx, h.out.last_frame), SHR_OK);
+    shr_pump(ctx);
+    ASSERT(!ctx->keep_still && h.out.presents == 2);
+    ASSERT_EQ_LL(shr_output_released(ctx, h.out.last_frame), SHR_OK);
+    shr_pump(ctx);
+    ASSERT(ctx->keep_still);
+    harness_close(&h);
+    PASS();
+}
+
+/* The pause takes the first frame submitted after it only: the next frame of new rows stores on credit again, the one
+ * after that (the third in a row drawing more than it takes from keeps) does not. */
+TEST test_keep_credit_still_once(void) {
+    keep_max = 24, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_cheap);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    for (uint32_t i = 0; i < 2; i++) keep_cell(l, i, i, i + 1);
+    keep_frame(ctx);
+    keep_again(ctx); /* from keeps: a new run of frames may start */
+    shr_pump(ctx);
+    ASSERT(ctx->keep_still && keep_is(ctx, 2, 0, 0, 20));
+    uint32_t stores[3];
+    for (uint32_t f = 0; f < 3; f++) {
+        for (uint32_t i = 0; i < 2; i++) keep_cell(l, i, i, 10 * (f + 1) + i);
+        keep_frame(ctx);
+        stores[f] = kc(ctx).stores;
+    }
+    ASSERT(stores[0] == 0 && stores[1] == 2 && stores[2] == 0);
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+static void tweak_keep_blink_cheap(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_keep_blink(d, drv);
+    drv->caps.flags |= SHR_DRIVER_CHEAP_STORE;
+}
+
+/* Blink phases alone do not end the pause: a blink frame after it stores on credit, the next submitted frame not. */
+TEST test_keep_credit_still_blink(void) {
+    keep_max = 4, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_blink_cheap);
+    fake r;
+    fake_attach(&r, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    keep_row(l, 0, &r, 0, RED, 8, SHR__LCMD_BLINK);
+    keep_frame(ctx);
+    ASSERT(keep_is(ctx, 0, 1, 0, 2) && row_shown(&h, 0, RED, 8, true));
+    fake_now = 50 * MS;
+    shr_pump(ctx);
+    ASSERT(ctx->keep_still);
+    fake_now = 150 * MS;
+    klog_reset();
+    shr_pump(ctx);
+    ASSERT(ctx->keep_still && keep_is(ctx, 0, 1, 0, 2) && klog_count(SHR_CMD_KEEP_BEGIN) == 1);
+    ASSERT(row_shown(&h, 0, RED, 8, false));
+    keep_row(l, 1, &r, 16, GREEN, 16, 0);
+    keep_frame(ctx);
+    ASSERT(!ctx->keep_still && keep_is(ctx, 0, 0, 1, 3) && row_shown(&h, 16, GREEN, 16, true));
+    destroy_layers(&l, 1);
+    r.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+/* The command limit applies to keep commands too: clear and fill at first sight; with a glyph beside, clear, glyph,
+ * KEEP_BEGIN, fill, KEEP_END, KEEP_DRAW at the second; then the KEEP_DRAW of a kept row. */
+TEST test_keep_command_limit(void) {
+    keep_max = 4, keep_cap = 0, keep_slot = 0;
+    for (max_cmds = 1; max_cmds <= 6; max_cmds++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_cmds);
+        fake r;
+        fake_attach(&r, ctx, &fk_ops);
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+        shr__lcmd row[3] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, 8, 16}, .key = {1}}, fill((shr_rect){0, 0, 8, 16}, RED),
+                            {.kind = SHR__LCMD_CACHE_END}};
+        shr__lcmd g[5];
+        for (int i = 0; i < 5; i++) g[i] = glyph(&r, 16 + 8 * i, 0, WHITE);
+        ASSERT_EQ_LL(shr__lyr_group_set(l, 2, row, 3), SHR_OK);
+        frame(ctx);
+        if (max_cmds >= 2) {
+            expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+            ASSERT_EQ_LL(shr__lyr_group_set(l, 1, g, 1), SHR_OK);
+            keep_again(ctx);
+        }
+        if (max_cmds < 6) {
+            ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_LIMIT);
+        } else {
+            expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+            ASSERT_EQ_LL(shr__lyr_group_set(l, 1, g, 5), SHR_OK);
+            keep_again(ctx);
+            ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_LIMIT);
+        }
+        destroy_layers(&l, 1);
+        r.res.dead = true;
+        harness_close(&h);
+    }
+    PASS();
+}
+
+/* Every allocation of the keep plan may fail (the first frame's releases, the stores, an eviction growing the plan
+ * past its earlier size): the frame fails and the keeps stay consistent. */
+TEST test_keep_plan_out_of_memory(void) {
+    static fake fk[9];
+    keep_max = 2, keep_cap = 2 * ROW_BYTES, keep_slot = 0;
+    for (long budget = 0;; budget++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_oom);
+        for (int i = 0; i < 9; i++) fake_attach(&fk[i], ctx, &fk_ops);
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+        long left = budget;
+        keep_row(l, 1, &fk[8], 0, RED, 0, 0);
+        keep_row(l, 2, &fk[8], 16, GREEN, 8, 0);
+        for (int k = 0; k < 2; k++) { /* seen, then stored */
+            ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+            limited(&left, shr_submit, ctx);
+            limited(&left, shr_pump, ctx);
+        }
+        /* Seen before, a row two rows high replaces row 1's keep and releases row 2's, growing the plan, whose first
+         * prologue block eight new buffers fill. */
+        const shr__lcmd tall[3] = {{.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, HW, 32}, .key = {7, 7}},
+                                   fill((shr_rect){0, 0, HW, 32}, BLUE), {.kind = SHR__LCMD_CACHE_END}};
+        ASSERT_EQ_LL(shr__lyr_group_set(l, 1, tall, 3), SHR_OK);
+        limited(&left, shr_submit, ctx);
+        limited(&left, shr_pump, ctx);
+        shr__lcmd g[8];
+        for (int i = 0; i < 8; i++) g[i] = glyph(&fk[i], 8 * i, 32, WHITE);
+        ASSERT_EQ_LL(shr__lyr_group_set(l, 0, g, 8), SHR_OK);
+        ASSERT_EQ_LL(shr_request_redraw(ctx), SHR_OK);
+        klog_reset();
+        limited(&left, shr_submit, ctx);
+        limited(&left, shr_pump, ctx);
+        uint64_t bytes = 0;
+        uint32_t releasing = 0;
+        for (uint32_t k = 0; k < keep_max; k++) bytes += ctx->keeps[k].bytes, releasing += ctx->keeps[k].releasing;
+        ASSERT(bytes == ctx->keep_resident && releasing == ctx->nkeep_released);
+        destroy_layers(&l, 1);
+        for (int i = 0; i < 9; i++) fk[i].res.dead = true;
+        harness_close(&h);
+        ASSERT_EQ_LL(oom.live, 0);
+        if (left) {
+            ASSERT(rec.npro == 9 && pro_is(8, SHR_CMD_KEEP_RELEASE, 2) && klog_nth(SHR_CMD_KEEP_BEGIN, 0)->buffer == 1);
+            break;
+        }
+    }
     PASS();
 }
 
@@ -3138,6 +4581,7 @@ TEST test_resource_resolution(void) {
     c[0].flags = SHR__LCMD_DIM;
     c[1].id = 0; /* not found: draws nothing */
     c[2].kind = SHR__LCMD_IMAGE, c[2].flags = SHR__LCMD_DIM;
+    c[3].flags = SHR__LCMD_ON_FILL, c[3].bg = 0xFF000000; /* on the clear colour */
     paint(l, 5, c);
     frame(ctx);
     ASSERT_EQ_LL(rec.n, 4);
@@ -3145,7 +4589,8 @@ TEST test_resource_resolution(void) {
     ASSERT(g->kind == SHR_CMD_GLYPH && g->flags == SHR_GLYPH_DIM && g->color == RED);
     ASSERT(rect_eq(g->dst, (shr_rect){6, 7, 12, 22}) && g->src_origin.x == 2 && g->src_origin.y == 1);
     ASSERT(rec.cmds[2].kind == SHR_CMD_IMAGE && rec.cmds[2].flags == 0);
-    ASSERT(rec.cmds[3].kind == SHR_CMD_GLYPH && rec.cmds[3].flags == 0);
+    ASSERT(rec.cmds[3].kind == SHR_CMD_GLYPH && rec.cmds[3].flags == SHR_GLYPH_ON_FILL &&
+           rec.cmds[3].bg == 0xFF000000);
     ASSERT(r.resolves == 3 && r.ends == 1 && im.ends == 1 && off.resolves == 1); /* frame_end once per frame */
     ASSERT_EQ_LL(px(h.out.shown, 4, 24), WHITE);
     im.st = SHR_E_IO;
@@ -3213,10 +4658,9 @@ TEST test_glyph_styles(void) {
     static const uint32_t rgba = 0xFFFFFFFFu;
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 1, 1, &rgba, 4, &img), SHR_OK);
     shr__res *ir = (shr__res *)img;
-    shr__resolved out;
-    memset(&out, 0xFF, sizeof(out));
+    const shr__resolved *out = NULL;
     ASSERT_EQ_LL(ir->ops->resolve(ir, 0, 1, &out), SHR_OK);
-    ASSERT(out.synth == 0 && out.slant_axis == 0);
+    ASSERT(out->synth == 0 && out->slant_axis == 0);
     ir->ops->frame_end(ir, 1);
     ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
     destroy_layers(&l, 1);
@@ -3251,6 +4695,31 @@ TEST test_provisional_pixels_redrawn(void) {
         r.res.dead = true;
         harness_close(&h);
     }
+    PASS();
+}
+
+/* Fallback pixels are recorded as rectangles: a cell next to the last one widens it. */
+TEST test_provisional_runs(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    fake r;
+    fake_attach(&r, ctx, &fk_ops);
+    r.px.provisional = true;
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    shr__lcmd c[4] = {glyph(&r, 0, 0, WHITE), glyph(&r, 8, 0, WHITE), glyph(&r, 32, 0, WHITE), glyph(&r, 0, 16, WHITE)};
+    paint(l, 4, c);
+    frame(ctx);
+    const shr__vec *v = NULL;
+    for (int i = 0; i < SHR_TARGETS; i++)
+        if (ctx->targets[i].provisional.len) v = &ctx->targets[i].provisional;
+    ASSERT(v && v->len == 3 && rect_eq(*SHR_VEC_AT(v, shr_rect, 0), (shr_rect){0, 0, 16, 16}));
+    r.changed = true, r.px.provisional = false;
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 2 && rec.damaged == 4 * 8 * 16);
+    destroy_layers(&l, 1);
+    r.res.dead = true;
+    harness_close(&h);
     PASS();
 }
 
@@ -3701,6 +5170,499 @@ TEST test_shutdown_cancels_reads(void) {
 
 GREATEST_MAIN_DEFS();
 
+/* ---- moves: a layer of six opaque rows of 8 pixels, group r in row coordinates at y 8r, scrolled like a tilemap ---- */
+
+#define MROWS 6
+static shr_color mshown[MROWS]; /* what each screen row of the layer should show */
+static uint32_t mnext = 1;      /* colours of new rows: mcolor(1), mcolor(2), ..., exact in either format */
+
+static shr_color mcolor(uint32_t k) {
+    uint32_t r = (k * 7 % 32 * 255 + 15) / 31, g = (k * 13 % 64 * 255 + 31) / 63, b = (k * 3 % 32 * 255 + 15) / 31;
+    return r << 16 | g << 8 | b;
+}
+
+static void mrow(shr_lyr *l, uint32_t r, uint16_t flags) {
+    shr__rcmd *c = shr__lyr_row_begin(l, 1);
+    c[0] = row_of(fill((shr_rect){0, 0, HW, 8}, mcolor(mnext)));
+    c[0].flags = (uint8_t)flags;
+    ASSERT_EQ_LL(shr__lyr_row_commit(l, r, (int32_t)r * 8, NULL, nokey, c, 1), SHR_OK);
+    mshown[r] = mcolor(mnext++);
+}
+
+static shr_lyr *mlayer(shr_context *ctx, shr_rect rect) {
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, rect, &l), SHR_OK);
+    mnext = 1;
+    for (uint32_t r = 0; r < MROWS; r++) mrow(l, r, 0);
+    return l;
+}
+
+/* Rows [top, bottom) up by n (down for n < 0); the uncovered rows get new colours. */
+static void mscroll(shr_lyr *l, uint32_t top, uint32_t bottom, int32_t n) {
+    shr__lyr_groups_shift(l, top, bottom, -n, (shr_rect){0, (int32_t)top * 8, HW, (int32_t)bottom * 8}, -n * 8);
+    shr_color was[MROWS];
+    memcpy(was, mshown, sizeof(was));
+    for (uint32_t r = top; r < bottom; r++) {
+        int64_t from = (int64_t)r + n;
+        if (from >= top && from < bottom) mshown[r] = was[from];
+        else mrow(l, r, 0);
+    }
+}
+
+/* Every row shows its colour at a few columns of the layer rect `in`. */
+static bool mrows_shown(const harness *h, shr_rect in) {
+    bool ok = true;
+    for (int32_t r = 0; r < MROWS; r++)
+        for (int32_t x = in.x0; x < in.x1; x += 9) ok &= px(h->out.shown, x, in.y0 + 8 * r + 3) == mshown[r];
+    return ok;
+}
+
+static int mcopies(void) {
+    int n = 0;
+    for (size_t i = 0; i < rec.n; i++) n += rec.cmds[i].kind == SHR_CMD_COPY;
+    return n;
+}
+
+static void tweak_moves(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_rec(d, drv);
+    drv->caps.flags = SHR_DRIVER_CHEAP_MOVE;
+}
+
+/* A scrolled layer's pixels move with one COPY of the output onto itself ahead of the draws of the rows it uncovers;
+ * a full-screen move leaves the rest of the output to the driver, a region or a narrower layer does not. */
+TEST test_moves_copy_the_output_onto_itself(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_moves);
+    shr_lyr *l = mlayer(ctx, FULL);
+    frame(ctx);
+    mscroll(l, 0, MROWS, 1);
+    frame(ctx);
+    const shr_draw_cmd *c = &rec.cmds[0];
+    ASSERT(rec.n == 2 && c->kind == SHR_CMD_COPY && c->flags == SHR_COPY_REST_UNDEFINED);
+    ASSERT(rect_eq(c->dst, (shr_rect){0, 0, HW, 40}) && c->src_origin.x == 0 && c->src_origin.y == 8);
+    ASSERT(c->src.pixels == h.out.bufs[h.out.last_buf] && c->src.stride == (size_t)HW * SCREEN_BPP);
+    ASSERT(rec.cmds[1].kind == SHR_CMD_FILL && rect_eq(rec.cmds[1].dst, (shr_rect){0, 40, HW, 48}));
+    ASSERT(rec.damaged == HW * 8 && mrows_shown(&h, FULL));
+    mscroll(l, 0, MROWS, -2);
+    frame(ctx);
+    ASSERT(mcopies() == 1 && rec.cmds[0].src_origin.y == 0 && rect_eq(rec.cmds[0].dst, (shr_rect){0, 16, HW, 48}));
+    ASSERT(mrows_shown(&h, FULL));
+    mscroll(l, 1, 5, 1); /* a region: rows 0 and 5 stay */
+    frame(ctx);
+    ASSERT(mcopies() == 1 && !rec.cmds[0].flags && rect_eq(rec.cmds[0].dst, (shr_rect){0, 8, HW, 32}));
+    ASSERT(mrows_shown(&h, FULL));
+    destroy_layers(&l, 1);
+    frame(ctx);
+    const shr_rect narrow = {8, 0, 56, HH};
+    l = mlayer(ctx, narrow);
+    frame(ctx);
+    mscroll(l, 0, MROWS, 1);
+    frame(ctx);
+    ASSERT(mcopies() == 1 && !rec.cmds[0].flags && rect_eq(rec.cmds[0].dst, (shr_rect){8, 0, 56, 40}));
+    ASSERT(mrows_shown(&h, narrow));
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* Without the driver's cheap moves, beyond half the area, over rows that are not opaque, on a hidden layer, an output
+ * that keeps nothing, or with damage beyond 3/4 of the screen, the pixels are drawn again. */
+TEST test_moves_fall_back_to_drawing(void) {
+    for (int mode = 0; mode < 6; mode++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, mode == 4 ? SHR_OUTPUT_RELEASE_ON_PRESENT : PRESERVED,
+                                        mode ? tweak_moves : tweak_rec);
+        shr_lyr *l = mlayer(ctx, FULL);
+        if (mode == 2) mrow(l, 3, SHR__LCMD_DIM);
+        frame(ctx);
+        if (mode == 3) ASSERT_EQ_LL(shr_lyr_set_visible(l, false), SHR_OK);
+        shr__damage staged = ctx->staged;
+        mscroll(l, 0, MROWS, mode == 1 ? 3 : 1);
+        if (mode == 3) ASSERT(ctx->staged.rects.len == staged.rects.len && ctx->staged.nmoves == 0);
+        if (mode == 3) ASSERT_EQ_LL(shr_lyr_set_visible(l, true), SHR_OK);
+        for (uint32_t r = 0; mode == 5 && r < 4; r++) mrow(l, r, 0);
+        frame(ctx);
+        ASSERT_EQ_LL(mcopies(), 0);
+        if (mode != 2) ASSERT(mrows_shown(&h, FULL));
+        destroy_layers(&l, 1);
+        harness_close(&h);
+    }
+    PASS();
+}
+
+/* Layers above keep their place: where they are and where their pixels moved to is drawn again; hidden ones and
+ * layers below need nothing. */
+TEST test_moves_under_other_layers(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_moves);
+    shr_lyr *below = solid(ctx, -1, FULL, RED), *l = mlayer(ctx, FULL);
+    shr_lyr *cursor = solid(ctx, 1, (shr_rect){16, 32, 24, 40}, WHITE), *hidden = solid(ctx, 2, (shr_rect){0, 0, 8, 8}, RED);
+    ASSERT_EQ_LL(shr_lyr_set_visible(hidden, false), SHR_OK);
+    frame(ctx);
+    mscroll(l, 0, MROWS, 1);
+    frame(ctx);
+    ASSERT(mcopies() == 1 && px(h.out.shown, 18, 34) == WHITE && px(h.out.shown, 18, 26) == mshown[3]);
+    ASSERT(px(h.out.shown, 2, 2) == mshown[0]);
+    ASSERT_EQ_LL(rec.damaged, HW * 8 + 2 * 64);
+    shr_lyr *big = solid(ctx, 3, (shr_rect){0, 8, 24, 24}, GREEN); /* covers too much: drawn again instead */
+    frame(ctx);
+    mscroll(l, 0, MROWS, 1);
+    frame(ctx);
+    ASSERT(mcopies() == 0 && px(h.out.shown, 2, 10) == GREEN && px(h.out.shown, 40, 10) == mshown[1]);
+    shr_lyr *all[5] = {below, l, cursor, hidden, big};
+    destroy_layers(all, 5);
+    harness_close(&h);
+    PASS();
+}
+
+/* Moves between frames: one way in one area add up; others follow one another, also onto buffers several frames
+ * behind; past SHR_MAX_MOVES the moved areas are drawn again. */
+TEST test_moves_accumulate(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_moves);
+    shr_lyr *l = mlayer(ctx, FULL);
+    frame(ctx);
+    for (int down = 0; down < 2; down++) {
+        mscroll(l, 0, MROWS, down ? -1 : 1);
+        mscroll(l, 0, MROWS, down ? -1 : 1);
+        frame(ctx);
+        ASSERT(mcopies() == 1 && rec.cmds[0].src_origin.y == (down ? 0 : 16) && mrows_shown(&h, FULL));
+    }
+    mscroll(l, 0, MROWS, 1);
+    mscroll(l, 0, MROWS, -1); /* the other way */
+    mscroll(l, 0, 4, 1);      /* another area */
+    mscroll(l, 0, MROWS, 2);
+    mscroll(l, 0, MROWS, 2); /* too far to add up */
+    ASSERT_EQ_LL(shr_submit(ctx), SHR_OK);
+    ASSERT_EQ_LL(ctx->targets[0].damage.nmoves, 5);
+    ASSERT_EQ_LL(shr_pump(ctx), SHR_OK);
+    ASSERT(mrows_shown(&h, FULL));
+    h.out.busy[0] = true; /* the next frames go to buffer 1, then buffer 0 again, three moves behind */
+    mscroll(l, 0, MROWS, -1);
+    frame(ctx);
+    ASSERT(h.out.last_buf == 1 && mcopies() == 0 && mrows_shown(&h, FULL));
+    mscroll(l, 0, MROWS, 1);
+    frame(ctx);
+    ASSERT(h.out.last_buf == 1 && mcopies() == 1 && mrows_shown(&h, FULL));
+    h.out.busy[0] = false, h.out.busy[1] = true;
+    mscroll(l, 1, MROWS, 1);
+    frame(ctx);
+    ASSERT(h.out.last_buf == 0 && mcopies() == 3 && mrows_shown(&h, FULL));
+    h.out.busy[1] = false;
+    for (int i = 0; i < SHR_MAX_MOVES + 1; i++) mscroll(l, 0, MROWS, i % 2 ? 1 : -1);
+    ASSERT_EQ_LL(ctx->staged.nmoves, 1); /* the first eight became damage */
+    frame(ctx);
+    ASSERT(mcopies() == 0 && mrows_shown(&h, FULL));
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* A move the frame being built cannot carry (made after the submission, or after the frame took its damage while it
+ * still runs, fails, or drew fallback pixels) becomes damage of the moved area. */
+TEST test_moves_racing_frames(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_moves);
+    fake r;
+    fake_attach(&r, ctx, &fk_ops);
+    shr_lyr *l = mlayer(ctx, FULL), *top;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 1, (shr_rect){40, 0, 48, 8}, &top), SHR_OK); /* small enough to move under */
+    frame(ctx);
+    mrow(l, 2, 0);
+    ASSERT_EQ_LL(shr_submit(ctx), SHR_OK); /* submitted, then moved: the frame draws the moved rows */
+    mscroll(l, 0, MROWS, 1);
+    ASSERT_EQ_LL(shr_pump(ctx), SHR_OK);
+    ASSERT_EQ_LL(mcopies(), 0);
+    frame(ctx);
+    ASSERT(mcopies() == 0 && mrows_shown(&h, FULL));
+    mscroll(l, 0, MROWS, 1); /* a failed frame gives its damage and moves back */
+    h.drv.fail_next = 1;
+    frame(ctx);
+    ASSERT_EQ_LL(mcopies(), 1);
+    frame(ctx);
+    ASSERT(mcopies() == 0 && mrows_shown(&h, FULL));
+    mscroll(l, 0, MROWS, 1); /* more moves than commands allowed */
+    mscroll(l, 0, MROWS, -1);
+    ctx->desc.max_commands = 1;
+    drain(ctx);
+    frame(ctx);
+    shr_event ev;
+    ASSERT(count_events(ctx, SHR_EVENT_PRESENT_FAILED, &ev) == 1 && ev.status == SHR_E_LIMIT);
+    ctx->desc.max_commands = 16384;
+    frame(ctx);
+    ASSERT(mrows_shown(&h, FULL));
+    for (int prov = 0; prov < 2; prov++) { /* moved while the frame runs */
+        r.px.provisional = prov;
+        shr__lcmd g = glyph(&r, 0, 0, WHITE);
+        paint(top, 1, &g);
+        h.drv.async = true;
+        mscroll(l, 0, MROWS, 1);
+        frame(ctx);
+        mscroll(l, 0, MROWS, 1);
+        ASSERT_EQ_LL(shr_submit(ctx), SHR_OK);
+        h.drv.async = false;
+        md_complete(&h.drv);
+        settle(ctx);
+        ASSERT_EQ_LL(mcopies(), prov ? 0 : 1);
+        ASSERT(px(h.out.shown, 2, 3) == mshown[0] && px(h.out.shown, 2, 43) == mshown[5]);
+    }
+    mscroll(l, 0, MROWS, -1); /* fallback pixels move along, then resolve */
+    frame(ctx);
+    ASSERT_EQ_LL(mcopies(), 1);
+    r.px.provisional = false, r.changed = true;
+    settle(ctx);
+    ASSERT(rec.damaged == 8 * 8 && px(h.out.shown, 43, 3) == WHITE && mrows_shown(&h, (shr_rect){0, 0, 32, HH}));
+    shr_lyr *all[2] = {l, top};
+    destroy_layers(all, 2);
+    r.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
+static void tweak_moves_klog(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_moves(d, drv);
+    drv->execute = klog_execute;
+}
+
+static void tweak_klog_moves(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_rec(d, drv);
+    drv->execute = klog_execute;
+    drv->caps.flags = SHR_DRIVER_CHEAP_MOVE;
+}
+
+/* A refused conversion runs again by itself; the band after it is built only then. */
+TEST test_band_conversion_refused(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_klog_moves);
+    shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_OK);
+    shr_lyr *l = solid(ctx, 0, FULL, GREEN);
+    klog_reset();
+    klog.block_at = 2;
+    frame(ctx);
+    ASSERT(klog.calls == 2 && klog.n == 1 && klog.cmds[0].kind == SHR_CMD_FILL && h.out.presents == 0);
+    ASSERT_EQ_LL(shr_driver_ready(ctx), SHR_OK);
+    ASSERT_EQ_LL(shr_pump(ctx), SHR_OK);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(klog.calls == 7 && klog.n == 6 && klog.cmds[1].kind == SHR_CMD_COPY && rect_eq(klog.cmds[2].dst, (shr_rect){0, 0, HW, 16}));
+    ASSERT_EQ_LL(px(h.out.shown, HW - 1, HH - 1), GREEN);
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* With a driver that runs batches on its own, a layer may move while a band runs: the bands built after that draw it
+ * moved, so the move turns into damage and the next frame draws the area again instead of moving the pixels twice. */
+TEST test_band_move_while_running(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_moves);
+    shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 0), SHR_OK);
+    shr_lyr *l = mlayer(ctx, FULL);
+    frame(ctx);
+    drain(ctx);
+    h.drv.async = true;
+    mscroll(l, 0, MROWS, 1);
+    frame(ctx);
+    ASSERT(h.drv.pending && rec.n == 1 && rec.cmds[0].kind == SHR_CMD_COPY);
+    mscroll(l, 0, MROWS, 1);
+    for (int i = 0; i < 8 && h.drv.pending; i++) md_complete(&h.drv), shr_pump(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    drain(ctx);
+    frame(ctx);
+    for (int i = 0; i < 8 && h.drv.pending; i++) md_complete(&h.drv), shr_pump(ctx);
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    ASSERT(rec.damaged == HW * HH && mrows_shown(&h, FULL));
+    mscroll(l, 0, MROWS, 1); /* the same, submitted while the move runs */
+    frame(ctx);
+    ASSERT(h.drv.pending && rec.n == 1 && rec.cmds[0].kind == SHR_CMD_COPY);
+    mscroll(l, 0, MROWS, 1);
+    ASSERT_EQ_LL(shr_submit(ctx), SHR_OK);
+    for (int i = 0; i < 8 && h.drv.pending; i++) md_complete(&h.drv), shr_pump(ctx);
+    for (int i = 0; i < 8 && h.drv.pending; i++) md_complete(&h.drv), shr_pump(ctx);
+    drain(ctx);
+    ASSERT(rec.damaged == HW * HH && mrows_shown(&h, FULL));
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* With bands the moves run first, in a batch of their own into the output, in output coordinates. */
+TEST test_moves_with_bands(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_moves_klog);
+    h.out.w = HH, h.out.h = HW;
+    shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+    shr_screen_desc sd;
+    shr_screen_desc_init(&sd);
+    sd.width = HW, sd.height = HH, sd.rotation = SHR_ROTATE_90_CW, sd.bands = b, sd.band_count = 2, sd.band_align = 8;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_OK);
+    shr_lyr *l = mlayer(ctx, FULL);
+    frame(ctx);
+    klog_reset();
+    mscroll(l, 0, MROWS, 1);
+    frame(ctx);
+    ASSERT(klog.calls == 3 && klog.cmds[0].kind == SHR_CMD_COPY && klog.cmds[0].flags == SHR_COPY_REST_UNDEFINED);
+    ASSERT(rect_eq(klog.cmds[0].dst, (shr_rect){8, 0, HH, HW}) && klog.cmds[0].src_origin.x == 0);
+    ASSERT(klog.cmds[0].src.pixels == h.out.bufs[h.out.last_buf] && klog.cmds[0].src.width == HH);
+    for (int32_t r = 0; r < MROWS; r++)
+        for (int32_t x = 1; x < HW; x += 13) {
+            shr_point p;
+            ASSERT_EQ_LL(shr_rotation_map_point(SHR_ROTATE_90_CW, HW, HH, (shr_point){x, 8 * r + 3}, false, &p), SHR_OK);
+            uint32_t c = mshown[r], q = c;
+            if (SCREEN_BPP == 2) /* opx() widens without rounding */
+                q = ((c >> 16) * 31 + 127) / 255 * 255 / 31 << 16 | ((c >> 8 & 255) * 63 + 127) / 255 * 255 / 63 << 8 |
+                    ((c & 255) * 31 + 127) / 255 * 255 / 31;
+            ASSERT_EQ_LL(opx(&h, p.x, p.y), q);
+        }
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* Damage widened to band_align merges where it overlaps or shares an edge: one COPY for both, two for a corner. */
+TEST test_band_regions_merge(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_klog_moves);
+    shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 8), SHR_OK);
+    shr_lyr *l = solid(ctx, 0, FULL, RED);
+    frame(ctx);
+    const shr_rect d[4] = {{0, 0, 6, 8}, {10, 0, 14, 8}, {0, 16, 6, 24}, {10, 24, 14, 32}};
+    for (int i = 0; i < 4; i++) shr__damage_add(ctx, &ctx->staged, d[i]);
+    klog_reset();
+    frame(ctx);
+    ASSERT_EQ_LL(klog_count(SHR_CMD_COPY), 3);
+    ASSERT(rect_eq(klog_nth(SHR_CMD_COPY, 0)->dst, (shr_rect){0, 0, 16, 8}));
+    const shr_rect pairs[2][2] = {{{0, 0, 6, 6}, {0, 10, 6, 16}}, {{0, 0, 6, 6}, {4, 4, 22, 12}}}; /* stacked, overlapping */
+    const shr_rect merged[2] = {{0, 0, 8, 16}, {0, 0, 24, 16}};
+    for (int k = 0; k < 2; k++) {
+        for (int i = 0; i < 2; i++) shr__damage_add(ctx, &ctx->staged, pairs[k][i]);
+        klog_reset();
+        frame(ctx);
+        ASSERT_EQ_LL(klog_count(SHR_CMD_COPY), 1);
+        ASSERT(rect_eq(klog_nth(SHR_CMD_COPY, 0)->dst, merged[k]));
+    }
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* The keeps of moved rows stay recent; rows that left, rows without a keep group and the blink phase never stored
+ * are passed over. */
+static void tweak_keep_moves(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    tweak_keep(d, drv);
+    drv->caps.flags = SHR_DRIVER_CHEAP_MOVE;
+}
+
+TEST test_moves_keep_rows_recent(void) {
+    keep_max = 8, keep_cap = 0, keep_slot = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_keep_moves);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    for (uint32_t r = 0; r < MROWS; r++) { /* keys in one chain */
+        if (r == 4) continue;
+        shr__rcmd *c = shr__lyr_row_begin(l, 3);
+        c[0] = row_of((shr__lcmd){.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, HW, 8}});
+        c[1] = row_of(fill((shr_rect){0, 0, HW, 8}, mcolor(r + 1)));
+        c[1].flags = r == 3 ? SHR__LCMD_BLINK : 0;
+        c[2] = row_of((shr__lcmd){.kind = SHR__LCMD_CACHE_END});
+        const uint64_t key[2] = {8 * r + 1, r};
+        ASSERT_EQ_LL(shr__lyr_row_commit(l, r, (int32_t)r * 8, NULL, key, c, 3), SHR_OK);
+    }
+    shr__lcmd plain_row = fill((shr_rect){0, 32, HW, 40}, BLUE); /* row 4 without a keep group */
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 4, &plain_row, 1), SHR_OK);
+    keep_frame(ctx);
+    keep_again(ctx); /* stored, rows 0 .. 5 in order */
+    ASSERT_EQ_LL(klog_count(SHR_CMD_KEEP_BEGIN), 5);
+    keep_damage(ctx, (shr_rect){0, 0, HW, 8}); /* row 0 drawn: the oldest is now row 1 */
+    shr__lyr_groups_shift(l, 1, MROWS, 1, (shr_rect){0, 8, HW, 48}, 8);
+    const shr__keep *oldest = SHR_CONTAINER(shr__lru_oldest(ctx->keep_lru), shr__keep, lru);
+    ASSERT_EQ_LL(oldest->key.hash[0], 8 * 5 + 1); /* rows 1 .. 3 moved down and were touched; row 5 left */
+    shr__lcmd fresh = fill((shr_rect){0, 8, HW, 16}, GREEN);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 1, &fresh, 1), SHR_OK);
+    keep_frame(ctx);
+    ASSERT(klog_nth(SHR_CMD_COPY, 0)->src_origin.y == 8 && px(h.out.shown, 3, 3 * 8 + 3) == mcolor(3));
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* A group committed at another y is a change of all of it, at both places. */
+TEST test_group_placed_elsewhere(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    shr__rcmd *c = shr__lyr_row_begin(l, 1);
+    c[0] = row_of(fill((shr_rect){0, 0, 8, 8}, RED));
+    ASSERT_EQ_LL(shr__lyr_row_commit(l, 0, 8, NULL, nokey, c, 1), SHR_OK);
+    frame(ctx);
+    ASSERT(px(h.out.shown, 2, 10) == RED && px(h.out.shown, 2, 2) == 0);
+    c = shr__lyr_row_begin(l, 1);
+    c[0] = row_of(fill((shr_rect){0, 0, 8, 8}, RED));
+    ASSERT_EQ_LL(shr__lyr_row_commit(l, 0, 24, NULL, nokey, c, 1), SHR_OK);
+    frame(ctx);
+    ASSERT(rec.damaged == 3 * 64 && px(h.out.shown, 2, 26) == RED && px(h.out.shown, 2, 10) == 0);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, NULL, 0), SHR_OK); /* removed from its place */
+    frame(ctx);
+    ASSERT(rec.damaged == 64 && px(h.out.shown, 2, 26) == 0);
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
+/* Row groups draw like the same list in full form. A group that changes form or a row that changes resource changed
+ * all of it, a row whose key alone changed nothing; a row's cache pair encloses it. */
+TEST test_row_groups(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    fake r, r2;
+    fake_attach(&r, ctx, &fk_ops);
+    fake_attach(&r2, ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    shr__lcmd full[2] = {fill((shr_rect){0, 0, 16, 16}, RED), glyph(&r, 8, 0, WHITE)};
+    shr__rcmd rows[4] = {row_of((shr__lcmd){.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, 16, 16}}), row_of(full[0]),
+                         row_of(full[1]), row_of((shr__lcmd){.kind = SHR__LCMD_CACHE_END})};
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, full, 2), SHR_OK);
+    frame(ctx);
+    ASSERT(px(h.out.shown, 2, 2) == RED && px(h.out.shown, 10, 2) == WHITE);
+    ASSERT_EQ_LL(rows_set(l, 0, 0, &r.res, rows + 1, 2), SHR_OK);
+    ASSERT_EQ_LL(r.res.users, 1);
+    frame(ctx);
+    ASSERT(rec.damaged == 16 * 16 && px(h.out.shown, 2, 2) == RED && px(h.out.shown, 10, 2) == WHITE);
+    ASSERT_EQ_LL(rows_set(l, 0, 0, &r2.res, rows + 1, 2), SHR_OK);
+    ASSERT(r.res.users == 0 && r2.res.users == 1);
+    frame(ctx);
+    ASSERT_EQ_LL(rec.damaged, 16 * 16);
+
+    const uint64_t keys[3][2] = {{1, 2}, {1, 3}, {4, 3}};
+    for (int i = 0; i < 3; i++) {
+        rec.damaged = 0;
+        ASSERT_EQ_LL(shr__lyr_row_commit(l, 0, 0, &r2.res, keys[i], rows, 4), SHR_OK);
+        frame(ctx);
+        ASSERT_EQ_LL(rec.damaged, i ? 0 : 16 * 16); /* the cache pair added, then only its key */
+        ASSERT_EQ_LL(SHR_VEC_AT(&l->groups, shr__group, 0)->key[0], keys[i][0]);
+        ASSERT_EQ_LL(SHR_VEC_AT(&l->groups, shr__group, 0)->key[1], keys[i][1]);
+    }
+    shr__rcmd inner[3] = {rows[1], rows[0], rows[3]}, open[3] = {rows[0], rows[3], rows[1]};
+    ASSERT_EQ_LL(rows_set(l, 0, 0, &r2.res, inner, 3), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(rows_set(l, 0, 0, &r2.res, open, 3), SHR_E_INVALID_ARG);
+    rows[1].flags = 1u << 6;
+    ASSERT_EQ_LL(rows_set(l, 0, 0, &r2.res, rows, 4), SHR_E_INVALID_ARG); /* unknown flag */
+
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, full, 2), SHR_OK);
+    ASSERT(r.res.users == 1 && r2.res.users == 0);
+    frame(ctx);
+    ASSERT(rec.damaged == 16 * 16 && px(h.out.shown, 2, 2) == RED && px(h.out.shown, 10, 2) == WHITE);
+    destroy_layers(&l, 1);
+    r.res.dead = r2.res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(test_init_functions);
@@ -3709,7 +5671,10 @@ int main(int argc, char **argv) {
     RUN_TEST(test_context_services);
     RUN_TEST(test_plugin_slots);
     RUN_TEST(test_screen_configure_validation);
+    RUN_TEST(test_screen_configure_bands);
+    RUN_TEST(test_band_sources_aligned);
     RUN_TEST(test_dma_only_composition);
+    RUN_TEST(test_band_sync_and_trace);
     RUN_TEST(test_rotation_and_conversion);
     RUN_TEST(test_rotation_map_point);
     RUN_TEST(test_buffer_validation);
@@ -3739,7 +5704,13 @@ int main(int argc, char **argv) {
     RUN_TEST(test_blink_epoch_in_future);
     RUN_TEST(test_blink_needs_clock);
     RUN_TEST(test_blink_outside_screen_draws_nothing);
+    RUN_TEST(test_frame_cap);
+    RUN_TEST(test_frame_cap_blink);
     RUN_TEST(test_command_limit_fails_frame);
+    RUN_TEST(test_band_frame_failures);
+    RUN_TEST(test_band_command_list);
+    RUN_TEST(test_band_command_list_hot);
+    RUN_TEST(test_band_buffers_held_for_frame);
     RUN_TEST(test_driver_would_block);
     RUN_TEST(test_driver_ready_retries);
     RUN_TEST(test_driver_caps_checked);
@@ -3763,20 +5734,41 @@ int main(int argc, char **argv) {
     RUN_TEST(test_configure_rejects_unreachable_composition);
     RUN_TEST(test_layer_arguments);
     RUN_TEST(test_layer_out_of_memory);
+    RUN_TEST(test_group_memory_classes);
     RUN_TEST(test_layer_order);
     RUN_TEST(test_layer_rect_clips_and_moves);
     RUN_TEST(test_app_layer_diff);
+    RUN_TEST(test_group_damage_runs);
     RUN_TEST(test_command_diff_compares_every_field);
+    RUN_TEST(test_group_resource_counts);
     RUN_TEST(test_groups_draw_in_id_order);
     RUN_TEST(test_command_validation);
     RUN_TEST(test_plugin_owned_layers);
     RUN_TEST(test_resource_users_counted);
     RUN_TEST(test_hidden_layers_skipped);
     RUN_TEST(test_large_group_blocks_skipped);
-    RUN_TEST(test_cache_hints);
+    RUN_TEST(test_keep_rows);
+    RUN_TEST(test_keep_hit_skips_to_its_end);
+    RUN_TEST(test_keep_eviction);
+    RUN_TEST(test_keep_replacement);
+    RUN_TEST(test_keep_blink_phases);
+    RUN_TEST(test_keep_lost_batches);
+    RUN_TEST(test_keep_bands);
+    RUN_TEST(test_keep_store_budget);
+    RUN_TEST(test_keep_credit);
+    RUN_TEST(test_keep_credit_evicts);
+    RUN_TEST(test_keep_credit_provisional);
+    RUN_TEST(test_keep_credit_run);
+    RUN_TEST(test_keep_credit_mostly_kept);
+    RUN_TEST(test_keep_credit_still);
+    RUN_TEST(test_keep_credit_still_once);
+    RUN_TEST(test_keep_credit_still_blink);
+    RUN_TEST(test_keep_command_limit);
+    RUN_TEST(test_keep_plan_out_of_memory);
     RUN_TEST(test_resource_resolution);
     RUN_TEST(test_glyph_styles);
     RUN_TEST(test_provisional_pixels_redrawn);
+    RUN_TEST(test_provisional_runs);
     RUN_TEST(test_provisional_change_during_raster);
     RUN_TEST(test_fallback_areas_redrawn_with_changes);
     RUN_TEST(test_composed_frame_waits_for_output);
@@ -3792,5 +5784,17 @@ int main(int argc, char **argv) {
     RUN_TEST(test_shutdown_cancels_reads);
     RUN_TEST(test_submit_flushes_plugin_layers);
     RUN_TEST(test_extreme_coordinates_clamp);
+    RUN_TEST(test_moves_copy_the_output_onto_itself);
+    RUN_TEST(test_moves_fall_back_to_drawing);
+    RUN_TEST(test_moves_under_other_layers);
+    RUN_TEST(test_moves_accumulate);
+    RUN_TEST(test_moves_racing_frames);
+    RUN_TEST(test_moves_with_bands);
+    RUN_TEST(test_band_regions_merge);
+    RUN_TEST(test_band_conversion_refused);
+    RUN_TEST(test_band_move_while_running);
+    RUN_TEST(test_moves_keep_rows_recent);
+    RUN_TEST(test_group_placed_elsewhere);
+    RUN_TEST(test_row_groups);
     GREATEST_MAIN_END();
 }

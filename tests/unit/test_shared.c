@@ -23,17 +23,58 @@ TEST alloc_init_defaults_and_rejects_half_allocators(void) {
     shr__alloc al;
     ASSERT(shr__alloc_init(&al, NULL));
     ASSERT(al.a.alloc == shr__default_alloc && al.a.free == shr__default_free);
-    shr_allocator a = {NULL, NULL, NULL};
+    shr_allocator a = {NULL, NULL, NULL, 0};
     ASSERT(shr__alloc_init(&al, &a));
     ASSERT(al.a.alloc == shr__default_alloc);
-    a = (shr_allocator){NULL, fa_alloc, NULL};
+    a = (shr_allocator){NULL, fa_alloc, NULL, 0};
     ASSERT(!shr__alloc_init(&al, &a));
-    a = (shr_allocator){NULL, NULL, fa_free};
+    a = (shr_allocator){NULL, NULL, fa_free, 0};
     ASSERT(!shr__alloc_init(&al, &a));
     fail_alloc f = {-1, 0};
     a = fail_allocator(&f);
     ASSERT(shr__alloc_init(&al, &a));
     ASSERT(al.a.alloc == fa_alloc && al.a.user == &f);
+    a.flags = SHR_ALLOC_HOT;
+    ASSERT(shr__alloc_init(&al, &a) && al.a.flags == SHR_ALLOC_HOT);
+    a.flags = 1u << 9;
+    ASSERT(!shr__alloc_init(&al, &a));
+    PASS();
+}
+
+static shr_alloc_kind kinds[2]; /* the last alloc's and free's */
+
+static void *kind_alloc(void *user, size_t size, size_t align, shr_alloc_kind kind) {
+    kinds[0] = kind;
+    return fa_alloc(user, size, align, kind);
+}
+
+static void kind_free(void *user, void *p, size_t size, size_t align, shr_alloc_kind kind) {
+    kinds[1] = kind;
+    fa_free(user, p, size, align, kind);
+}
+
+/* SHR_ALLOC_HOT reaches only an allocator whose flags ask for it, at alloc and free alike. */
+TEST hints_reach_only_allocators_asking_for_them(void) {
+    fail_alloc f = {-1, 0};
+    for (uint32_t flags = 0; flags <= SHR_ALLOC_HOT; flags += SHR_ALLOC_HOT) {
+        const shr_allocator a = {&f, kind_alloc, kind_free, flags};
+        shr__alloc al;
+        ASSERT(shr__alloc_init(&al, &a));
+        shr__vec v;
+        SHR_VEC_INIT_HOT(&v, uint32_t);
+        ASSERT(shr__vec_push(&v, &al));
+        shr__vec_free(&v, &al);
+        ASSERT_EQ_LL(kinds[0], flags ? SHR_ALLOC_PAYLOAD | SHR_ALLOC_HOT : SHR_ALLOC_PAYLOAD);
+        ASSERT_EQ_LL(kinds[1], kinds[0]);
+        uint32_t *p = SHR_NEW_HOT_ARRAY(&al, uint32_t, 2);
+        SHR_FREE_HOT_ARRAY(&al, p, uint32_t, 2);
+        ASSERT_EQ_LL(kinds[0], kinds[1]);
+        void *d = shr__malloc(&al, 4, 4, SHR_ALLOC_DMA);
+        shr__free(&al, d, 4, 4, SHR_ALLOC_DMA);
+        ASSERT_EQ_LL(kinds[0], SHR_ALLOC_DMA);
+        ASSERT_EQ_LL(kinds[1], SHR_ALLOC_DMA);
+    }
+    ASSERT_EQ_LL(f.live, 0);
     PASS();
 }
 
@@ -111,7 +152,7 @@ TEST vec_failures_leave_it_unchanged(void) {
     ASSERT_EQ_LL(v.len, 1);
     ASSERT_EQ_LL(v.cap, 8);
     ASSERT_EQ_LL(*SHR_VEC_AT(&v, uint32_t, 0), 7);
-    shr__vec huge = {NULL, 0, 0, SIZE_MAX / 4, 1}; /* bytes overflow */
+    shr__vec huge = {NULL, 0, 0, SIZE_MAX / 4, 1, SHR_ALLOC_PAYLOAD}; /* bytes overflow */
     ASSERT(!shr__vec_reserve(&huge, &al, 1));
     shr__vec_free(&v, &al);
     ASSERT_EQ_LL(f.live, 0);
@@ -345,6 +386,7 @@ int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(checked_sizes_detect_overflow);
     RUN_TEST(alloc_init_defaults_and_rejects_half_allocators);
+    RUN_TEST(hints_reach_only_allocators_asking_for_them);
     RUN_TEST(default_allocator_honours_large_alignment);
     RUN_TEST(calloc_zeroes_and_fails_cleanly);
     RUN_TEST(vec_grows_by_doubling_and_keeps_contents);

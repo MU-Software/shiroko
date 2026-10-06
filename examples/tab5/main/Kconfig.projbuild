@@ -1,0 +1,65 @@
+menu "shiroko Tab5 example"
+    choice SHIROKO_TAB5_BOARD
+        prompt "Board"
+        default SHIROKO_TAB5_BOARD_TAB5
+        help
+            Tab5 shows the frame buffer on its MIPI-DSI panel. Headless (an ESP32-P4 board without a panel, such as the
+            M5Stack Unit PoE-P4) draws into a PSRAM frame buffer of the same size and format that nothing shows.
+
+        config SHIROKO_TAB5_BOARD_TAB5
+            bool "M5Stack Tab5"
+        config SHIROKO_TAB5_BOARD_HEADLESS
+            bool "Headless ESP32-P4"
+    endchoice
+
+    choice SHIROKO_TAB5_SCANOUT
+        prompt "Scan-out on the headless board"
+        depends on SHIROKO_TAB5_BOARD_HEADLESS
+        default SHIROKO_TAB5_SCANOUT_NONE
+        help
+            Streams the frame buffer out of the MIPI-DSI host with a Tab5 panel's timing, nothing attached, so the
+            PSRAM reads of the panel's scan-out load the board as on that Tab5.
+
+        config SHIROKO_TAB5_SCANOUT_NONE
+            bool "None"
+        config SHIROKO_TAB5_SCANOUT_ILI9881C
+            bool "ILI9881C board (48 Hz)"
+        config SHIROKO_TAB5_SCANOUT_ST7121
+            bool "ST7121 board (57 Hz)"
+    endchoice
+
+    config SHIROKO_TAB5_ALL_MODES
+        bool "Run every drawing mode"
+        default n
+        help
+            Runs each scene composed in PSRAM (A), with one band (B) and with two bands (C); only C when off.
+
+    config SHIROKO_TAB5_FPS_CAP
+        int "Frame-rate cap (frames per second, 0 = uncapped)"
+        range 0 1000
+        default 30
+        help
+            Sets shr_context_desc.min_frame_interval_ns to 1 s / this value. 0 measures the renderer uncapped.
+
+    config SHIROKO_TAB5_KEEP_SCREENS
+        int "Keep slots, in screens of rows"
+        range 1 8
+        default 4
+        help
+            The software driver keeps rendered rows for this many screens (45 slots of 40 KiB each, about 1.8 MiB
+            of PSRAM per screen), so rows switching among that many screens or looks are copied back instead of
+            drawn. 4 (default) fits rows cycling through four looks (restyle4: stores 180 over 60 frames, frame
+            p50 28.8 ms); 3 saves 1.8 MiB and runs the other scenes as fast (restyle4 p50 47.6 ms); 2 saves 3.6 MiB
+            (restyle4 p50 55.7 ms).
+
+    config SHIROKO_TAB5_INTERNAL_BUDGET_KB
+        int "Internal RAM for the renderer's per-frame memory (KiB)"
+        range 0 1024
+        default 216
+        help
+            Memory the renderer uses every frame (SHR_ALLOC_HOT: rows of commands, the band command list, per-frame
+            state) goes to internal RAM while it fits in this many KiB, the rest of it and all other renderer memory
+            to PSRAM; the rest of internal RAM stays with the application. 216 leaves the app about 200-215 KiB
+            while a scene runs; 256 draws scenes with many rows 0.4-0.7 ms faster and leaves about 160 KiB.
+            0 puts it all in PSRAM.
+endmenu

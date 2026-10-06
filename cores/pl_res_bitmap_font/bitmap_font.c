@@ -15,11 +15,25 @@ static void font_free(shr_pl_res_bitmap_font *f) {
     SHR_DELETE(&al, f, shr_pl_res_bitmap_font);
 }
 
-static shr_status op_resolve(shr__res *res, uint64_t id, uint64_t frame, shr__resolved *out) {
-    return shr__font_resolve(font_of(res), id, frame, out);
+/* An id resolves the same within a frame (built over several pumps with bands): the pages it found stay pinned until
+ * frame_end(), and a provisional answer is drawn again later anyway. Repeats are answered from the memo. */
+static shr_status op_resolve(shr__res *res, uint64_t id, uint64_t frame, const shr__resolved **out) {
+    shr_pl_res_bitmap_font *f = font_of(res);
+    shr__memo *m = &f->memo[((id & UINT32_MAX) * 0x9E3779B1u >> (32 - SHR_FONT_MEMO_BITS)) % SHR_FONT_MEMO];
+    *out = &m->r;
+    if (m->frame == frame && m->id == id) return m->r.buf ? SHR_OK : SHR_E_NOT_FOUND;
+    shr_status st = shr__font_resolve(f, id, frame, &m->r);
+    if (st == SHR_E_NOT_FOUND) m->r.buf = NULL;
+    m->id = id, m->frame = st == SHR_OK || st == SHR_E_NOT_FOUND ? frame : 0;
+    return st;
 }
 
-static void op_frame_end(shr__res *res, uint64_t frame) { shr__font_frame_end(font_of(res), frame); }
+static void op_frame_end(shr__res *res, uint64_t frame) {
+    shr_pl_res_bitmap_font *f = font_of(res);
+    for (uint32_t k = 0; k < SHR_FONT_MEMO; k++)
+        if (f->memo[k].frame == frame) f->memo[k].frame = 0;
+    shr__font_frame_end(f, frame);
+}
 
 /* A cool-down a frame ran into is over: the pump redraws its fallback, so the next frame tries it again. */
 static bool cool_over(const shr_pl_res_bitmap_font *f, uint64_t now, uint32_t ready) {
@@ -35,6 +49,8 @@ static bool op_pump(shr__res *res) {
         f->changed = true, f->cool_at = 0, f->cool_wait = f->cool_due = false, f->ready_seen = ready;
     for (int r = ROLE_LATIN; r < ROLE_COUNT; r++) shr__pkg_advance(&f->pkg[r]);
     shr__pages_schedule(f);
+    shr__pages_preload(f);
+    f->delivered = false;
     bool changed = f->changed;
     f->changed = false;
     return changed;
@@ -49,7 +65,7 @@ static bool op_has_work(const shr__res *res) {
     for (size_t i = 0; i < f->wants.len; i++)
         if (shr__page_due(*SHR_VEC_AT(&f->wants, shr__page *, i), now)) return true;
     /* `changed` is only set and cleared inside the pump */
-    return cool_over(f, now, shr__ctx_asset_ready(res->ctx));
+    return cool_over(f, now, shr__ctx_asset_ready(res->ctx)) || shr__preload_role(f);
 }
 
 static uint64_t earlier(uint64_t at, uint64_t t) { return at && at <= t ? at : t; } /* at 0: none yet */
@@ -77,6 +93,7 @@ static void op_io_done(shr__res *res, uint64_t tag, shr_status status) {
     if (res->dead) return;
     shr__pkg *pkg = &f->pkg[role];
     f->wake++;
+    f->delivered = true;
     if (!page) {
         if (f->shutting_down)
             pkg->step_busy = false;
@@ -84,7 +101,9 @@ static void op_io_done(shr__res *res, uint64_t tag, shr_status status) {
             shr__pkg_load_done(pkg, status);
         return;
     }
-    if (!f->shutting_down) shr__page_done(pkg->pages[page - 1], status); /* else freed with the font */
+    if (f->shutting_down) return; /* the page is freed with the font */
+    if (pkg->pages[page - 1] == f->preloading) f->preloading = NULL;
+    shr__page_done(pkg->pages[page - 1], status);
 }
 
 static void cancel_reads(shr_pl_res_bitmap_font *f) {
@@ -159,6 +178,19 @@ shr_status shr_pl_res_bitmap_font_destroy(shr_pl_res_bitmap_font *font) {
     if (!font->shutting_down) cancel_reads(font);
     font->res.dead = true;
     return SHR_OK;
+}
+
+shr_status shr_pl_res_bitmap_font_preload(shr_pl_res_bitmap_font *font, const char *package, uint32_t pages) {
+    if (!font || !package) return SHR_E_INVALID_ARG;
+    if (font->res.dead || shr__ctx_refused(font->res.ctx)) return SHR_E_STATE;
+    for (int r = ROLE_LATIN; r < ROLE_COUNT; r++) {
+        char name[40];
+        shr__pkg_name(&font->pkg[r], name);
+        if (strcmp(name, package)) continue;
+        font->pkg[r].preload = pages, font->pkg[r].wanted = true;
+        return SHR_OK;
+    }
+    return SHR_E_NOT_FOUND;
 }
 
 shr__res *shr__bitmap_font_res(shr_pl_res_bitmap_font *font) { return &font->res; }

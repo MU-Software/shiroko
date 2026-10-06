@@ -1,6 +1,6 @@
 /* SDL3 window over the software driver (SDL_Renderer streaming texture) and the ANGLE driver (SDL's GL ES
  * context, ANGLE loaded by SDL): the render test scenes, load modes that change the screen every frame, and
- * per-frame render and present times. `--help` lists the options and keys. */
+ * per-frame work and wait times. `--help` lists the options and keys. */
 #include "render.h"
 
 #include <SDL3/SDL.h>
@@ -9,16 +9,27 @@
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <shiroko/port_angle.h>
+
+#include <GLES2/gl2ext.h> /* after gl3.h, which defines its types */
 #endif
 
 #define N(a) (sizeof(a) / sizeof((a)[0]))
-#define RING 1000
+#define RING 4096
+#define QUERIES 8
 #define SPRITE 96
 #define MAX_SPRITES 500
 
 enum { SOFTWARE, ANGLE };
-enum { SCROLL, CHURN, RESTYLE, BLINK, IMAGES, LOADS };
-static const char *const load_names[LOADS] = {"scroll", "churn", "restyle", "blink", "images"};
+enum { SCROLL, CHURN, RESTYLE, BLINK, IMAGES, SCROLL_API, SCROLL_STATUS, SCROLL_CURSOR, SCROLL_DOWN, SCROLL_BURST,
+       SCROLL_IMAGES, LOADS };
+static const char *const load_names[LOADS] = {"scroll",           "churn",          "restyle",
+                                              "blink",            "images",         "scroll-api",
+                                              "scroll-api-status", "scroll-api-cursor", "scroll-api-down",
+                                              "scroll-api-burst", "scroll-api-images"};
+/* Per-frame times in ms; work = step + submit + finish + upload, wait = fence + drawable + swap. */
+enum { STEP, SUBMIT, FINISH, UPLOAD, FENCE, DRAWABLE, SWAP, WORK, WAIT, INTERVAL, GPU, TIMES };
+static const char *const time_names[TIMES] = {"step", "submit", "finish", "upload", "fence", "drawable",
+                                              "swap", "work",   "wait",   "interval", "gpu"};
 
 typedef struct item {
     const scene *sc;
@@ -40,7 +51,8 @@ typedef struct app {
     SDL_Texture *tex;
     SDL_GLContext gl;
     uint32_t fbo;
-    shr_framebuffer_driver drv;
+    shr_framebuffer_driver drv, track; /* track: drv as the software path's context sees it */
+    shr_rect dirty;                     /* software: the output drawn since the last upload */
     bool has_drv;
     stage s;
     shr_surface out, comp;
@@ -56,14 +68,29 @@ typedef struct app {
     bool vsync, redraw;
     int32_t width, height, rows, cols;
     int pw, ph;     /* drawable size the scene was opened for */
+    int dw, dh;     /* drawable size the driver's keep slots were sized for */
     char what[128]; /* the open scene, for its statistics */
-    shr_lyr *grid;
+    shr_lyr *grid, *cursor;
     sprite sprites[MAX_SPRITES];
     uint64_t tick;
     uint32_t rng;
-    double first, render[RING], present[RING];
+    bool finish_each, gpu_time, idle; /* per-frame glFinish, GPU timer queries, present only */
+    int keep_screens;                 /* --keeps */
+    double first, refresh, t[TIMES][RING];
+    uint64_t last; /* start of the previous frame */
     long frames;
+    FILE *csv;
+#ifdef SHR_DESKTOP_ANGLE
+    GLsync fences[2];
+    GLuint queries[QUERIES];
+    long query_frame[QUERIES];
+    bool query_on;
+#endif
 } app;
+
+#ifdef SHR_DESKTOP_ANGLE
+static PFNGLGETQUERYOBJECTUI64VEXTPROC get_query;
+#endif
 
 static double ms(uint64_t ns) { return (double)ns / 1e6; }
 
@@ -81,6 +108,28 @@ static shr_status out_present(void *user, const shr_surface *s, uint64_t id) {
 }
 
 static void out_discard(void *user, const shr_surface *s) { (void)user, (void)s; }
+
+/* The software driver, noting what each batch draws into the output so that present() uploads only that. */
+static shr_status track_execute(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t count,
+                                shr_fence fence) {
+    app *a = user;
+    bool group = false; /* KEEP_BEGIN .. KEEP_END draw into a keep; KEEP_END has no dst */
+    for (size_t i = 0; dst->pixels == a->out.pixels && i < count; i++) {
+        shr_cmd_kind k = cmds[i].kind;
+        group = k == SHR_CMD_KEEP_BEGIN || (group && k != SHR_CMD_KEEP_END);
+        shr_rect r = cmds[i].dst, d = a->dirty;
+        if (group || k == SHR_CMD_KEEP_END || k > SHR_CMD_KEEP_DRAW || r.x0 >= r.x1 || r.y0 >= r.y1) continue;
+        a->dirty = d.x0 < d.x1 ? (shr_rect){SDL_min(d.x0, r.x0), SDL_min(d.y0, r.y0), SDL_max(d.x1, r.x1), SDL_max(d.y1, r.y1)}
+                               : r;
+    }
+    return a->drv.execute(a->drv.user, dst, cmds, count, fence);
+}
+
+static void track_cancel(void *user, shr_fence fence) { ((app *)user)->drv.cancel(((app *)user)->drv.user, fence); }
+static shr_status track_reset(void *user) { return ((app *)user)->drv.reset(((app *)user)->drv.user); }
+static void track_sync(void *user, const void *addr, size_t bytes) {
+    ((app *)user)->drv.sync(((app *)user)->drv.user, addr, bytes);
+}
 
 static uint64_t scene_clock(void *user) { return ((app *)user)->s.now; }
 
@@ -125,6 +174,44 @@ static void finish(const app *a) {
     if (a->driver == ANGLE) glFinish();
 #endif
     (void)a;
+}
+
+/* Waits for the GPU to finish the frame before the previous one, so at most two frames are in flight. */
+static double wait_fence(app *a) {
+#ifdef SHR_DESKTOP_ANGLE
+    GLsync *f = &a->fences[a->frames % 2];
+    if (!*f) return 0;
+    uint64_t t = SDL_GetTicksNS();
+    GLenum r = glClientWaitSync(*f, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000u);
+    glDeleteSync(*f);
+    *f = NULL;
+    if (r != GL_ALREADY_SIGNALED && r != GL_CONDITION_SATISFIED) stage_ok(&a->s, SHR_E_DEVICE, "frame fence");
+    return ms(SDL_GetTicksNS() - t);
+#else
+    (void)a;
+    return 0;
+#endif
+}
+
+/* Starts this frame's GPU timer and collects the one started QUERIES frames ago if it is ready. */
+static void gpu_timer_begin(app *a) {
+#ifdef SHR_DESKTOP_ANGLE
+    int k = (int)(a->frames % QUERIES);
+    long f = a->query_frame[k];
+    GLuint ready = 0;
+    GLint disjoint = 0;
+    if (f >= 0) glGetQueryObjectuiv(a->queries[k], GL_QUERY_RESULT_AVAILABLE, &ready);
+    glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+    if (ready && !disjoint && f < a->frames && a->frames - f < RING) {
+        GLuint64 ns = 0;
+        get_query(a->queries[k], GL_QUERY_RESULT_EXT, &ns);
+        a->t[GPU][f % RING] = ms(ns);
+    }
+    a->query_frame[k] = a->frames, a->query_on = true;
+    glBeginQuery(GL_TIME_ELAPSED_EXT, a->queries[k]);
+#else
+    (void)a;
+#endif
 }
 
 /* Submits (or only pumps) until nothing is due now; failed frames and unexpected resource failures fail the scene. */
@@ -219,7 +306,46 @@ static void load_build(app *a) {
     a->rows = a->height / CH, a->cols = a->width / CW, a->rng = 0x9E3779B9u;
     a->grid = stage_grid(&a->s, 0, (shr_rect){0, 0, a->width, a->height}, &bg);
     for (int32_t r = 0; r < a->rows && a->grid; r++) paint_row(a, r, (uint32_t)r, a->load == BLINK ? SHR_STYLE_BLINK : 0);
-    if (a->load == IMAGES) build_sprites(a);
+    if (a->load == IMAGES || a->load == SCROLL_IMAGES) build_sprites(a);
+    if (a->load != SCROLL_CURSOR || !(a->cursor = stage_layer(&a->s, 1, (shr_rect){0, 0, CW, CH}))) return;
+    shr_lyr_cmd_begin(a->cursor);
+    stage_fill(&a->s, a->cursor, (shr_rect){0, 0, CW, CH}, SHR_RGB(0x50, 0xFA, 0x7B));
+    stage_ok(&a->s, shr_lyr_cmd_commit(a->cursor), "commit");
+}
+
+static void move_sprites(app *a) {
+    for (long i = 0; i < a->n[IMAGES] && a->sprites[i].l; i++) {
+        sprite *p = &a->sprites[i];
+        if (p->x + p->dx < 0 || p->x + p->dx > a->width - SPRITE) p->dx = -p->dx;
+        if (p->y + p->dy < 0 || p->y + p->dy > a->height - SPRITE) p->dy = -p->dy;
+        p->x += p->dx, p->y += p->dy;
+        stage_ok(&a->s, shr_lyr_set_rect(p->l, (shr_rect){p->x, p->y, p->x + SPRITE, p->y + SPRITE}), "set_rect");
+    }
+}
+
+/* The grid scrolled as a VT engine scrolls it: n rows up (5 for burst, down one for down) in rows [0, bottom), the
+ * status line below them (status) changing a few cells, the uncovered rows painted; row r then shows line r + n * tick,
+ * which the scroll load writes cell by cell. The cursor follows the last row. */
+static void scroll_api_step(app *a) {
+    int32_t n = a->load == SCROLL_BURST ? 5 : a->load == SCROLL_DOWN ? -1 : 1, t = (int32_t)a->tick;
+    int32_t bottom = a->rows - (a->load == SCROLL_STATUS);
+    if (bottom < 1) return;
+    n = SDL_clamp(n, -bottom, bottom);
+    stage_ok(&a->s, shr_pl_lyr_tilemap_scroll(a->grid, 0, bottom, n, (shr_text_style){0}), "scroll");
+    for (int32_t r = n > 0 ? bottom - n : 0; r < (n > 0 ? bottom : -n); r++) {
+        uint32_t line = (uint32_t)(r + n * t);
+        paint_row(a, r, line, line_styles[line % N(line_styles)]);
+    }
+    char status[16];
+    const shr_text_style st = {fgs[0], bgs[1], SHR_STYLE_BG};
+    int len = a->load == SCROLL_STATUS ? snprintf(status, sizeof(status), "frame %d", t) : 0;
+    for (int i = 0; i < len && i < a->cols; i++)
+        stage_ok(&a->s, shr_pl_lyr_tilemap_set_cell(a->grid, a->rows - 1, i, &status[i], 1, 1, st), "set_cell");
+    if (a->cursor) {
+        shr_rect c = {t % a->cols * CW, (bottom - 1) * CH, t % a->cols * CW + CW, bottom * CH};
+        stage_ok(&a->s, shr_lyr_set_rect(a->cursor, c), "set_rect");
+    }
+    if (a->load == SCROLL_IMAGES) move_sprites(a);
 }
 
 /* Changes the screen for the next frame; false when the frame comes from the clock alone. */
@@ -245,14 +371,8 @@ static bool load_step(app *a) {
     case BLINK:
         a->s.now += BLINK_NS;
         return false;
-    default:
-        for (long i = 0; i < a->n[IMAGES] && a->sprites[i].l; i++) {
-            sprite *p = &a->sprites[i];
-            if (p->x + p->dx < 0 || p->x + p->dx > a->width - SPRITE) p->dx = -p->dx;
-            if (p->y + p->dy < 0 || p->y + p->dy > a->height - SPRITE) p->dy = -p->dy;
-            p->x += p->dx, p->y += p->dy;
-            stage_ok(&a->s, shr_lyr_set_rect(p->l, (shr_rect){p->x, p->y, p->x + SPRITE, p->y + SPRITE}), "set_rect");
-        }
+    case IMAGES: move_sprites(a); break;
+    default: scroll_api_step(a);
     }
     return true;
 }
@@ -273,17 +393,29 @@ static int place(const app *a, int w, int h, int *x, int *y) {
     return z;
 }
 
-static void present(app *a) {
+/* Uploads or blits the picture and swaps; fills v[UPLOAD], v[DRAWABLE] and v[SWAP]. */
+static void present(app *a, double v[TIMES]) {
     int w = 0, h = 0, x, y, z;
+    uint64_t t0 = SDL_GetTicksNS();
     if (a->driver == SOFTWARE) {
-        SDL_UpdateTexture(a->tex, NULL, a->out.pixels, (int)a->out.stride);
+        shr_rect d = {SDL_max(a->dirty.x0, 0), SDL_max(a->dirty.y0, 0), SDL_min(a->dirty.x1, a->out.width),
+                      SDL_min(a->dirty.y1, a->out.height)};
+        size_t bpp = a->out.format == SHR_FORMAT_RGB565 ? 2 : 4;
+        if (!a->idle && d.x0 < d.x1 && d.y0 < d.y1)
+            SDL_UpdateTexture(a->tex, &(SDL_Rect){d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0},
+                              (const uint8_t *)a->out.pixels + (size_t)d.y0 * a->out.stride + (size_t)d.x0 * bpp,
+                              (int)a->out.stride);
+        a->dirty = (shr_rect){0};
         SDL_GetRenderOutputSize(a->ren, &w, &h);
         z = place(a, w, h, &x, &y);
         SDL_SetRenderDrawColor(a->ren, 0x10, 0x10, 0x14, 0xFF);
         SDL_RenderClear(a->ren);
         SDL_FRect dst = {(float)x, (float)y, (float)(a->out.width * z), (float)(a->out.height * z)};
         SDL_RenderTexture(a->ren, a->tex, NULL, &dst);
+        uint64_t t1 = SDL_GetTicksNS();
+        /* The renderer encodes the queued draws and waits for the next drawable in here. */
         SDL_RenderPresent(a->ren);
+        v[UPLOAD] = ms(t1 - t0), v[SWAP] = ms(SDL_GetTicksNS() - t1);
         return;
     }
 #ifdef SHR_DESKTOP_ANGLE
@@ -302,13 +434,20 @@ static void present(app *a) {
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glViewport(0, 0, w, h);
     glClearColor(0x10 / 255.0f, 0x10 / 255.0f, 0x14 / 255.0f, 1);
+    /* The first use of the window framebuffer takes the next drawable (ANGLE Metal waits for it here). */
+    uint64_t td = SDL_GetTicksNS();
     glClear(GL_COLOR_BUFFER_BIT);
+    uint64_t te = SDL_GetTicksNS();
     /* Surface row 0 is the top, default framebuffer row 0 the bottom. */
     glBlitFramebuffer(0, 0, a->out.width, a->out.height, x, h - y, x + a->out.width * z, h - y - a->out.height * z,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
     if (glGetError() != GL_NO_ERROR) stage_ok(&a->s, SHR_E_DEVICE, "present blit");
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (a->query_on) glEndQuery(GL_TIME_ELAPSED_EXT), a->query_on = false;
+    if (!a->finish_each) a->fences[a->frames % 2] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    uint64_t t1 = SDL_GetTicksNS();
     SDL_GL_SwapWindow(a->win);
+    v[UPLOAD] = ms(td - t0) + ms(t1 - te), v[DRAWABLE] = ms(te - td), v[SWAP] = ms(SDL_GetTicksNS() - t1);
 #endif
 }
 
@@ -317,6 +456,7 @@ static void close_driver(app *a) {
 #ifdef SHR_DESKTOP_ANGLE
         if (a->driver == ANGLE) {
             glDeleteFramebuffers(1, &a->fbo);
+            if (a->gpu_time) glDeleteQueries(QUERIES, a->queries);
             shr_angle_driver_destroy(&a->drv);
         }
 #endif
@@ -327,6 +467,15 @@ static void close_driver(app *a) {
     if (a->ren) SDL_DestroyRenderer(a->ren);
     if (a->win) SDL_DestroyWindow(a->win);
     a->gl = NULL, a->ren = NULL, a->win = NULL;
+}
+
+/* Keeps for the rows of --keeps screens (default 3: rows toggled between two states still hit). Each keep's slot holds
+ * a row of a window `pw` x `ph` px; returns the keep count, `bytes` the keep bytes. */
+static uint32_t keep_sizes(const app *a, int pw, int ph, uint64_t *bytes) {
+    uint32_t keeps = (uint32_t)a->keep_screens * (uint32_t)(ph / SHR_CELL_HEIGHT);
+    uint64_t row = (uint64_t)pw * SHR_CELL_HEIGHT * (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? 2 : 4);
+    *bytes = keeps * ((row + 127) / 128 * 128);
+    return keeps;
 }
 
 /* A new window for `driver`: SDL_Renderer and a GL context cannot share one. */
@@ -345,31 +494,34 @@ static shr_status open_driver(app *a, int driver, int w, int h) {
         return SHR_E_DEVICE;
     }
     shr_status st = SHR_E_DEVICE;
+    int pw, ph;
+    SDL_GetWindowSizeInPixels(a->win, &pw, &ph);
+    uint64_t keep;
+    uint32_t keeps = keep_sizes(a, pw, ph, &keep);
+    a->dw = pw, a->dh = ph;
     if (driver == SOFTWARE) {
-        int pw, ph, rw, rh;
-        SDL_GetWindowSizeInPixels(a->win, &pw, &ph);
-        /* Room for the rows of two screens with slack: rows toggled between two states still hit. */
-        uint64_t cache = 3ull * (uint64_t)pw * (uint64_t)ph * (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? 2 : 4);
+        int rw, rh;
         a->ren = SDL_CreateRenderer(a->win, NULL);
-        st = a->ren ? shr_software_driver_create(NULL, cache, 256, &a->drv) : SHR_E_DEVICE;
+        st = a->ren ? shr_software_driver_create(NULL, keep, keeps, 256, &a->drv) : SHR_E_DEVICE;
         if (st == SHR_OK) {
             SDL_GetRenderOutputSize(a->ren, &rw, &rh);
-            printf("software driver, presented by SDL_Renderer %s (output %dx%d px, window %dx%d px, cache %.1f MiB)\n",
-                   SDL_GetRendererName(a->ren), rw, rh, pw, ph, (double)cache / (1 << 20));
+            printf("software driver, presented by SDL_Renderer %s (output %dx%d px, window %dx%d px, keeps %.1f MiB)\n",
+                   SDL_GetRendererName(a->ren), rw, rh, pw, ph, (double)keep / (1 << 20));
             snprintf(a->label, sizeof(a->label), "software");
         }
     }
 #ifdef SHR_DESKTOP_ANGLE
     else {
         a->gl = SDL_GL_CreateContext(a->win);
-        st = a->gl && SDL_GL_MakeCurrent(a->win, a->gl) ? shr_angle_driver_create(NULL, 0, 256, &a->drv) : SHR_E_DEVICE;
+        st = a->gl && SDL_GL_MakeCurrent(a->win, a->gl) ? shr_angle_driver_create(NULL, 0, keep, keeps, 256, &a->drv)
+                                                        : SHR_E_DEVICE;
         if (st == SHR_OK) {
             const char *r = (const char *)glGetString(GL_RENDERER);
             snprintf(a->label, sizeof(a->label), "angle/%s",
                      strstr(r, "Metal") ? "metal" : strstr(r, "Vulkan") ? "vulkan" : strstr(r, "OpenGL") ? "opengl" : "?");
             /* The driver binds to eglGetCurrentContext(): it must be the context SDL created. */
-            printf("ANGLE driver on %s (EGL context %p, SDL context %p)\n", r, (void *)eglGetCurrentContext(),
-                   (void *)a->gl);
+            printf("ANGLE driver on %s (EGL context %p, SDL context %p, keeps %.1f MiB)\n", r,
+                   (void *)eglGetCurrentContext(), (void *)a->gl, (double)keep / (1 << 20));
             glGenFramebuffers(1, &a->fbo);
         }
     }
@@ -380,6 +532,16 @@ static shr_status open_driver(app *a, int driver, int w, int h) {
         return st;
     }
     a->has_drv = true;
+#ifdef SHR_DESKTOP_ANGLE
+    if (driver == ANGLE && a->gpu_time) {
+        const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+        get_query = (PFNGLGETQUERYOBJECTUI64VEXTPROC)eglGetProcAddress("glGetQueryObjectui64vEXT");
+        a->gpu_time = ext && strstr(ext, "GL_EXT_disjoint_timer_query") && get_query;
+        if (a->gpu_time) glGenQueries(QUERIES, a->queries);
+        printf("GPU time: %s\n", a->gpu_time ? "timer queries (they split ANGLE's command buffers)" : "not supported");
+    }
+    for (int k = 0; k < QUERIES; k++) a->query_frame[k] = -1;
+#endif
     return SHR_OK;
 }
 
@@ -403,18 +565,23 @@ static void scene_close(app *a) {
         if (!done) printf("%s: context did not shut down\n", scene_name(a));
         s->ctx = NULL;
     }
+#ifdef SHR_DESKTOP_ANGLE
+    for (int i = 0; i < 2; i++)
+        if (a->fences[i]) glDeleteSync(a->fences[i]), a->fences[i] = NULL;
+#endif
     surface_destroy(a, &a->comp);
     surface_destroy(a, &a->out);
     if (a->tex) SDL_DestroyTexture(a->tex);
     a->tex = NULL;
     memset(a->sprites, 0, sizeof(a->sprites));
+    a->cursor = NULL;
 }
 
 /* Builds the scene and draws its first frame (the update step included), timed like test_render. */
 static shr_status scene_open(app *a) {
     stage *s = &a->s;
     memset(s, 0, sizeof(*s));
-    a->presents = a->frames = 0, a->tick = 0, a->first = 0, a->log[0] = 0;
+    a->presents = a->frames = 0, a->tick = 0, a->first = 0, a->last = 0, a->log[0] = 0;
     const scene *sc = a->load < 0 ? a->items[a->cur].sc : NULL;
     int pw = 0, ph = 0, z = a->zoom ? a->zoom : 1;
     SDL_GetWindowSizeInPixels(a->win, &pw, &ph);
@@ -425,6 +592,8 @@ static shr_status scene_open(app *a) {
     bool quarter = rot == SHR_ROTATE_90_CW || rot == SHR_ROTATE_90_CCW;
     bool composing = rot || of != SHR_PIXEL_FORMAT || (sc && (sc->screen_flags & SHR_SCREEN_COMPOSITION));
     a->flags = sc ? sc->flags : 0;
+    const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(a->win));
+    a->refresh = 1000.0 / (mode && mode->refresh_rate > 0 ? mode->refresh_rate : 60);
     s->page = sc ? a->items[a->cur].page : 0, s->now = sc ? sc->now_ns : 0, s->hold = (a->flags & FONTS_ASYNC) != 0;
     set_vsync(a);
     int32_t ow = quarter ? a->height : a->width, oh = quarter ? a->width : a->height;
@@ -437,10 +606,17 @@ static shr_status scene_open(app *a) {
         (composing && !stage_ok(s, surface_create(a, a->width, a->height, SHR_PIXEL_FORMAT, &a->comp), "composition")))
         return s->st;
     if (a->driver == SOFTWARE) {
-        a->tex = SDL_CreateTexture(a->ren, of == SHR_FORMAT_RGB565 ? SDL_PIXELFORMAT_RGB565 : SDL_PIXELFORMAT_RGBX32,
+        /* RGBA32 has the bytes of RGBX8888 and SDL's Metal, OpenGL, Direct3D 11/12 and Vulkan renderers take it
+         * without conversion; X is unspecified, hence no blending. SDL converts RGB565 where it is missing (Metal). */
+        a->tex = SDL_CreateTexture(a->ren, of == SHR_FORMAT_RGB565 ? SDL_PIXELFORMAT_RGB565 : SDL_PIXELFORMAT_RGBA32,
                                    SDL_TEXTUREACCESS_STREAMING, ow, oh);
-        if (!a->tex || !SDL_SetTextureScaleMode(a->tex, SDL_SCALEMODE_NEAREST))
+        if (!a->tex || !SDL_SetTextureScaleMode(a->tex, SDL_SCALEMODE_NEAREST) ||
+            !SDL_SetTextureBlendMode(a->tex, SDL_BLENDMODE_NONE))
             return stage_ok(s, SHR_E_DEVICE, "texture"), s->st;
+        a->dirty = (shr_rect){0, 0, ow, oh};
+        a->track = a->drv, a->track.user = a, a->track.execute = track_execute;
+        a->track.cancel = a->drv.cancel ? track_cancel : NULL, a->track.reset = a->drv.reset ? track_reset : NULL;
+        a->track.sync = a->drv.sync ? track_sync : NULL;
     }
     shr_output output;
     shr_output_init(&output);
@@ -449,7 +625,7 @@ static shr_status scene_open(app *a) {
     shr_context_desc cd;
     shr_context_desc_init(&cd);
     cd.user = a, cd.now_ns = scene_clock, cd.log = on_log;
-    cd.driver = &a->drv, cd.output = &output;
+    cd.driver = a->driver == SOFTWARE ? &a->track : &a->drv, cd.output = &output;
     cd.blink = (shr_blink_profile){BLINK_NS, 0, true, SHR_BLINK_RESTART_NONE};
     cd.max_commands = 1u << 22, cd.page_cache_bytes = 64u << 20, cd.image_bytes = 64u << 20;
     cd.io_retry_ns = cd.io_timeout_ns = 0;
@@ -474,7 +650,8 @@ static shr_status scene_open(app *a) {
     if (sc && sc->update && s->st == SHR_OK && sc->update(s) == SHR_OK) frame(a, true);
     finish(a);
     a->first = ms(SDL_GetTicksNS() - t0);
-    if (s->st == SHR_OK) present(a);
+    double v[TIMES];
+    if (s->st == SHR_OK) present(a, v);
     return s->st;
 }
 
@@ -485,70 +662,136 @@ static int cmp_double(const void *x, const void *y) {
     return (a > b) - (a < b);
 }
 
-/* p50, p95, p99 and max of the last `window` entries. */
+/* p50, p95, p99 and max of the last `window` entries; negative entries (not measured) are left out. */
 static void percentiles(const double *ring, long frames, long window, double out[4]) {
     static double v[RING];
-    size_t n = (size_t)SDL_min(frames, window);
-    for (size_t i = 0; i < n; i++) v[i] = ring[(size_t)(frames - 1 - (long)i) % RING];
+    size_t n = 0;
+    for (long i = SDL_max(0, frames - window); i < frames; i++)
+        if (ring[i % RING] >= 0) v[n++] = ring[i % RING];
     SDL_qsort(v, n, sizeof(double), cmp_double);
     static const size_t q[3] = {50, 95, 99};
     for (int k = 0; k < 3; k++) out[k] = n ? v[(n * q[k] + 99) / 100 - 1] : 0;
     out[3] = n ? v[n - 1] : 0;
 }
 
+static long count_over(const double *ring, long frames, double limit) {
+    long c = 0;
+    for (long i = SDL_max(0, frames - RING); i < frames; i++) c += ring[i % RING] > limit;
+    return c;
+}
+
 static void print_stats(const app *a) {
-    printf("[%s] %s, vsync %s%s; first %.3f ms, %ld frames, %ld presented\n", a->label, a->what, a->vsync ? "on" : "off",
-           a->load < 0 && !a->redraw ? ", no redraw" : "", a->first, a->frames, a->presents);
-    const char *names[2] = {"render ", "present"};
-    const double *rings[2] = {a->render, a->present};
-    for (int k = 0; k < 2; k++) {
+    bool gpu = a->driver == ANGLE && a->gpu_time;
+    printf("[%s] %s, vsync %s%s%s; first %.3f ms, %ld frames, %ld presented, refresh %.2f ms\n", a->label, a->what,
+           a->vsync ? "on" : "off", a->driver == ANGLE ? a->finish_each ? ", glFinish" : ", fences" : "",
+           a->load < 0 && !a->redraw ? ", no redraw" : "", a->first, a->frames, a->presents, a->refresh);
+    static const int shown[] = {WORK, WAIT, INTERVAL, GPU};
+    for (size_t i = 0; i < N(shown) - !gpu; i++) {
         double p[2][4];
-        percentiles(rings[k], a->frames, 100, p[0]);
-        percentiles(rings[k], a->frames, 1000, p[1]);
-        printf("  %s ms p50/p95/p99/max  last 100: %.3f/%.3f/%.3f/%.3f  last 1000: %.3f/%.3f/%.3f/%.3f\n", names[k],
-               p[0][0], p[0][1], p[0][2], p[0][3], p[1][0], p[1][1], p[1][2], p[1][3]);
+        percentiles(a->t[shown[i]], a->frames, 100, p[0]);
+        percentiles(a->t[shown[i]], a->frames, 1000, p[1]);
+        printf("  %-8s ms p50/p95/p99/max  last 100: %.3f/%.3f/%.3f/%.3f  last 1000: %.3f/%.3f/%.3f/%.3f\n",
+               time_names[shown[i]], p[0][0], p[0][1], p[0][2], p[0][3], p[1][0], p[1][1], p[1][2], p[1][3]);
     }
+    printf("  p50 ms last 1000:");
+    for (int k = STEP; k <= SWAP; k++) {
+        double p[4];
+        percentiles(a->t[k], a->frames, 1000, p);
+        printf("%s %s %.3f", k == FENCE ? " |" : "", time_names[k], p[0]);
+    }
+    printf("\n  last %ld frames: missed %ld (interval > 1.5 refresh), work over refresh %ld\n", SDL_min(a->frames, RING),
+           count_over(a->t[INTERVAL], a->frames, 1.5 * a->refresh), count_over(a->t[WORK], a->frames, a->refresh));
     fflush(stdout);
 }
 
 static void update_title(const app *a) {
-    double r[4], p[4];
-    percentiles(a->render, a->frames, 100, r);
-    percentiles(a->present, a->frames, 100, p);
+    double w[4], t[4];
+    percentiles(a->t[WORK], a->frames, 100, w);
+    percentiles(a->t[WAIT], a->frames, 100, t);
     char title[256];
     if (a->s.st != SHR_OK)
         snprintf(title, sizeof(title), "shiroko %s · %s · failed: %s", a->label, scene_name(a), a->s.what);
     else
-        snprintf(title, sizeof(title), "shiroko %s · %s · %dx%d · first %.2f · render p50 %.2f p99 %.2f · present p50 %.2f ms%s",
-                 a->label, scene_name(a), a->out.width, a->out.height, a->first, r[0], r[2], p[0],
-                 a->vsync ? " · vsync" : "");
+        snprintf(title, sizeof(title), "shiroko %s · %s · %dx%d · work p50 %.2f max %.2f · wait p50 %.2f ms · missed %ld%s",
+                 a->label, scene_name(a), a->out.width, a->out.height, w[0], w[3], t[0],
+                 count_over(a->t[INTERVAL], a->frames, 1.5 * a->refresh), a->vsync ? " · vsync" : "");
     SDL_SetWindowTitle(a->win, title);
 }
 
 /* Renders, presents and records one frame. */
 static void tick(app *a) {
     stage *s = &a->s;
+    double v[TIMES] = {0};
     uint64_t t0 = SDL_GetTicksNS();
-    bool submit = a->load >= 0 ? load_step(a) : a->redraw && stage_ok(s, shr_request_redraw(s->ctx), "request_redraw");
-    frame(a, submit);
-    finish(a);
+    if (a->frames && a->last) a->t[INTERVAL][(a->frames - 1) % RING] = ms(t0 - a->last);
+    a->last = t0;
+    v[FENCE] = wait_fence(a);
+    if (a->driver == ANGLE && a->gpu_time) gpu_timer_begin(a);
     uint64_t t1 = SDL_GetTicksNS();
-    present(a);
+    bool submit = !a->idle && (a->load >= 0 ? load_step(a) : a->redraw && stage_ok(s, shr_request_redraw(s->ctx), "request_redraw"));
     uint64_t t2 = SDL_GetTicksNS();
-    a->render[a->frames % RING] = ms(t1 - t0), a->present[a->frames % RING] = ms(t2 - t1);
+    if (!a->idle) frame(a, submit);
+    uint64_t t3 = SDL_GetTicksNS();
+    if (a->finish_each && !a->idle) finish(a);
+    uint64_t t4 = SDL_GetTicksNS();
+    present(a, v);
+    v[STEP] = ms(t2 - t1), v[SUBMIT] = ms(t3 - t2), v[FINISH] = ms(t4 - t3), v[INTERVAL] = v[GPU] = -1;
+    v[WORK] = v[STEP] + v[SUBMIT] + v[FINISH] + v[UPLOAD], v[WAIT] = v[FENCE] + v[DRAWABLE] + v[SWAP];
+    for (int k = 0; k < TIMES; k++) a->t[k][a->frames % RING] = v[k];
     a->frames++;
+}
+
+static void dump_csv(const app *a) {
+    for (long i = SDL_max(0, a->frames - RING); a->csv && i < a->frames; i++) {
+        fprintf(a->csv, "%s,%s,%ld", a->label, scene_name(a), i);
+        for (int k = 0; k < TIMES; k++) fprintf(a->csv, ",%.4f", a->t[k][i % RING]);
+        fputc('\n', a->csv);
+    }
 }
 
 /* Ends the statistics of the current settings. */
 static void segment(app *a) {
     if (a->frames) print_stats(a);
-    a->frames = a->presents = 0;
+    dump_csv(a);
+    a->frames = a->presents = 0, a->last = 0;
+#ifdef SHR_DESKTOP_ANGLE
+    for (int k = 0; k < QUERIES; k++) a->query_frame[k] = -1;
+#endif
 }
 
 static void reopen(app *a) {
     segment(a);
     scene_close(a);
     if (scene_open(a) != SHR_OK) printf("%s: %s%s%s\n", scene_name(a), a->s.what, a->log[0] ? "; last log: " : "", a->log);
+}
+
+/* Keep slots hold a row of the window: a new pixel size takes a driver sized for it. */
+static void resize(app *a) {
+    int pw, ph;
+    SDL_GetWindowSizeInPixels(a->win, &pw, &ph);
+    segment(a);
+    scene_close(a);
+    uint64_t keep;
+    uint32_t keeps = keep_sizes(a, pw, ph, &keep);
+    a->dw = pw, a->dh = ph;
+    shr_status st = SHR_E_DEVICE;
+    if (a->driver == SOFTWARE) {
+        shr_software_driver_destroy(&a->drv);
+        st = shr_software_driver_create(NULL, keep, keeps, 256, &a->drv);
+    }
+#ifdef SHR_DESKTOP_ANGLE
+    else if (SDL_GL_MakeCurrent(a->win, a->gl)) {
+        shr_angle_driver_destroy(&a->drv);
+        st = shr_angle_driver_create(NULL, 0, keep, keeps, 256, &a->drv);
+    }
+#endif
+    a->has_drv = st == SHR_OK;
+    if (st != SHR_OK) {
+        printf("driver for %dx%d px: %s\n", pw, ph, shr_status_name(st));
+        exit(EXIT_FAILURE);
+    }
+    printf("driver for %dx%d px (keeps %u, %.1f MiB)\n", pw, ph, keeps, (double)keep / (1 << 20));
+    reopen(a);
 }
 
 static void toggle(app *a) {
@@ -602,15 +845,24 @@ static void angle_setup(void) {
 #endif
 
 static const char usage[] =
-    "usage: shiroko_desktop [--driver software|angle] [--scene NAME | --load scroll|churn|restyle|blink|images]\n"
+    "usage: shiroko_desktop [--driver software|angle] [--scene NAME | --load scroll|churn|restyle|blink|images|\n"
+    "         scroll-api|scroll-api-status|scroll-api-cursor|scroll-api-down|scroll-api-burst|scroll-api-images]\n"
     "         [--n N] [--zoom Z] [--vsync on|off] [--redraw on|off] [--size WxH] [--fonts DIR]\n"
     "         [--frames N [--quit]] [--toggle-every K] [--print N] [--list]\n"
+    "         [--sync fence|finish] [--gpu-time on|off] [--csv FILE] [--idle] [--keeps N|on|off]\n"
     "  --frames N: print the statistics after N frames (--quit: then exit); --toggle-every K: switch drivers every\n"
     "  K frames; --print N: statistics every N frames of a scene; --n: cells per frame (churn) or image layers.\n"
+    "  --sync (ANGLE): fence = up to two frames in flight (default), finish = glFinish every frame (GPU time counts\n"
+    "  as work); --gpu-time: GL timer queries per frame (ANGLE; splits its command buffers); --csv: per-frame times\n"
+    "  of every statistics segment; --idle: present only, nothing rendered or uploaded (control); --keeps: driver\n"
+    "  keeps for the rows of N screens (default 3 = on, off = 0). With --frames, --print or --csv the window title\n"
+    "  shows no statistics (setting it takes milliseconds, which the measured frames would include).\n"
     "keys: Tab driver, Left/Right scene, 1-5 load mode, Up/Down N x2 /2, +/- zoom (0 = fit), V vsync,\n"
     "  R redraw scenes every frame, Space statistics, Esc quit\n"
-    "Render time: the scene's changes, submit and pump until the frame is presented, plus glFinish (ANGLE).\n"
-    "Present time: texture upload and SDL_RenderPresent, or blit and SDL_GL_SwapWindow.\n";
+    "Work: the scene's changes, submit and pump until presented, glFinish (--sync finish), and the texture upload\n"
+    "  or blit. Wait: the fence for the frame before last, taking the next drawable (ANGLE: the first clear of the\n"
+    "  window), and SDL_RenderPresent or SDL_GL_SwapWindow. Interval: from one frame's start to the next; missed\n"
+    "  frames are intervals over 1.5 display refreshes.\n";
 
 static bool on(const char *v) { return !strcmp(v, "on") || !strcmp(v, "1"); }
 
@@ -627,11 +879,17 @@ static bool key(app *a, SDL_Keycode k) {
         a->load = -1;
         reopen(a);
         break;
-    case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4: case SDLK_5:
+    case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4: case SDLK_5: {
+        int w, h;
+        SDL_GetWindowSizeInPixels(a->win, &w, &h);
         segment(a);
         a->load = (int)(k - SDLK_1);
-        reopen(a);
+        if (w != a->dw || h != a->dh)
+            resize(a);
+        else
+            reopen(a);
         break;
+    }
     case SDLK_UP:
     case SDLK_DOWN:
         if (a->load != CHURN && a->load != IMAGES) break;
@@ -670,17 +928,18 @@ static bool key(app *a, SDL_Keycode k) {
 
 int main(int argc, char **argv) {
     static app a;
-    a.font_dir = SHR_FONT_DIR, a.load = -1, a.vsync_opt = -1, a.redraw = true;
+    a.font_dir = SHR_FONT_DIR, a.load = -1, a.vsync_opt = -1, a.redraw = true, a.keep_screens = 3;
     a.n[CHURN] = 1000, a.n[IMAGES] = 16;
     int driver = SOFTWARE, ww = 1280, wh = 720;
     long frames = 0, toggle_every = 0, print_every = 1000;
-    bool quit = false, list = false;
-    const char *scene_arg = NULL;
+    bool quit = false, list = false, measure = false; /* measure: the title, slow to set, stays as it is */
+    const char *scene_arg = NULL, *csv = NULL;
     for (int i = 1; i < argc; i++) {
         const char *o = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         bool used = v != NULL;
         if (!strcmp(o, "--quit")) quit = true, used = false;
         else if (!strcmp(o, "--list")) list = true, used = false;
+        else if (!strcmp(o, "--idle")) a.idle = true, used = false;
         else if (!v) used = false, o = "--help";
         else if (!strcmp(o, "--driver")) driver = !strcmp(v, "angle") ? ANGLE : SOFTWARE;
         else if (!strcmp(o, "--scene")) scene_arg = v;
@@ -694,9 +953,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(o, "--redraw")) a.redraw = on(v);
         else if (!strcmp(o, "--size")) sscanf(v, "%dx%d", &ww, &wh);
         else if (!strcmp(o, "--fonts")) a.font_dir = v;
-        else if (!strcmp(o, "--frames")) frames = strtol(v, NULL, 10);
+        else if (!strcmp(o, "--frames")) frames = strtol(v, NULL, 10), measure = true;
         else if (!strcmp(o, "--toggle-every")) toggle_every = strtol(v, NULL, 10);
-        else if (!strcmp(o, "--print")) print_every = strtol(v, NULL, 10);
+        else if (!strcmp(o, "--print")) print_every = strtol(v, NULL, 10), measure = true;
+        else if (!strcmp(o, "--sync")) {
+            a.finish_each = !strcmp(v, "finish");
+            if (!a.finish_each && strcmp(v, "fence")) o = "--help";
+        } else if (!strcmp(o, "--gpu-time")) a.gpu_time = on(v);
+        else if (!strcmp(o, "--csv")) csv = v, measure = true;
+        else if (!strcmp(o, "--keeps"))
+            a.keep_screens = !strcmp(v, "on") ? 3 : SDL_clamp((int)strtol(v, NULL, 10), 0, 64);
         else o = "--help";
         if (!strcmp(o, "--help")) {
             fputs(usage, stdout);
@@ -714,6 +980,15 @@ int main(int argc, char **argv) {
     if (scene_arg) {
         printf("unknown scene %s (--list shows them)\n", scene_arg);
         return EXIT_FAILURE;
+    }
+    if (csv && !(a.csv = fopen(csv, "w"))) {
+        printf("%s: cannot write\n", csv);
+        return EXIT_FAILURE;
+    }
+    if (a.csv) {
+        fputs("driver,scene,frame", a.csv);
+        for (int k = 0; k < TIMES; k++) fprintf(a.csv, ",%s", time_names[k]);
+        fputc('\n', a.csv);
     }
 #ifdef SHR_DESKTOP_ANGLE
     angle_setup();
@@ -743,7 +1018,7 @@ int main(int argc, char **argv) {
             if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) running = key(&a, e.key.key), reported = false;
             if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED && ours && a.load >= 0 &&
                 (e.window.data1 != a.pw || e.window.data2 != a.ph))
-                reopen(&a);
+                resize(&a);
         }
         if (!running) break;
         if (a.s.st != SHR_OK) {
@@ -759,7 +1034,7 @@ int main(int argc, char **argv) {
         tick(&a);
         total++;
         if (print_every > 0 && a.frames % print_every == 0 && total != frames) print_stats(&a);
-        if (SDL_GetTicksNS() - title_at > 250000000u) update_title(&a), title_at = SDL_GetTicksNS();
+        if (!measure && SDL_GetTicksNS() - title_at > 250000000u) update_title(&a), title_at = SDL_GetTicksNS();
         if (frames && total == frames) {
             print_stats(&a);
             if (quit) break;
@@ -767,6 +1042,8 @@ int main(int argc, char **argv) {
         if (toggle_every > 0 && total % toggle_every == 0) toggle(&a);
     }
     if (a.s.st != SHR_OK) rc = EXIT_FAILURE;
+    dump_csv(&a);
+    if (a.csv) fclose(a.csv);
     scene_close(&a);
     close_driver(&a);
     SDL_Quit();

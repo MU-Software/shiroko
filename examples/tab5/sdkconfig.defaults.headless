@@ -1,0 +1,2 @@
+# Headless ESP32-P4 board (e.g. M5Stack Unit PoE-P4), over sdkconfig.defaults: make tab5-build TAB5_BOARD=headless
+CONFIG_SHIROKO_TAB5_BOARD_HEADLESS=y

@@ -137,6 +137,25 @@
       "sha256": "97c937514d645eae90415d30ba025e08a94d5bdffdc627404864f90aa0c7d83b"
     }
   },
+  "order": {
+    "korean-frequency-2005.zip": {
+      "url": "https://www.korean.go.kr/common/download.do?file_path=reportData&c_file_name=2c6f86ef-d5fe-489d-a545-9f6115c3d594_0.zip&o_file_name=%ED%98%84%EB%8C%80%20%EA%B5%AD%EC%96%B4%20%EC%82%AC%EC%9A%A9%20%EB%B9%88%EB%8F%84%20%EC%A1%B0%EC%82%AC%202.zip",
+      "sha256": "e9d5b0baf3880dee5bff7681fc641f6b014a365705b674e0ea7105ba2c8a9251",
+      "cache": "fonts",
+      "member": "음절통계.txt",
+      "member_encoding": "cp949",
+      "member_sha256": "cdb39168e789482486cba77d87f604a8be5e6cdfe90c20c35849c9926e7769b6",
+      "page": "https://www.korean.go.kr/front/reportData/reportDataView.do?mn_id=45&report_seq=1",
+      "license": "KOGL Type 1 (공공누리 제1유형: 출처표시)",
+      "license_url": "https://www.kogl.or.kr/info/licenseType1.do",
+      "attribution": "본 저작물은 '국립국어원'에서 '2005년' 작성하여 공공누리 제1유형으로 개방한 '현대 국어 사용 빈도 조사 2(작성자: 김한샘)'을 이용하였으며, 해당 저작물은 '국립국어원, https://www.korean.go.kr/front/reportData/reportDataView.do?mn_id=45&report_seq=1'에서 무료로 다운받으실 수 있습니다."
+    },
+    "Unihan.zip": {
+      "url": "https://www.unicode.org/Public/17.0.0/ucd/Unihan.zip",
+      "sha256": "f7a48b2b545acfaa77b2d607ae28747404ce02baefee16396c5d2d7a8ef34b5e",
+      "cache": "ucd"
+    }
+  },
   "faces": {
     "meslo-lgs-regular": {
       "file": "meslo-lg-v1.2.1.zip",

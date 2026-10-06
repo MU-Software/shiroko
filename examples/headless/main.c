@@ -63,7 +63,10 @@ int main(int argc, char **argv) {
     const char *font_dir = argc > 2 ? argv[2] : "build/host/fonts";
     image_output out = {calloc((size_t)W * H, BPP), 0};
     shr_framebuffer_driver drv;
-    check("driver", shr_software_driver_create(NULL, 1u << 20, 256, &drv), NULL);
+    /* Keeps for the rows of three screens, each in a slot of one row. */
+    uint32_t keeps = 3 * (H / SHR_CELL_HEIGHT);
+    uint64_t slot = (W * SHR_CELL_HEIGHT * BPP + 127) / 128 * 128;
+    check("driver", shr_software_driver_create(NULL, keeps * slot, keeps, 256, &drv), NULL);
     shr_output output;
     shr_output_init(&output);
     output.user = &out;

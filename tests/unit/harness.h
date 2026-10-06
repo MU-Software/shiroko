@@ -77,9 +77,10 @@ static inline uint64_t fake_clock(void *user) {
 
 /* Runs commands on the software port, or, when async, keeps the compositor's own commands (no copy)
  * and runs them at md_complete(): the contract says they stay unchanged until the fence resolves.
- * The buffer prologue updates `buffers` (id k at [k - 1]) as the batch runs. A failed batch forgets them all, or
- * with `fail_late` first applies its prologue, as a driver checking draws only after it may do. `budget` (0 = none)
- * bounds the registered bytes like a driver keeping copies: a REGISTER beyond it fails the batch. */
+ * The buffer prologue updates `buffers` (id k at [k - 1]) as the batch runs. A failed batch (`fail_status`, or
+ * SHR_E_DEVICE) forgets them all, or with `fail_late` first applies its prologue, as a driver checking draws only after
+ * it may do. `budget` (0 = none) bounds the registered bytes like a driver keeping copies: a REGISTER beyond it fails
+ * the batch. With `sw` set, that driver runs the batches instead (keeps). */
 typedef struct mock_driver {
     int fail_next;
     int block_next;
@@ -98,6 +99,8 @@ typedef struct mock_driver {
     uint64_t budget;
     int registers, updates, releases; /* buffer commands run */
     shr_status completed;             /* of the last md_complete() */
+    shr_status fail_status;
+    shr_framebuffer_driver sw;
 } mock_driver;
 
 static inline uint64_t md_held(const mock_driver *d) {
@@ -111,11 +114,13 @@ static inline shr_status md_batch(mock_driver *d, const shr_surface *dst, const 
     size_t i = 0;
     for (; i < n && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER; i++) {
         const shr_draw_cmd *c = &cmds[i];
+        shr_image m = {0};
         if (c->kind != SHR_CMD_BUFFER_RELEASE && (!c->buffer || c->buffer > HBUFS)) return SHR_E_INVALID_ARG;
+        if (c->kind == SHR_CMD_BUFFER_REGISTER && shr_image_ref_get(&c->src, &m) != SHR_OK) return SHR_E_INVALID_ARG;
         if (c->kind == SHR_CMD_BUFFER_REGISTER && d->budget &&
-            md_held(d) - d->buffers[c->buffer - 1].byte_length + c->src.byte_length > d->budget)
+            md_held(d) - d->buffers[c->buffer - 1].byte_length + m.byte_length > d->budget)
             return SHR_E_UNSUPPORTED;
-        if (c->kind == SHR_CMD_BUFFER_REGISTER) d->buffers[c->buffer - 1] = c->src, d->registers++;
+        if (c->kind == SHR_CMD_BUFFER_REGISTER) d->buffers[c->buffer - 1] = m, d->registers++;
         if (c->kind == SHR_CMD_BUFFER_UPDATE && !d->buffers[c->buffer - 1].format) return SHR_E_INVALID_ARG;
         d->updates += c->kind == SHR_CMD_BUFFER_UPDATE;
         if (c->kind == SHR_CMD_BUFFER_RELEASE && c->buffer && c->buffer <= HBUFS) d->buffers[c->buffer - 1] = (shr_image){0};
@@ -125,7 +130,7 @@ static inline shr_status md_batch(mock_driver *d, const shr_surface *dst, const 
 }
 
 static inline shr_status md_run(mock_driver *d, const shr_surface *dst, const shr_draw_cmd *cmds, size_t n) {
-    return md_batch(d, dst, cmds, n, true);
+    return d->sw.execute ? d->sw.execute(d->sw.user, dst, cmds, n, 0) : md_batch(d, dst, cmds, n, true);
 }
 
 static inline shr_status md_execute(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t n, shr_fence fence) {
@@ -136,7 +141,7 @@ static inline shr_status md_execute(void *user, const shr_surface *dst, const sh
         d->fail_next--;
         if (d->fail_late) md_batch(d, dst, cmds, n, false);
         else memset(d->buffers, 0, sizeof(d->buffers));
-        return SHR_E_DEVICE;
+        return d->fail_status ? d->fail_status : SHR_E_DEVICE;
     }
     if (d->block_next > 0) {
         d->block_next--;
@@ -246,7 +251,9 @@ static inline void harness_close(harness *h) {
         md_complete(&h->drv);
         shr_pump(h->ctx);
         if (h->font && shr_pl_res_bitmap_font_destroy(h->font) == SHR_OK) h->font = NULL;
-        if (!h->font && shr_destroy(h->ctx) == SHR_OK) return;
+        if (h->font || shr_destroy(h->ctx) != SHR_OK) continue;
+        if (h->drv.sw.execute) shr_software_driver_destroy(&h->drv.sw);
+        return;
     }
     FAIL_WITH_LONGJMPm("context did not shut down");
 }

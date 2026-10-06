@@ -134,7 +134,7 @@ typedef struct reader {
     int done, ok, wrong;
 } reader;
 
-static shr_status rd_resolve(shr__res *r, uint64_t id, uint64_t frame, shr__resolved *out) {
+static shr_status rd_resolve(shr__res *r, uint64_t id, uint64_t frame, const shr__resolved **out) {
     (void)r, (void)id, (void)frame, (void)out;
     return SHR_E_NOT_FOUND;
 }
@@ -205,7 +205,7 @@ static void w_discard(void *user, const shr_surface *s) { (void)user, (void)s; }
 static void *run_context(void *arg) {
     worker *w = arg;
     shr_framebuffer_driver drv;
-    if (shr_software_driver_create(NULL, 64 << 10, 16, &drv) != SHR_OK) return w->failures++, NULL;
+    if (shr_software_driver_create(NULL, 64 << 10, 16, 16, &drv) != SHR_OK) return w->failures++, NULL;
     shr_output out;
     shr_output_init(&out);
     out.user = w, out.flags = SHR_OUTPUT_RELEASE_ON_PRESENT | SHR_OUTPUT_PRESERVES_CONTENT;

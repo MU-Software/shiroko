@@ -46,6 +46,12 @@
       "dependencies": [
         "zstd"
       ]
+    },
+    "zstd-source": {
+      "description": "zstd decoder sources for the ESP-IDF build (examples/tab5)",
+      "dependencies": [
+        "zstd-source"
+      ]
     }
   },
   "license": "MIT"

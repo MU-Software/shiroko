@@ -137,11 +137,19 @@ static uint64_t glyph2(shr_pl_res_bitmap_font *f) {
 
 static uint64_t frame_no = 1000;
 
+/* resolve() of `res`, its answer copied to *out. */
+static shr_status resolve_at(shr__res *res, uint64_t id, uint64_t frame, shr__resolved *out) {
+    const shr__resolved *r = NULL;
+    shr_status st = res->ops->resolve(res, id, frame, &r);
+    if (st == SHR_OK || st == SHR_E_NOT_FOUND) *out = *r;
+    return st;
+}
+
 /* Resolves in a frame of its own, which then ends. */
 static shr_status resolve(shr_pl_res_bitmap_font *f, uint64_t id, shr__resolved *out) {
     shr__res *res = shr__bitmap_font_res(f);
     *out = (shr__resolved){0};
-    shr_status st = res->ops->resolve(res, id, ++frame_no, out);
+    shr_status st = resolve_at(res, id, ++frame_no, out);
     res->ops->frame_end(res, frame_no);
     return st;
 }
@@ -151,7 +159,7 @@ static void resolve_all(shr_pl_res_bitmap_font *f, const uint64_t *ids, size_t n
     shr__res *res = shr__bitmap_font_res(f);
     shr__resolved r;
     frame_no++;
-    for (size_t i = 0; i < n; i++) res->ops->resolve(res, ids[i], frame_no, &r);
+    for (size_t i = 0; i < n; i++) resolve_at(res, ids[i], frame_no, &r);
     res->ops->frame_end(res, frame_no);
 }
 
@@ -2208,7 +2216,7 @@ TEST test_deadline_is_the_earliest_retry(void) {
     const uint64_t ids[3] = {glyph2(f), glyph1(f, 'A'), glyph1(f, 0xAC00)};
     for (int i = 0; i < 3; i++) { /* pages of one frame back off until 150, 160 and 170 ms */
         fake_now = 100 * MS + 10 * MS * (uint64_t)i;
-        res->ops->resolve(res, ids[i], frame_no + 1, &r);
+        resolve_at(res, ids[i], frame_no + 1, &r);
         shr_pump(ctx);
     }
     res->ops->frame_end(res, ++frame_no);
@@ -2237,8 +2245,8 @@ TEST test_page_cache_budget(void) {
     shr__resolved r;
     ASSERT_EQ_LL(load(ctx, f, first, &r), SHR_OK);
     uint64_t frame = ++frame_no;
-    ASSERT_EQ_LL(res->ops->resolve(res, first, frame, &r), SHR_OK); /* pinned by the frame */
-    ASSERT_EQ_LL(res->ops->resolve(res, second, frame, &r), SHR_OK);
+    ASSERT_EQ_LL(resolve_at(res, first, frame, &r), SHR_OK); /* pinned by the frame */
+    ASSERT_EQ_LL(resolve_at(res, second, frame, &r), SHR_OK);
     ASSERT(r.provisional);
     settle(ctx);
     ASSERT_EQ_LL(f->page_bytes, SY_RES); /* no room while the first page is pinned */
@@ -2597,17 +2605,17 @@ TEST test_pins_per_frame(void) {
     ASSERT_EQ_LL(load(ctx, f, sa, &r), SHR_OK); /* once the other packages are known to be absent */
     ASSERT(!r.provisional && rh(&r) == 4);
     shr__page *p = f->pkg[ROLE_LATIN].pages[0], *q = f->pkg[ROLE_LATIN].pages[1];
-    for (int i = 0; i < 4; i++) res->ops->resolve(res, i % 2 ? sa : a, 5, &r); /* one stamp per frame */
-    res->ops->resolve(res, a, 6, &r);
-    res->ops->resolve(res, second, 6, &r);
-    res->ops->resolve(res, sa, 6, &r);
+    for (int i = 0; i < 4; i++) resolve_at(res, i % 2 ? sa : a, 5, &r); /* one stamp per frame */
+    resolve_at(res, a, 6, &r);
+    resolve_at(res, second, 6, &r);
+    resolve_at(res, sa, 6, &r);
     ASSERT(p->pin[0] == 5 && p->pin[1] == 6 && q->pin[0] == 6 && q->pin[1] == 0);
     ASSERT(!f->lru);
-    ASSERT_EQ_LL(res->ops->resolve(res, a, 7, &r), SHR_E_LIMIT); /* a third frame in flight */
+    ASSERT_EQ_LL(resolve_at(res, a, 7, &r), SHR_E_LIMIT); /* a third frame in flight */
     res->ops->frame_end(res, 5);
     ASSERT(p->pin[0] == 0 && p->pin[1] == 6);
     ASSERT(!f->lru);
-    ASSERT_EQ_LL(res->ops->resolve(res, a, 7, &r), SHR_OK);
+    ASSERT_EQ_LL(resolve_at(res, a, 7, &r), SHR_OK);
     ASSERT_EQ_LL(p->pin[0], 7);
     res->ops->frame_end(res, 6);
     ASSERT(f->lru == &q->lru && !q->lru.next);
@@ -2723,7 +2731,7 @@ TEST test_provisional_redrawn_when_ready(void) {
 static shr_framebuffer_driver cached_driver;
 static void tweak_cached(shr_context_desc *d, shr_framebuffer_driver *drv) {
     (void)d;
-    shr_software_driver_create(NULL, 1u << 20, 64, &cached_driver);
+    shr_software_driver_create(NULL, 1u << 20, 64, 64, &cached_driver);
     *drv = cached_driver;
 }
 
@@ -2793,6 +2801,162 @@ TEST test_failed_page_event_in_frames(void) {
     ASSERT_EQ_LL(ev.status, SHR_E_CHECKSUM);
     ASSERT(lit(h.out.shown, 0, CW, 0, CH) > 0); /* the built-in 'A' */
     ASSERT_EQ_LL(shr_lyr_destroy(layer), SHR_OK);
+    harness_close(&h);
+    PASS();
+}
+
+/* ===== Preloading ===== */
+
+static shr_status preload(shr_pl_res_bitmap_font *f, const char *package, uint32_t pages) {
+    return shr_pl_res_bitmap_font_preload(f, package, pages);
+}
+
+/* The leading pages of packages load without frames, one page per pump, opening the packages; a frame then draws them
+ * without reads. */
+TEST test_preload(void) {
+    static spkg latin, cjk;
+    synth(&latin);
+    synth_as(&cjk, ROLE_CJK, "ko", 'A', 0xAC00, SY_A4);
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
+    tsrc sl = {latin.d, latin.n, .mode = SRC_READ}, sc = {cjk.d, cjk.n, .mode = SRC_MAP};
+    lib l = {.src = {[ROLE_LATIN] = &sl, [ROLE_CJK] = &sc}};
+    shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
+    shr__res *res = shr__bitmap_font_res(f);
+    ASSERT_EQ_LL(preload(NULL, "shiroko-latin.shrf", 1), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(preload(f, NULL, 1), SHR_E_INVALID_ARG);
+    res->dead = true;
+    ASSERT_EQ_LL(preload(f, "shiroko-latin.shrf", 1), SHR_E_STATE); /* destroyed */
+    res->dead = false;
+    ASSERT_EQ_LL(preload(f, "shiroko-cjk-ja.shrf", 1), SHR_E_NOT_FOUND); /* not this font's locale */
+    ASSERT_EQ_LL(preload(f, "shiroko-latin.shrf", 0), SHR_OK);
+    ASSERT_EQ_LL(preload(f, "shiroko-cjk-ko.shrf", 0), SHR_OK);
+    ASSERT_EQ_LL(preload(f, "shiroko-emoji.shrf", 1), SHR_OK); /* not installed */
+    ASSERT(res->ops->has_work(res));
+    settle(ctx);
+    ASSERT(f->pkg[ROLE_LATIN].state == PKG_READY && f->pkg[ROLE_CJK].state == PKG_READY);
+    ASSERT_EQ_LL(f->pkg[ROLE_EMOJI].state, PKG_ABSENT);
+    ASSERT_EQ_LL(sl.calls, 3); /* header, index, metadata */
+    shr__page **lp = f->pkg[ROLE_LATIN].pages, **cp = f->pkg[ROLE_CJK].pages;
+    ASSERT_EQ_LL(preload(f, "shiroko-cjk-ko.shrf", 9), SHR_OK); /* beyond its two pages */
+    shr_pump(ctx);
+    ASSERT(cp[0]->state == PAGE_READY && !cp[1]);
+    shr_pump(ctx);
+    ASSERT(cp[1]->state == PAGE_READY);
+    ASSERT_EQ_LL(preload(f, "shiroko-latin.shrf", 1), SHR_OK);
+    shr_pump(ctx);
+    ASSERT(lp[0]->state == PAGE_LOADING && sl.calls == 4);
+    ASSERT(!res->ops->has_work(res)); /* the read ends in the next pump */
+    settle(ctx);
+    ASSERT(lp[0]->state == PAGE_READY && !lp[1] && sl.calls == 4);
+    shr__resolved r;
+    ASSERT_EQ_LL(resolve(f, glyph1(f, 'A'), &r), SHR_OK);
+    ASSERT(!r.provisional && rh(&r) == 4 && sl.calls == 4);
+    ASSERT_EQ_LL(resolve(f, glyph1(f, 0xAC00), &r), SHR_OK);
+    ASSERT(!r.provisional && rh(&r) == 4);
+    shr_begin_shutdown(ctx);
+    ASSERT_EQ_LL(preload(f, "shiroko-latin.shrf", 1), SHR_E_STATE); /* shutting down */
+    harness_close(&h);
+    PASS();
+}
+
+/* Pages frames wait for go first; one preload read is in flight at a time. */
+TEST test_preload_after_frames(void) {
+    static spkg d;
+    synth(&d);
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
+    tsrc s = {d.d, d.n, .script = {[3] = SHR_IN_PROGRESS, [4] = SHR_IN_PROGRESS}};
+    lib l = {.src = {[ROLE_LATIN] = &s}};
+    shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
+    shr__res *res = shr__bitmap_font_res(f);
+    shr__resolved r;
+    resolve(f, glyph2(f), &r);
+    settle(ctx);
+    resolve(f, glyph2(f), &r);
+    ASSERT_EQ_LL(preload(f, "shiroko-latin.shrf", 2), SHR_OK);
+    settle(ctx);
+    ASSERT(s.calls == 4 && s.pending == 1); /* the frame's page */
+    ts_complete(ctx, &s, SHR_OK);
+    shr_pump(ctx);
+    shr__page **pages = f->pkg[ROLE_LATIN].pages;
+    ASSERT(pages[1]->state == PAGE_READY && pages[0]->state == PAGE_LOADING && s.calls == 5);
+    ASSERT(!res->ops->has_work(res));
+    ASSERT_EQ_LL(resolve(f, glyph1(f, 'A'), &r), SHR_OK); /* wanted while preloading */
+    ASSERT(r.provisional);
+    ts_complete(ctx, &s, SHR_OK);
+    ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &r), SHR_OK);
+    ASSERT(!r.provisional && rh(&r) == 4 && s.calls == 5);
+    harness_close(&h);
+    PASS();
+}
+
+/* A preload ends where the cache would have to evict; it skips pages that exist, whose read is refused or whose
+ * descriptor cannot be allocated; read packages wait while reads are blocked, mapped ones go on. */
+TEST test_preload_limits(void) {
+    static spkg d, cjk, sym, nerd;
+    synth(&d);
+    synth_as(&cjk, ROLE_CJK, "ko", 0xAC00, 0xAC01, SY_A4);
+    synth_as(&sym, ROLE_SYMBOLS, "", 0x2630, 0x2631, SY_A4);
+    synth_as(&nerd, ROLE_NERD, "", 0xE0B0, 0xE0B1, SY_A4);
+    harness h;
+    cache_limit = one_page(&d);
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_cache);
+    tsrc s = {d.d, d.n, .mode = SRC_READ};
+    lib l = {.src = {[ROLE_LATIN] = &s}};
+    shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
+    ASSERT_EQ_LL(preload(f, "shiroko-latin.shrf", 2), SHR_OK);
+    settle(ctx);
+    ASSERT(f->pkg[ROLE_LATIN].pages[0]->state == PAGE_READY && !f->pkg[ROLE_LATIN].pages[1]);
+    ASSERT_EQ_LL(f->pkg[ROLE_LATIN].preload, 0);
+    harness_close(&h);
+
+    ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
+    s = (tsrc){d.d, d.n, .script = {[3] = SHR_E_WOULD_BLOCK}};
+    f = h.font = font_new(ctx, &l, NULL);
+    ASSERT_EQ_LL(preload(f, "shiroko-latin.shrf", 2), SHR_OK);
+    settle(ctx);
+    ASSERT(!f->pkg[ROLE_LATIN].pages[0] && f->pkg[ROLE_LATIN].pages[1]->state == PAGE_READY && s.calls == 5);
+    harness_close(&h);
+
+    oom_allocator = fail_allocator(&oom);
+    oom = (fail_alloc){-1, 0};
+    ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_oom);
+    tsrc c = {cjk.d, cjk.n, .mode = SRC_MAP};
+    l = (lib){.src = {[ROLE_CJK] = &c}};
+    f = h.font = font_new(ctx, &l, NULL);
+    shr__res *res = shr__bitmap_font_res(f);
+    ASSERT_EQ_LL(preload(f, "shiroko-cjk-ko.shrf", 0), SHR_OK);
+    res->ops->pump(res);
+    ASSERT_EQ_LL(f->pkg[ROLE_CJK].state, PKG_READY);
+    ASSERT_EQ_LL(preload(f, "shiroko-cjk-ko.shrf", 2), SHR_OK);
+    oom.budget = 0;
+    res->ops->pump(res);
+    oom.budget = -1;
+    settle(ctx);
+    ASSERT(!f->pkg[ROLE_CJK].pages[0] && f->pkg[ROLE_CJK].pages[1]->state == PAGE_READY);
+    harness_close(&h);
+
+    ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_one_read);
+    tsrc sy = {sym.d, sym.n, .script = {SHR_IN_PROGRESS}}, n = {nerd.d, nerd.n, .mode = SRC_READ};
+    s = (tsrc){d.d, d.n, .mode = SRC_READ}, c = (tsrc){cjk.d, cjk.n, .mode = SRC_MAP};
+    l = (lib){.src = {[ROLE_LATIN] = &s, [ROLE_CJK] = &c, [ROLE_SYMBOLS] = &sy, [ROLE_NERD] = &n}};
+    f = h.font = font_new(ctx, &l, NULL);
+    res = shr__bitmap_font_res(f);
+    shr__resolved r;
+    load(ctx, f, glyph1(f, 'A'), &r);
+    ASSERT_EQ_LL(preload(f, "shiroko-symbols.shrf", 1), SHR_OK);
+    shr_pump(ctx);
+    ASSERT_EQ_LL(sy.pending, 1); /* holds the only read */
+    ASSERT_EQ_LL(preload(f, "shiroko-latin.shrf", 2), SHR_OK);
+    ASSERT_EQ_LL(preload(f, "shiroko-nerd.shrf", 1), SHR_OK);
+    ASSERT_EQ_LL(preload(f, "shiroko-cjk-ko.shrf", 1), SHR_OK);
+    shr_pump(ctx); /* the Nerd package finds no free read */
+    ASSERT(f->pkg[ROLE_CJK].pages[0]->state == PAGE_READY && f->pkg[ROLE_LATIN].preload_next == 0);
+    ASSERT(!res->ops->has_work(res));
+    ts_complete(ctx, &sy, SHR_OK);
+    settle(ctx);
+    ASSERT(f->pkg[ROLE_LATIN].pages[1]->state == PAGE_READY && f->pkg[ROLE_NERD].pages[0]->state == PAGE_READY);
     harness_close(&h);
     PASS();
 }
@@ -3031,6 +3195,9 @@ int main(int argc, char **argv) {
     RUN_TEST(test_provisional_redrawn_when_ready);
     RUN_TEST(test_cooled_package_redrawn);
     RUN_TEST(test_failed_page_event_in_frames);
+    RUN_TEST(test_preload);
+    RUN_TEST(test_preload_after_frames);
+    RUN_TEST(test_preload_limits);
     RUN_TEST(test_real_packages);
     RUN_TEST(test_real_emoji_sequences);
     RUN_TEST(test_powerline_meets_cell_edge);

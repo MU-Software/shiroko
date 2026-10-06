@@ -24,25 +24,37 @@ const char *shr_angle_offscreen_backend(const shr_angle_offscreen *offscreen);
 shr_status shr_angle_offscreen_destroy(shr_angle_offscreen *offscreen);
 
 /* Synchronous driver (execute() returns SHR_OK once the GL commands are issued, without glFlush) for CPU and
- * DEVICE destinations and sources, bound to the EGL context current now (SHR_E_STATE without one). Buffer ids are
+ * DEVICE destinations and sources, bound to the EGL context current now (SHR_E_STATE without one); a COPY of a
+ * destination onto itself goes through a texture copy of what it reads (SHR_DRIVER_CHEAP_MOVE). Buffer ids are
  * 1..max_buffers. The driver draws from texture copies of the buffers (SHR_BUFFER_COPIES); a REGISTER that would
  * take the byte_length of all registered buffers beyond `texture_cache_bytes` (caps.buffer_bytes, 0 = unlimited)
  * fails with SHR_E_UNSUPPORTED. Buffers of one texture shape (A4/A8 or RGBA8888, texel width, height) share array
- * textures, which hold up to 15 unused layers per shape. caps.max_width / max_height and max_buffer_width / max_buffer_height are GL_MAX_TEXTURE_SIZE, at most
- * 16384. execute() checks each leading buffer command, applies it, then checks the rest of the batch before
- * drawing; SHR_E_DEVICE is a GL error, which may leave the destination partly written and unregisters every
- * buffer. */
-shr_status shr_angle_driver_create(const shr_allocator *allocator, uint64_t texture_cache_bytes, uint32_t max_buffers,
-                                   shr_framebuffer_driver *out);
+ * textures, which hold up to 15 unused layers per shape. caps.max_width / max_height and max_buffer_width /
+ * max_buffer_height are GL_MAX_TEXTURE_SIZE, at most 16384.
+ * Keep ids are 1..max_keeps (caps.max_keeps, caps.keep_bytes = `keep_bytes`). Id k owns slot k of keep_bytes /
+ * max_keeps bytes rounded down to a multiple of 128 (caps.max_keep_bytes; SHR_E_INVALID_ARG when that is 0 with
+ * max_keeps), kept after KEEP_RELEASE. A slot holds P = slot bytes / destination bytes per pixel texels as sw x sh,
+ * sw = P / SHR_CELL_HEIGHT within 1..caps.max_width and sh = P / sw at most caps.max_height, so a keep of a row of
+ * cells inside the destination fits whenever its bytes do; a store wider than sw or taller than sh fails with
+ * SHR_E_NO_MEMORY, as does one GL has no memory for. keep_bytes = max_keeps * (row bytes rounded up to 128) holds
+ * max_keeps rows. The slots of a destination format are one array texture, in as few columns and layers as fit
+ * (SHR_E_UNSUPPORTED beyond 256 layers), allocated by the first store into a destination of that format and kept
+ * until destroy or SHR_E_DEVICE; a driver drawing into both formats holds two.
+ * execute() checks each leading buffer command, applies it, then checks the rest of the batch before drawing;
+ * SHR_E_DEVICE is a GL error, which may leave the destination partly written and unregisters every buffer and
+ * empties every keep. */
+shr_status shr_angle_driver_create(const shr_allocator *allocator, uint64_t texture_cache_bytes, uint64_t keep_bytes,
+                                   uint32_t max_keeps, uint32_t max_buffers, shr_framebuffer_driver *out);
 /* Also destroys the surfaces still alive. */
 shr_status shr_angle_driver_destroy(shr_framebuffer_driver *driver);
 
 /* Counters since the driver was created: draw calls and the quads they drew, buffer textures alive and their
- * bytes. Needs no EGL context. */
+ * bytes, keeps stored and KEEP_DRAWs drawn, bytes of the keep slot textures alive. Needs no EGL context. */
 typedef struct shr_angle_stats {
     uint64_t draws, instances;
     uint32_t textures;
     uint64_t texture_bytes;
+    uint64_t keep_stores, keep_draws, keep_texture_bytes;
 } shr_angle_stats;
 shr_status shr_angle_driver_stats(const shr_framebuffer_driver *driver, shr_angle_stats *out);
 

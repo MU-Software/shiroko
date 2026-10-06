@@ -31,6 +31,8 @@
 #define SHR_GID_UNKNOWN 0xFFFFFFFDu
 #define SHR_MAX_CELL_SIZE 1024
 #define SHR_FONT_MAX_CLUSTERS (1u << 16)
+#define SHR_FONT_MEMO_BITS 9
+#define SHR_FONT_MEMO (1u << SHR_FONT_MEMO_BITS)
 
 /* Package roles as stored in MANIFEST; the built-in package takes slot 0. */
 enum { ROLE_BUILTIN, ROLE_LATIN, ROLE_CJK, ROLE_SYMBOLS, ROLE_EMOJI, ROLE_NERD, ROLE_COUNT };
@@ -107,6 +109,7 @@ struct shr__pkg {
     uint32_t stride;
     uint64_t slot_shape; /* format and page shape */
     shr__page **pages;   /* npages entries (from the metadata step), NULL until wanted */
+    uint32_t preload, preload_next; /* the leading pages to preload; the next one to try */
 };
 
 typedef struct shr__cluster {
@@ -116,6 +119,12 @@ typedef struct shr__cluster {
     uint32_t cp;
     uint32_t gid[ROLE_COUNT]; /* glyph value per package once it is ready, else SHR_GID_UNKNOWN */
 } shr__cluster;
+
+/* An answer of resolve() for a frame not ended yet (frame 0 = none); r.buf NULL = draws nothing. */
+typedef struct shr__memo {
+    uint64_t id, frame;
+    shr__resolved r;
+} shr__memo;
 
 struct shr_pl_res_bitmap_font {
     shr__res res;
@@ -135,12 +144,15 @@ struct shr_pl_res_bitmap_font {
     bool cool_due;     /* a frame ran into a cool-down that is already over */
     uint64_t frame;    /* the latest frame that resolved glyphs */
     shr__vec wants;    /* shr__page *, wanted by a frame and not ready */
+    shr__page *preloading; /* the preload page being read */
+    bool delivered;    /* a read ended since the last pump */
     shr__vec clusters; /* shr__cluster */
     shr__vec pool;     /* uint32_t scalars of the clusters */
     void *zdc;         /* the zstd decoder, from the first package that needs it */
     uint32_t *slots;   /* cluster index + 1, open addressing */
     size_t nslots;
     bool changed, blocked, shutting_down;
+    shr__memo memo[SHR_FONT_MEMO]; /* by id */
 };
 
 static inline uint64_t shr__font_now(const shr_pl_res_bitmap_font *f) { return shr__ctx_now(f->res.ctx); }
@@ -191,6 +203,8 @@ typedef struct shr__streams {
 } shr__streams;
 
 /* package.c */
+/* The file name open() receives for the package. */
+void shr__pkg_name(const shr__pkg *pkg, char name[40]);
 void shr__pkg_release(shr__pkg *pkg);
 /* Opens a mapped package; SHR_E_NO_MEMORY: retry later. */
 shr_status shr__pkg_map(shr__pkg *pkg, const char **why);
@@ -218,6 +232,9 @@ bool shr__page_decode(shr_pl_res_bitmap_font *f, const shr__page *p, const shr__
 shr_status shr__pages_builtin(shr__pkg *pkg);
 void shr__pages_free(shr__pkg *pkg);
 void shr__pages_schedule(shr_pl_res_bitmap_font *f);
+/* The role whose preload goes on in this pump, 0 = none. */
+int shr__preload_role(const shr_pl_res_bitmap_font *f);
+void shr__pages_preload(shr_pl_res_bitmap_font *f);
 void shr__page_done(shr__page *p, shr_status result);
 bool shr__page_due(const shr__page *p, uint64_t now);
 void shr__font_frame_end(shr_pl_res_bitmap_font *f, uint64_t frame);
@@ -227,5 +244,6 @@ shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t fr
 #define SHR_ID_VALUE 0x1FFFFFull
 #define SHR_ID_EMOJI (1ull << 23)
 #define SHR_ID_CLUSTER (1ull << 24)
+_Static_assert((SHR_ID_VALUE | SHR_ID_EMOJI | SHR_ID_CLUSTER) <= UINT32_MAX, "glyph ids fit 32 bits");
 
 #endif

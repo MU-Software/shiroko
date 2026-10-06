@@ -1,0 +1,7 @@
+{
+  "name": "zstd-source",
+  "version": "1.5.7",
+  "description": "zstd's decoder sources, for builds that compile them with their own toolchain (ESP-IDF)",
+  "homepage": "https://facebook.github.io/zstd/",
+  "license": "BSD-3-Clause OR GPL-2.0-only"
+}

@@ -1,4 +1,4 @@
-set(SHIROKO_FUZZ_TARGETS fuzz_tilemap fuzz_package fuzz_driver fuzz_compositor)
+set(SHIROKO_FUZZ_TARGETS fuzz_tilemap fuzz_package fuzz_driver fuzz_compositor fuzz_rows)
 set(SHIROKO_FUZZ_CORPUS ${CMAKE_CURRENT_SOURCE_DIR}/corpus)
 
 # fuzz_package also starts from reduced real packages for this build's cell size, zstd and stored, in the smallest
@@ -23,7 +23,8 @@ out.mkdir(parents=True, exist_ok=True)
 for method in ("zstd", "stored"):
     for role, name in enumerate(["latin", "cjk-ko", "symbols", "emoji", "nerd"]):
         data = (src / method / f"shiroko-{name}.shrf").read_bytes()
-        for mode, flags in ((0, 1), (0, 3), (0x08, 1), (0x10, 1), (0x20, 1), (0x40, 1), (0x80, 1), (0x88, 1)):
+        for mode, flags in ((0, 1), (0, 3), (0, 5), (0x08, 1), (0x08, 5), (0x10, 1), (0x20, 1), (0x20, 5), (0x40, 1),
+                            (0x40, 5), (0x80, 1), (0x88, 1)):
             (out / f"shiroko-{name}-{method}-{mode:02x}-{flags}").write_bytes(bytes([role | mode, flags]) + data)
 (out / ".stamp").touch()
 ]])
@@ -56,7 +57,7 @@ foreach(t IN LISTS SHIROKO_FUZZ_TARGETS)
   endif()
   target_link_libraries(${t} PRIVATE shiroko)
   target_include_directories(${t} SYSTEM PRIVATE ${UTHASH_INCLUDE_DIR})
-  target_include_directories(${t} PRIVATE ${PROJECT_SOURCE_DIR}/cores/shared)
+  target_include_directories(${t} PRIVATE ${PROJECT_SOURCE_DIR}/cores/shared ${PROJECT_SOURCE_DIR}/cores/compositor)
   target_compile_options(${t} PRIVATE ${SHIROKO_WARNINGS})
   if(NOT SHIROKO_FUZZ AND SHIROKO_BUILD_TESTS)
     set(dirs ${_seed_root}/${t})

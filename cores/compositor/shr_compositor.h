@@ -77,9 +77,9 @@ typedef struct shr__resolved {
 } shr__resolved;
 
 typedef struct shr__res_ops {
-    /* For a frame being built: the pixels of `id`, pinned until frame_end(frame).
+    /* For a frame being built: the pixels of `id`, pinned until frame_end(frame), in *out until the next resolve().
      * SHR_E_NOT_FOUND = draw nothing; other errors fail the frame. */
-    shr_status (*resolve)(shr__res *res, uint64_t id, uint64_t frame, shr__resolved *out);
+    shr_status (*resolve)(shr__res *res, uint64_t id, uint64_t frame, const shr__resolved **out);
     /* Exactly once per frame in which resolve() succeeded, also for failed or superseded frames. */
     void (*frame_end)(shr__res *res, uint64_t frame);
     /* Called from shr_pump(). true: provisional pixels may now resolve differently. */
@@ -97,7 +97,7 @@ struct shr__res {
     shr_context *ctx;
     uint32_t users;   /* layer commands and plugins referring to it; maintained by the compositor and plugins */
     bool dead;        /* set by the plugin when it may be freed */
-    uint64_t serial;  /* unique in the process (set by shr__res_attach): part of cache keys */
+    uint64_t serial;  /* unique in its context (set by shr__res_attach): part of cache keys */
     shr__res *next;
 };
 
@@ -130,28 +130,66 @@ enum {
     SHR__LCMD_DIM = SHR_GLYPH_DIM, /* GLYPH or FILL at half strength */
     SHR__LCMD_BOLD = SHR_GLYPH_BOLD, /* GLYPH styles, synthesized where the resource allows */
     SHR__LCMD_ITALIC = SHR_GLYPH_ITALIC,
-    SHR__LCMD_BLINK = 1u << 8 /* hidden while the blink phase is off */
+    /* GLYPH: an earlier FILL of the group, without DIM or BLINK, of colour `bg` covers `dst`, and no command
+     * between them draws into `dst` */
+    SHR__LCMD_ON_FILL = SHR_GLYPH_ON_FILL,
+    SHR__LCMD_BLINK = 1u << 7 /* hidden while the blink phase is off */
 };
 
-/* One retained layer command, in layer coordinates.
+/* One retained layer command, in the coordinates of its group.
  * FILL: `dst` <- color. GLYPH/IMAGE: resolve(res, id) placed at anchor + offset, drawn only inside
- * `dst` (the cells or the image area). CACHE_BEGIN: `dst` is the cached area, `key` its content. */
+ * `dst` (the cells or the image area). CACHE_BEGIN: `dst` is the cached area, `key` its content; the compositor sets
+ * `end`, the distance to its CACHE_END, when it takes the list.
+ * Every command sets kind, flags, dst and color; only GLYPH/IMAGE read the anchor fields, only CACHE_BEGIN `key`. */
 typedef struct shr__lcmd {
     uint8_t kind;
-    uint32_t flags;
+    uint16_t flags;
     shr_rect dst;
-    shr_point anchor;
     shr_color color;
-    shr__res *res;
-    uint64_t id;
-    uint64_t key[2];
+    union {
+        struct {
+            shr_point anchor;
+            shr_color bg; /* ON_FILL */
+            uint32_t id; /* 32 bits for every resource */
+            shr__res *res;
+        };
+        struct {
+            uint64_t key[2];
+            size_t end;
+        };
+    };
 } shr__lcmd;
 
-/* Replaces group `group` (groups draw in ascending order, commands in list order); n = 0 removes it.
- * The compositor records the bounds of the old and new commands that differ as damage and keeps
- * res->users of referenced resources. */
+/* A row command: the compact form of a layer command that row groups keep. x in cells, y in pixels of the group.
+ * GLYPH: `id` of the group's resource anchored at (x0, y0) of `dst`, `bg` with ON_FILL; FILL and CACHE_END: id and bg 0;
+ * CACHE_END: all 0 but the kind. A row's cache pair, if any, is its first and last command, its key the group's. */
+typedef struct shr__rcmd {
+    uint16_t x0, x1;
+    uint8_t y0, y1;
+    uint8_t kind, flags;
+    shr_color color;
+    uint32_t id;
+    shr_color bg;
+} shr__rcmd;
+
+/* Replaces group `group` (groups draw in ascending order, commands in list order); n = 0 removes it. Its commands
+ * are in layer coordinates. The compositor records the bounds of the old and new commands that differ as damage and
+ * keeps res->users of referenced resources. */
 shr_status shr__lyr_group_set(shr_lyr *layer, uint32_t group, const shr__lcmd *cmds, size_t n);
-shr_status shr__lyr_groups_clear(shr_lyr *layer);
+/* The same for a row group without a copy, the commands in group coordinates: layer coordinates moved up by `oy`, its
+ * GLYPHs drawn from `res`, its CACHE_BEGIN with `key`. The caller writes all n commands into shr__lyr_row_begin(layer,
+ * n) (NULL: no memory) and hands them to shr__lyr_row_commit() before the next begin. Group memory stays with the
+ * layer until shr__lyr_groups_clear(): what replaced and removed groups leave serves the groups built next (in three
+ * sizes up to the most commands asked for), so rebuilt groups allocate nothing. */
+shr__rcmd *shr__lyr_row_begin(shr_lyr *layer, size_t n);
+shr_status shr__lyr_row_commit(shr_lyr *layer, uint32_t group, int32_t oy, shr__res *res, const uint64_t key[2],
+                               shr__rcmd *cmds, size_t n);
+/* Removes all groups and their memory; the groups built next are expected to ask for up to `most` commands. */
+shr_status shr__lyr_groups_clear(shr_lyr *layer, size_t most);
+/* Groups [first, last) take ids id + shift and move down by dy pixels; those shifted out of [first, last) are removed.
+ * They lie inside `area` (layer coordinates), whose pixels move along: where the driver moves pixels cheaply and the
+ * layer covers the moved part with opaque groups, the compositor records a move instead of damage. */
+void shr__lyr_groups_shift(shr_lyr *layer, uint32_t first, uint32_t last, int32_t shift, shr_rect area, int32_t dy);
 
 /* Appends to an application layer's list between shr_lyr_cmd_begin() and shr_lyr_cmd_commit()
  * (shr_lyr_cmd_image is implemented by the image plugin through this). SHR_E_STATE outside. */

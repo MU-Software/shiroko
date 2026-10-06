@@ -1,5 +1,6 @@
-/* Compositor under random layer, image, submit, pump, output and fence events with faults (driver
- * failures and stalls, async fences, watchdog timeouts, output errors, screen changes, sparse event polling).
+/* Compositor under random layer, image, group shift (a move), submit, pump, output and fence events with faults (driver
+ * failures and stalls, async fences, watchdog timeouts, output errors, screen changes with or without bands, sparse
+ * event polling).
  * Invariants:
  *   - presented frame ids only grow; a frame ends once (accepted, failed or superseded); only accepted frames
  *     are released (exactly once) or displayed; once settled, every frame a submission reported has ended
@@ -9,12 +10,18 @@
  *   - buffer commands lead each batch with ids in 1..max_buffers, draws name registered ids (also after a failed
  *     batch, which forgets every id or first runs its buffer commands, or a reset, which forgets every id), and a
  *     driver keeping copies holds at most buffer_bytes at every REGISTER and draws what the images hold: every
- *     change reached it through an UPDATE or REGISTER
+ *     change reached it through an UPDATE or REGISTER; KEEP_RELEASE names ids in 1..max_keeps, and layers of fills
+ *     and images make no keep group
  *   - no event is dropped, even with the smallest queue polled only now and then
  *   - once settled, the presented image equals a reference raster of the layer model (z, creation order,
- *     visibility, layer clipping, images with alpha), also rotated or converted
- *   - shutdown ends every submitted frame and drains once the device and the output release everything */
+ *     visibility, layer clipping, images with alpha, moved groups), also rotated or converted, composed whole or band
+ *     by band, after moves the driver made as COPYs of the output onto itself
+ *   - shutdown ends every submitted frame and drains once the device and the output release everything
+ *   - with a frame-rate cap (every input also runs with one), frames start at least the cap apart and the settled
+ *     output still shows the model */
 #include "fuzz_common.h"
+
+#include "shr_compositor.h"
 
 #define NBUF 3
 #define NLAYERS 4
@@ -23,6 +30,7 @@
 #define MAX_FRAMES 1024
 #define NIDS 16
 #define IMAGE_BYTES (8 * 8 * 4)
+#define CAP_NS 250
 
 enum { BUF_FREE, BUF_ACQUIRED, BUF_HELD };
 enum { FRAME_NONE, FRAME_ACCEPTED, FRAME_RELEASED, FRAME_ENDED };
@@ -43,6 +51,7 @@ typedef struct mlayer {
     bool visible, building;
     mcmd cmds[NCMDS], pend[NCMDS];
     int n, np;
+    int32_t oy; /* the committed commands moved down by oy */
 } mlayer;
 
 typedef struct mimage {
@@ -54,6 +63,8 @@ typedef struct mimage {
 
 typedef struct harness {
     uint8_t bufs[NBUF][FUZZ_W * FUZZ_H * 4];
+    uint8_t band_px[2][FUZZ_W * FUZZ_H * 4];
+    shr_surface bands[2];
     uint8_t buf_state[NBUF];
     uint32_t gen[NBUF];
     uint8_t shown[FUZZ_W * FUZZ_H * 4];
@@ -88,6 +99,7 @@ typedef struct harness {
     mlayer layers[NLAYERS];
     mimage images[NIMAGES];
     uint64_t seq;
+    uint64_t cap, next_start;
 } harness;
 
 static harness h;
@@ -101,6 +113,10 @@ static uint64_t clock_fn(void *user) {
 static void trace_fn(void *user, const shr_trace_event *ev) {
     (void)user;
     if (ev->kind == SHR_TRACE_SUBMIT && ev->id < MAX_FRAMES) h.submitted[ev->id] = true;
+    if (ev->kind == SHR_TRACE_RASTER_BEGIN) {
+        FUZZ_CHECK(now >= h.next_start);
+        h.next_start = now + h.cap;
+    }
 }
 
 static int buf_index(const void *pixels) {
@@ -164,17 +180,20 @@ static size_t prologue_len(const shr_draw_cmd *cmds, size_t n) {
 /* Applies a buffer command to `t`, as a driver keeping copies does when `copy`. */
 static void apply(shr_image *t, const shr_draw_cmd *c, bool copy) {
     uint32_t k = c->buffer - 1;
+    if (c->kind == SHR_CMD_KEEP_RELEASE) {
+        FUZZ_CHECK(c->buffer >= 1 && c->buffer <= h.caps.max_keeps);
+        return;
+    }
     if (c->kind == SHR_CMD_BUFFER_RELEASE) {
         if (c->buffer && c->buffer <= NIDS) t[k] = (shr_image){0};
         return;
     }
     FUZZ_CHECK(c->buffer >= 1 && c->buffer <= h.caps.max_buffers);
     if (c->kind == SHR_CMD_BUFFER_REGISTER) {
-        FUZZ_CHECK(shr_image_validate(&c->src) == SHR_OK && c->src.byte_length <= IMAGE_BYTES);
-        t[k] = c->src;
+        FUZZ_CHECK(shr_image_ref_get(&c->src, &t[k]) == SHR_OK && t[k].byte_length <= IMAGE_BYTES);
         if (!copy) return;
         h.origin[k] = c->src.pixels;
-        memcpy(h.copies[k], c->src.pixels, c->src.byte_length);
+        memcpy(h.copies[k], c->src.pixels, t[k].byte_length);
         t[k].pixels = h.copies[k];
         uint64_t held = 0;
         for (int i = 0; i < NIDS; i++) held += t[i].byte_length;
@@ -217,11 +236,11 @@ static void see_batch(const shr_draw_cmd *cmds, size_t n) {
             see(h.origin[cmds[i].buffer - 1], m->byte_length);
         }
         apply(after, &cmds[i], false);
-        if (cmds[i].kind == SHR_CMD_BUFFER_REGISTER) see(cmds[i].src.pixels, cmds[i].src.byte_length);
+        if (cmds[i].kind == SHR_CMD_BUFFER_REGISTER) see(cmds[i].src.pixels, fuzz_span(&cmds[i].src));
     }
     for (size_t i = p; i < n; i++) {
         const shr_draw_cmd *c = &cmds[i];
-        if (c->kind == SHR_CMD_COPY || c->kind == SHR_CMD_ROTATE) see(c->src.pixels, c->src.byte_length);
+        if (c->kind == SHR_CMD_COPY || c->kind == SHR_CMD_ROTATE) see(c->src.pixels, fuzz_span(&c->src));
         if (c->kind != SHR_CMD_GLYPH && c->kind != SHR_CMD_IMAGE) continue;
         FUZZ_CHECK(c->buffer >= 1 && c->buffer <= h.caps.max_buffers);
         if (!copies()) see(after[c->buffer - 1].pixels, after[c->buffer - 1].byte_length);
@@ -251,14 +270,22 @@ static shr_status d_execute(void *user, const shr_surface *dst, const shr_draw_c
     h.pending_dst = dst, h.pending_cmds = cmds, h.pending_count = n;
     h.seen_dst = *dst;
     memcpy(h.seen_cmds, cmds, n * sizeof(*cmds));
+#ifdef FUZZ_MSAN
+    __msan_unpoison(h.seen_cmds, n * sizeof(*cmds)); /* fields a command leaves unspecified are compared as they are */
+#endif
     see_batch(cmds, n);
     return SHR_IN_PROGRESS;
 }
 
 static void complete_pending(void) {
     if (!h.pending) return;
+    static shr_draw_cmd cmds[512];
+    memcpy(cmds, h.pending_cmds, h.pending_count * sizeof(*cmds));
+#ifdef FUZZ_MSAN
+    __msan_unpoison(cmds, h.pending_count * sizeof(*cmds));
+#endif
     FUZZ_CHECK(!memcmp(&h.seen_dst, h.pending_dst, sizeof(h.seen_dst)) &&
-               !memcmp(h.seen_cmds, h.pending_cmds, h.pending_count * sizeof(*h.seen_cmds)));
+               !memcmp(h.seen_cmds, cmds, h.pending_count * sizeof(*cmds)));
     for (int k = 0; k < h.seen_srcs; k++)
         FUZZ_CHECK(hash_bytes(h.seen_src[k].pixels, h.seen_src[k].length) == h.seen_src[k].hash);
     run_batch(h.pending_dst, h.pending_cmds, h.pending_count);
@@ -346,8 +373,8 @@ static void draw_model(const shr_surface *screen, shr_color clear) {
             const mcmd *m = &l->cmds[i];
             shr_rect clip = {l->rect.x0 > 0 ? l->rect.x0 : 0, l->rect.y0 > 0 ? l->rect.y0 : 0,
                              l->rect.x1 < all.x1 ? l->rect.x1 : all.x1, l->rect.y1 < all.y1 ? l->rect.y1 : all.y1};
-            int64_t x0 = (int64_t)l->rect.x0 + m->rect.x0, y0 = (int64_t)l->rect.y0 + m->rect.y0;
-            int64_t x1 = (int64_t)l->rect.x0 + m->rect.x1, y1 = (int64_t)l->rect.y0 + m->rect.y1;
+            int64_t x0 = (int64_t)l->rect.x0 + m->rect.x0, y0 = (int64_t)l->rect.y0 + l->oy + m->rect.y0;
+            int64_t x1 = (int64_t)l->rect.x0 + m->rect.x1, y1 = (int64_t)l->rect.y0 + l->oy + m->rect.y1;
             shr_rect d = {(int32_t)(x0 > clip.x0 ? x0 : clip.x0), (int32_t)(y0 > clip.y0 ? y0 : clip.y0),
                           (int32_t)(x1 < clip.x1 ? x1 : clip.x1), (int32_t)(y1 < clip.y1 ? y1 : clip.y1)};
             if (d.x0 >= d.x1 || d.y0 >= d.y1) continue;
@@ -356,7 +383,7 @@ static void draw_model(const shr_surface *screen, shr_color clear) {
             if (m->image) {
                 const mimage *im = &h.images[m->img];
                 /* Image pixel (0, 0) sits at the command's anchor. */
-                int64_t ax = (int64_t)l->rect.x0 + m->at.x, ay = (int64_t)l->rect.y0 + m->at.y;
+                int64_t ax = (int64_t)l->rect.x0 + m->at.x, ay = (int64_t)l->rect.y0 + l->oy + m->at.y;
                 table = (shr_image){im->px, im->w, im->h, (size_t)im->w * 4, sizeof(im->px), SHR_FORMAT_RGBA8888,
                                     SHR_MEMORY_CPU};
                 c.kind = SHR_CMD_IMAGE;
@@ -377,7 +404,10 @@ static void check_model(const shr_screen_desc *sd) {
     h.async = false;
     FUZZ_CHECK(shr_submit(h.ctx) == SHR_OK);
     shr_deadline dl = {SHR_DEADLINE_NOW, 0};
-    for (int i = 0; i < 64 && (dl.kind == SHR_DEADLINE_NOW || h.pending || h.held_count); i++) {
+    for (int i = 0; i < 64 && (dl.kind == SHR_DEADLINE_NOW || (h.cap && dl.kind == SHR_DEADLINE_AT) || h.pending ||
+                                h.held_count);
+         i++) {
+        if (h.cap && dl.kind == SHR_DEADLINE_AT) now = dl.at_ns;
         complete_pending();
         while (h.held_count) release_one(false, false);
         drain_events();
@@ -399,10 +429,10 @@ static void check_model(const shr_screen_desc *sd) {
     shr_format_row_bytes(h.ofmt, h.ow, &row);
     shr_surface o = {expect, h.ow, h.oh, row, row * (size_t)h.oh, h.ofmt, 0, SHR_MEMORY_CPU, 0};
     shr_draw_cmd c = {.kind = sd->rotation ? SHR_CMD_ROTATE : SHR_CMD_COPY,
+                      .rotation = (uint8_t)sd->rotation,
                       .dst = {0, 0, h.ow, h.oh},
-                      .src = {logical, screen.width, screen.height, screen.stride, screen.byte_length, SHR_PIXEL_FORMAT,
-                              SHR_MEMORY_CPU},
-                      .rotation = sd->rotation};
+                      .src = {logical, screen.width, screen.height, (uint32_t)screen.stride, SHR_PIXEL_FORMAT,
+                              SHR_MEMORY_CPU, 0}};
     FUZZ_CHECK(shr_software_execute(&o, &c, 1, NULL, 0) == SHR_OK);
     FUZZ_CHECK(memcmp(expect, h.shown, o.byte_length) == 0);
 }
@@ -421,8 +451,9 @@ static void image_pixels(uint8_t *px, size_t n, uint8_t seed) {
     for (size_t i = 3; i < n; i += 4) px[i] = seed & 1 ? 255 : (uint8_t)(i * 11u); /* opaque or mixed alpha */
 }
 
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+static int run_input(const uint8_t *data, size_t size, uint64_t cap) {
     memset(&h, 0, sizeof(h));
+    h.cap = cap;
     now = 0;
     fuzz_reader r = {data, size};
     uint8_t setup = fr_u8(&r);
@@ -436,6 +467,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     drv.caps.max_buffers = (setup & 64) ? NIMAGES : NIDS; /* each image draws from one of its two buffers */
     drv.caps.buffer_flags = (setup & 128) ? SHR_BUFFER_COPIES : 0;
     drv.caps.buffer_bytes = (setup & 128) ? NIMAGES * IMAGE_BYTES : 0;
+    drv.caps.max_keeps = (setup & 64) ? 2 : 0;
+    drv.caps.flags = SHR_DRIVER_CHEAP_MOVE | ((setup & 65) == 65 ? SHR_DRIVER_CHEAP_STORE : 0); /* keeps, half the time */
     h.caps = drv.caps;
     shr_output out;
     shr_output_init(&out);
@@ -449,6 +482,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     cd.event_capacity = (setup & 16) ? 4 : 256;
     cd.max_unreleased_frames = 2;
     cd.image_bytes = 3 * IMAGE_BYTES + 64; /* a second buffer for some images */
+    cd.min_frame_interval_ns = cap;
     FUZZ_CHECK(shr_create(&cd, &h.ctx) == SHR_OK);
     shr_context *ctx = h.ctx;
     shr_screen_desc sd;
@@ -517,7 +551,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (l->l && shr_lyr_cmd_commit(l->l) == SHR_OK) {
                 FUZZ_CHECK(l->building);
                 memcpy(l->cmds, l->pend, sizeof(l->cmds));
-                l->n = l->np, l->np = 0, l->building = false;
+                l->n = l->np, l->np = 0, l->building = false, l->oy = 0;
             }
             break;
         case 9: {
@@ -553,9 +587,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             FUZZ_CHECK(shr_submit(ctx) == SHR_OK);
             break;
         case 13:
-        case 14:
             FUZZ_CHECK(shr_pump(ctx) == SHR_OK);
             break;
+        case 14: { /* the layer's group moves down by dy with the pixels of the whole layer, or leaves */
+            int32_t dy = fr_i8(&r) % 24;
+            if (!l->l) break;
+            shr__lyr_groups_shift(l->l, 0, 1, (arg & 0x80) != 0, (shr_rect){0, 0, l->rect.x1 - l->rect.x0,
+                                  l->rect.y1 - l->rect.y0}, dy);
+            l->oy += dy;
+            if (arg & 0x80) l->n = 0;
+            break;
+        }
         case 15: {
             static const shr_status res[] = {SHR_OK, SHR_OK, SHR_E_WOULD_BLOCK, SHR_E_DEVICE};
             h.present_result = res[arg % 4];
@@ -607,9 +649,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                                                                                   : SHR_FORMAT_RGB565)
                                          : 0;
             next.clear = SHR_RGB(arg, 2, 3);
+            next.bands = NULL, next.band_count = 0, next.band_align = 0;
             if (arg & 0x10) {
                 check_model(&sd);
                 break;
+            }
+            if (arg & 0x20) { /* 1 or 2 bands of a height that is a multiple of the alignment */
+                static const uint32_t aligns[6] = {0, 1, 2, 4, 8, 16};
+                uint8_t hb = fr_u8(&r), ab = fr_u8(&r);
+                int32_t a = aligns[ab % 6] ? (int32_t)aligns[ab % 6] : 1, bh = a * (1 + hb % (FUZZ_H / a));
+                size_t row;
+                shr_format_row_bytes(SHR_PIXEL_FORMAT, FUZZ_W, &row);
+                for (int k = 0; k < 2; k++)
+                    h.bands[k] = (shr_surface){h.band_px[k], FUZZ_W, bh, row, row * (size_t)bh, SHR_PIXEL_FORMAT, 1,
+                                               SHR_MEMORY_CPU, 0};
+                next.bands = h.bands, next.band_count = 1 + (arg >> 6 & 1), next.band_align = aligns[ab % 6];
+                next.flags = 0;
             }
             if (shr_screen_configure(ctx, &next) != SHR_OK) break;
             sd = next;
@@ -651,4 +706,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     for (int i = 0; i < NBUF; i++) FUZZ_CHECK(h.buf_state[i] == BUF_FREE);
     for (uint64_t f = 1; f <= h.last_accepted && f < MAX_FRAMES; f++) FUZZ_CHECK(h.frames[f] != FRAME_ACCEPTED);
     return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    run_input(data, size, 0);
+    return run_input(data, size, CAP_NS);
 }

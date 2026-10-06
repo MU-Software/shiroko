@@ -334,6 +334,49 @@ static const uint8_t *pending_buffer(const harness *h, uint32_t id) {
     return NULL;
 }
 
+/* With bands a frame resolves band after band, also across updates while an earlier band still runs: every band
+ * draws the buffer the frame pinned first, which no update writes; the next frame draws the new pixels. */
+TEST test_image_pinned_across_bands(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak);
+    static uint8_t band_px[2][HW * 16 * 4];
+    shr_surface bands[2];
+    for (int k = 0; k < 2; k++)
+        bands[k] = (shr_surface){band_px[k], HW, 16, HW * SCREEN_BPP, HW * 16 * SCREEN_BPP, SHR_PIXEL_FORMAT, 1, 0, 0};
+    shr_screen_desc sd;
+    shr_screen_desc_init(&sd);
+    sd.width = HW, sd.height = HH, sd.bands = bands, sd.band_count = 2;
+    ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_OK);
+    shr_pl_res_image *img;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &img), SHR_OK);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
+    ASSERT_EQ_LL(shr_lyr_cmd_image(l, img, (shr_rect){0, 0, 2, 2}, (shr_point){0, 0}), SHR_OK);
+    ASSERT_EQ_LL(shr_lyr_cmd_image(l, img, (shr_rect){0, 0, 2, 2}, (shr_point){0, 20}), SHR_OK);
+    ASSERT_EQ_LL(shr_lyr_cmd_commit(l), SHR_OK);
+    h.drv.async = true;
+    frame(ctx);
+    const uint8_t *first = pending_buffer(&h, 1);
+    static const uint8_t blue[16] = {0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255};
+    ASSERT(first && h.drv.pending_dst->pixels == band_px[0]);
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){0, 0, 2, 2}, blue, 8), SHR_OK);
+    while (h.drv.pending && h.drv.pending_dst->pixels != band_px[1]) md_complete(&h.drv), shr_pump(ctx);
+    ASSERT_EQ_LL(h.drv.pending_dst->pixels, band_px[1]);
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){0, 0, 1, 1}, blue, 8), SHR_OK);
+    while (h.drv.pending) md_complete(&h.drv), shr_pump(ctx);
+    ASSERT(h.out.presents == 1 && px(h.out.shown, 0, 0) == RED && px(h.out.shown, 0, 20) == RED);
+    frame(ctx);
+    while (h.drv.pending) md_complete(&h.drv), shr_pump(ctx);
+    ASSERT(h.out.presents == 2 && px(h.out.shown, 0, 0) == BLUE && px(h.out.shown, 0, 20) == BLUE);
+    ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
+
 /* An update while a frame reads the image goes to a second buffer: the frame in flight keeps the old pixels, the
  * next frame draws the new ones. The two buffers then take turns, each brought level before it is written. */
 TEST test_image_double_buffer(void) {
@@ -432,6 +475,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_image_update_damages_every_buffer);
     RUN_TEST(test_image_pinned_by_frames);
     RUN_TEST(test_image_double_buffer);
+    RUN_TEST(test_image_pinned_across_bands);
     RUN_TEST(test_image_second_buffer_out_of_memory);
     GREATEST_MAIN_END();
 }

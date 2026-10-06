@@ -159,7 +159,15 @@ shiroko_part(shiroko_pl_lyr_tilemap cores/pl_lyr_tilemap cores/pl_res_bitmap_fon
 shiroko_part(shiroko_port_software ports/software cores/shared)
 
 include(GNUInstallDirs)
-include(cmake/shiroko_fonts.cmake)
+# Cross builds without uv (e.g. ESP-IDF) take the Unicode tables and the built-in package from a host build's
+# generated/ directory.
+set(SHIROKO_GENERATED_DIR "" CACHE PATH "Pre-generated shr_gen_*.c (skips the uv generators and font packages)")
+if(SHIROKO_GENERATED_DIR)
+  target_sources(shiroko_shared PRIVATE ${SHIROKO_GENERATED_DIR}/shr_gen_unicode_tables.c)
+  target_sources(shiroko_pl_res_bitmap_font PRIVATE ${SHIROKO_GENERATED_DIR}/shr_gen_builtin_package.c)
+else()
+  include(cmake/shiroko_fonts.cmake)
+endif()
 
 get_property(SHIROKO_PARTS GLOBAL PROPERTY SHIROKO_PARTS)
 set(SHIROKO_OBJECTS "")

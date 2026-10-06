@@ -19,6 +19,11 @@
         }                                                                                 \
     } while (0)
 
+/* `m` as a command carries it. */
+static inline shr_image_ref img_ref(shr_image m) {
+    return (shr_image_ref){m.pixels, m.width, m.height, (uint32_t)m.stride, (uint8_t)m.format, (uint8_t)m.domain, 0};
+}
+
 /* Allocator whose allocations fail once `budget` successful ones were made; -1 never fails. */
 typedef struct fail_alloc {
     long budget;
@@ -41,6 +46,6 @@ static void fa_free(void *user, void *p, size_t size, size_t align, shr_alloc_ki
     free(p);
 }
 
-static inline shr_allocator fail_allocator(fail_alloc *f) { return (shr_allocator){f, fa_alloc, fa_free}; }
+static inline shr_allocator fail_allocator(fail_alloc *f) { return (shr_allocator){f, fa_alloc, fa_free, 0}; }
 
 #endif

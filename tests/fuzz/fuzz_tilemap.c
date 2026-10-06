@@ -1,10 +1,12 @@
-/* Tilemap under random set_cell / set_text / clear / resize / measure sequences with the built-in font.
+/* Tilemap under random set_cell / set_text / clear / scroll / resize / measure sequences with the built-in font.
  * Invariants:
  *   - measure layouts partition the text, advance cell by cell and are deterministic
  *   - set_text accepts exactly the texts measure accepts (same columns, no runs); only measure's unbounded
  *     layout can reach the coordinate limit, which these short texts stay below
- *   - every accepted state rasters, an incremental frame equals a full redraw, and every batch the caching
- *     driver draws equals the stateless path (a stale row cache hit shows up here)
+ *   - every accepted state rasters, an incremental frame (scrolled rows moved as pixels) equals a full redraw, and
+ *     every batch the driver draws
+ *     equals the stateless path, with keeps (some evicted for want of bytes) drawn from what the harness drew for
+ *     their rows: a stale keep, or one the driver does not hold, shows up here
  *   - a rejected call changes nothing on screen */
 #include "fuzz_common.h"
 
@@ -77,8 +79,10 @@ static fuzz_output out;
 static uint8_t shown[sizeof(out.pixels)], before[sizeof(out.pixels)], direct[sizeof(out.pixels)];
 
 static shr_image buffers[64]; /* the stateless path's registrations */
+#define NKEEPS 8
+static fuzz_keep keeps[NKEEPS];
 
-/* `user` is the caching driver; each batch is also drawn by shr_software_execute() into a copy. */
+/* `user` is the keeping driver; each batch is also drawn by the stateless path into a copy. */
 static shr_status checked_execute(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t count,
                                   shr_fence fence) {
     const shr_framebuffer_driver *d = user;
@@ -86,13 +90,21 @@ static shr_status checked_execute(void *user, const shr_surface *dst, const shr_
     memcpy(direct, dst->pixels, dst->byte_length);
     shr_surface copy = *dst;
     copy.pixels = direct;
-    for (size_t i = 0; i < count && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER; i++)
-        if (cmds[i].kind != SHR_CMD_BUFFER_UPDATE && cmds[i].buffer && cmds[i].buffer <= 64)
-            buffers[cmds[i].buffer - 1] = cmds[i].kind == SHR_CMD_BUFFER_REGISTER ? cmds[i].src : (shr_image){0};
-    shr_status want = shr_software_execute(&copy, cmds, count, buffers, 64);
+    for (size_t i = 0; i < count && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER; i++) {
+        uint32_t id = cmds[i].buffer;
+        if (cmds[i].kind == SHR_CMD_KEEP_RELEASE) {
+            FUZZ_CHECK(id >= 1 && id <= NKEEPS);
+            keeps[id - 1].held = false;
+        } else if (cmds[i].kind == SHR_CMD_BUFFER_REGISTER && id && id <= 64) {
+            FUZZ_CHECK(shr_image_ref_get(&cmds[i].src, &buffers[id - 1]) == SHR_OK);
+        } else if (cmds[i].kind == SHR_CMD_BUFFER_RELEASE && id && id <= 64) {
+            buffers[id - 1] = (shr_image){0};
+        }
+    }
     shr_status st = d->execute(d->user, dst, cmds, count, fence);
-    FUZZ_CHECK(st == want);
-    if (st == SHR_OK) FUZZ_CHECK(memcmp(direct, dst->pixels, dst->byte_length) == 0);
+    FUZZ_CHECK(st == SHR_OK); /* the compositor's batches are valid */
+    FUZZ_CHECK(fuzz_keep_draw(&copy, dst->pixels, cmds, count, buffers, 64, keeps, NKEEPS));
+    FUZZ_CHECK(memcmp(direct, dst->pixels, dst->byte_length) == 0);
     return st;
 }
 
@@ -118,8 +130,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     now = 0;
     memset(&out, 0, sizeof(out));
     memset(buffers, 0, sizeof(buffers));
+    for (int i = 0; i < NKEEPS; i++) keeps[i].held = false;
     shr_framebuffer_driver drv, checked;
-    FUZZ_CHECK(shr_software_driver_create(NULL, (cfg & 1) ? 1024u << (cfg >> 4) : 0, 64, &drv) == SHR_OK);
+    /* Keeping nothing, or rows of up to 64 pixels (2 or 4 KiB each) in slots of 128 << k bytes: from none to all. */
+    FUZZ_CHECK(shr_software_driver_create(NULL, 1024u << (cfg >> 4), (cfg & 1) ? NKEEPS : 0, 64, &drv) == SHR_OK);
     checked = drv;
     checked.user = &drv, checked.execute = checked_execute, checked.reset = checked_reset;
     shr_output o;
@@ -189,6 +203,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
         case 2: {
             int32_t row = fr_i8(&r), col = fr_i8(&r), nr = fr_i8(&r), nc = fr_i8(&r);
+            if (op & 8) { /* rows [row, col) by nr */
+                st = shr_pl_lyr_tilemap_scroll(layer, row, col, nr, fr_style(&r));
+                if (st == SHR_OK) FUZZ_CHECK(row >= 0 && row <= col && col <= rows);
+                break;
+            }
             st = shr_pl_lyr_tilemap_clear(layer, row, col, nr, nc, fr_style(&r));
             break;
         }

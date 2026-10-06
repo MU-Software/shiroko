@@ -64,9 +64,9 @@ typedef struct shr_blink_profile {
 
 typedef enum shr_trace_kind {
     SHR_TRACE_SUBMIT = 1,
-    SHR_TRACE_RASTER_BEGIN,   /* value0 = commands, value1 = damaged pixels */
-    SHR_TRACE_RASTER_END,
-    SHR_TRACE_CONVERT,        /* value0 = bytes read + written */
+    SHR_TRACE_RASTER_BEGIN,   /* value1 = damaged pixels */
+    SHR_TRACE_RASTER_END,     /* value0 = commands the frame's batches held */
+    SHR_TRACE_CONVERT,        /* value0 = bytes read + written; with bands once all are converted, for all */
     SHR_TRACE_PRESENT,
     SHR_TRACE_DISPLAYED,      /* value0 = output timestamp */
     SHR_TRACE_IO_BEGIN,       /* value0 = bytes */
@@ -84,9 +84,9 @@ typedef struct shr_trace_event {
 } shr_trace_event;
 
 typedef struct shr_context_desc {
-    const shr_allocator *allocator;
+    const shr_allocator *allocator; /* its flags may ask for SHR_ALLOC_HOT: memory used every frame */
     void *user; /* passed to now_ns, log and trace */
-    /* Monotonic. NULL means no timers: io_retry_ns, io_timeout_ns and the
+    /* Monotonic. NULL means no timers: io_retry_ns, io_timeout_ns, min_frame_interval_ns and the
      * driver's caps.timeout_ns must then be 0, and blinking stays visible. */
     uint64_t (*now_ns)(void *user);
     const shr_framebuffer_driver *driver;
@@ -107,6 +107,10 @@ typedef struct shr_context_desc {
      * shr_next_deadline() reports no deadline for them. */
     uint64_t io_retry_ns;
     uint64_t io_timeout_ns;       /* reads of cancellable sources; 0 = no watchdog */
+    /* Frame-rate cap: a frame starts no sooner than this after the previous one started (frames whose state the
+     * output already shows do not count); changes made meanwhile are drawn together by that frame, and
+     * shr_next_deadline() reports its start. 0 = uncapped. */
+    uint64_t min_frame_interval_ns;
     void (*log)(void *user, shr_status status, const char *message);
     void (*trace)(void *user, const shr_trace_event *event);
 } shr_context_desc;
@@ -122,7 +126,15 @@ enum { SHR_SCREEN_COMPOSITION = 1u << 0 };
 
 /* Logical screen in SHR_PIXEL_FORMAT. With a composition surface the frame is composed there and
  * converted (rotation/format) into the output; required whenever rotation != NONE or
- * output_format != SHR_PIXEL_FORMAT. */
+ * output_format != SHR_PIXEL_FORMAT, unless bands are given.
+ * Bands replace the composition: the damage in screen rows [k * h, k * h + h) (h = the bands' height) is drawn into the
+ * next of `bands` in turn, and a batch of ROTATE (COPY without rotation) commands converts what was drawn into the
+ * output, which is then tracked as without a composition. A band's commands are built once the band before ran, from
+ * the layers as they are then, into one command list allocated here. 1 or 2 app-owned surfaces in SHR_PIXEL_FORMAT,
+ * `width` wide, of one height of at most `height`, not SHR_MEMORY_DEVICE: each command reads a part of one. With
+ * `band_align` every output rect of those commands has its edges on multiples of it (more than the damage is drawn),
+ * and the band height and the screen size must be multiples of it; 0 = any. A part starts a multiple of band_align (or
+ * 1) pixels and rows into its band, so the driver's address_align must divide both steps in bytes. */
 typedef struct shr_screen_desc {
     int32_t width;
     int32_t height;
@@ -131,10 +143,14 @@ typedef struct shr_screen_desc {
     uint32_t flags;
     const shr_surface *composition; /* app-owned buffer, or NULL to allocate */
     shr_color clear;                /* under every layer */
+    const shr_surface *bands;       /* band_count surfaces, NULL without bands */
+    uint32_t band_count;            /* 0 = no bands, else 1 or 2 */
+    uint32_t band_align;
 } shr_screen_desc;
 
 shr_status shr_screen_desc_init(shr_screen_desc *desc);
-/* SHR_E_UNSUPPORTED when the driver cannot draw into or read from the composition (caps).
+/* SHR_E_UNSUPPORTED when the driver cannot draw into or read from the composition or the bands (caps).
+ * SHR_E_NO_MEMORY without memory for the composition or the band command list.
  * SHR_E_WOULD_BLOCK while the driver runs a submission or an isolated frame holds its buffers: pump and
  * retry. A frame waiting for the driver or the output is superseded. On failure the previous
  * configuration stays active. */
@@ -289,6 +305,12 @@ shr_status shr_pl_res_bitmap_font_create(shr_context *ctx, const shr_pl_res_bitm
                                          shr_pl_res_bitmap_font **out);
 /* SHR_E_STATE while a tilemap uses the font. */
 shr_status shr_pl_res_bitmap_font_destroy(shr_pl_res_bitmap_font *font);
+/* Loads the first `pages` pages of `package` (a name open() receives) from shr_pump(), opening it if needed: one page
+ * per pump while no frame waits for pages, until the page cache would have to evict. fontpack places the most used
+ * glyphs first and reports how many pages hold them ("hot"). Pages whose read cannot start are left to the frames.
+ * SHR_E_NOT_FOUND: not a package of this font; SHR_E_STATE: the font is destroyed or the context shutting down, or
+ * called from one of its callbacks. */
+shr_status shr_pl_res_bitmap_font_preload(shr_pl_res_bitmap_font *font, const char *package, uint32_t pages);
 
 typedef struct shr_activation {
     uint64_t generation;
@@ -369,7 +391,10 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
  * with SHR_TEXT_WRAP, wrapping at the last column; lines continue at column `col`. Only what lies in
  * the grid is placed: without wrap a cluster cut by the last column becomes blank cells of its style,
  * later ones are dropped; rows past the grid are dropped. Zero-width clusters occupy no cell. The whole
- * text is validated; on error nothing changes. `runs` (NULL: `style` everywhere) restyle byte ranges. */
+ * text is validated; on error nothing changes. `runs` (NULL: `style` everywhere) restyle byte ranges.
+ * The tilemap keeps the memory the cells wait in until the text is valid: 40 bytes per cell of the largest call so
+ * far (cells at most the grid's, rounded up to a power of two), so later calls placing no more cells allocate only
+ * for clusters over 12 bytes. */
 shr_status shr_pl_lyr_tilemap_set_text(shr_lyr *layer, int32_t row, int32_t col, const char *utf8, size_t length,
                                        shr_text_style style, const shr_style_run *runs, size_t run_count,
                                        uint32_t flags, shr_error_info *err);
@@ -377,6 +402,12 @@ shr_status shr_pl_lyr_tilemap_set_text(shr_lyr *layer, int32_t row, int32_t col,
  * SHR_STYLE_BG, else to blank (the tilemap background or transparent). Other style fields are ignored. */
 shr_status shr_pl_lyr_tilemap_clear(shr_lyr *layer, int32_t row, int32_t col, int32_t rows, int32_t cols,
                                     shr_text_style style);
+
+/* Moves the cells of rows [top, bottom) by n rows: up for n > 0 (rows top .. top + n - 1 leave), down for n < 0. The
+ * rows it uncovers become cells cleared to `style` as shr_pl_lyr_tilemap_clear() clears them; |n| >= bottom - top
+ * clears all of them. Moved cells keep their text and style, and the renderer moves their pixels instead of drawing
+ * them again where it can. */
+shr_status shr_pl_lyr_tilemap_scroll(shr_lyr *layer, int32_t top, int32_t bottom, int32_t n, shr_text_style style);
 
 enum {
     SHR_CLUSTER_NEWLINE = 1u << 0,
