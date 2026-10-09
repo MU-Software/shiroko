@@ -208,6 +208,15 @@ SEEDS = {
         + cell(0, 1, b"x") + scroll(0, 3, 1) + RENDER + scroll(0, 3, -9) + RENDER,
         # Fails while the layout extent misses the columns of a TAB piece that wraps (library bug, reported).
         bytes([0]) + measure(b"A\tB\t\tC", 3),
+        # clusters past the profile limits (17-65 scalars, up to 260 bytes) over styled cells, then a font switch
+        bytes([2]) + resize(3, 8) + b"".join(cell(0, c, b"D", flags=0x80, color=0x11) for c in range(6)) + RENDER
+        + cell(0, 0, "e\u0301".encode() + "\u0301".encode() * 15, flags=0x80)
+        + cell(0, 1, "\U0001D400".encode() + "\U0001D167".encode() * 16, 2, flags=0x80)
+        + cell(0, 3, "a".encode() + "\u20d7".encode() * 33, flags=0x80)
+        + cell(0, 4, "e".encode() + "\u0301".encode() * 64, 2, flags=0x80) + RENDER
+        + cell(0, 4, "e".encode() + "\u0301".encode() * 64, 2, flags=0x80) + resize(3, 8, 1) + RENDER
+        + text(1, 0, ("x" + "e" + "\u0301" * 20 + "y" + "\U0001D400" + "\U0001D167" * 64).encode()) + RENDER
+        + measure(("a" + "\u20d7" * 100 + "b").encode(), 8) + measure(("e" + "\u0301" * 16).encode(), 1),
     ],
     "fuzz_driver": [
         bytes([0, 23, 19, 0, 1]) + batch(fill((0, 0, 24, 20)), fill((2, 2, 10, 10), dim=1)),

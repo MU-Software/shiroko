@@ -272,14 +272,19 @@ TEST invalid_utf8_and_controls_report_byte_offsets(void) {
     PASS();
 }
 
-TEST clusters_longer_than_the_profile_limit_fail(void) {
+TEST clusters_longer_than_the_profile_limit_are_replacements(void) {
     char zalgo[2 + 16 * 2];
     zalgo[0] = 'A', zalgo[1] = 'e';
     for (int i = 0; i < 16; i++) zalgo[2 + 2 * i] = (char)0xCC, zalgo[3 + 2 * i] = (char)0x81;
-    shr_error_info err;
-    ASSERT_EQ_LL(measure_status(zalgo, sizeof(zalgo) - 2, &err), SHR_OK); /* 16 scalars */
-    ASSERT_EQ_LL(measure_status(zalgo, sizeof(zalgo), &err), SHR_E_LIMIT);
-    ASSERT_EQ_LL(err.byte_offset, 1);
+    ASSERT_EQ_LL(measure_status(zalgo, sizeof(zalgo) - 2, NULL), SHR_OK); /* 16 scalars */
+    ASSERT_EQ_LL(ext.clusters, 2);
+    ASSERT(!(cl[1].flags & SHR_CLUSTER_REPLACEMENT));
+    ASSERT_EQ_LL(measure_status(zalgo, sizeof(zalgo), NULL), SHR_OK);
+    ASSERT_EQ_LL(ext.clusters, 2);
+    ASSERT_EQ_LL(cl[1].byte_offset, 1);
+    ASSERT_EQ_LL(cl[1].byte_length, sizeof(zalgo) - 1);
+    ASSERT_EQ_LL(cl[1].cells, 1);
+    ASSERT(cl[1].flags & SHR_CLUSTER_REPLACEMENT);
     PASS();
 }
 
@@ -563,6 +568,7 @@ TEST set_cell_validates_placed_input(void) {
     for (int i = 0; i < 16; i++) many[1 + 2 * i] = (char)0xCC, many[2 + 2 * i] = (char)0x81;
     char big[65];
     memset(big, 'a', sizeof(big));
+    big[64] = 0x1B;
     shr_lyr *l = open_grid(3, 8, NULL);
     ASSERT_EQ_LL(set_cell(l, 0, 0, "Z", 1, plain), SHR_OK);
     const struct {
@@ -575,7 +581,8 @@ TEST set_cell_validates_placed_input(void) {
         {0, 0, NULL, 1, 1, 0, SHR_E_INVALID_ARG},
         {0, 0, "A", 1, 0, 0, SHR_E_INVALID_ARG},
         {0, 0, "A", 1, 1, 1u << 8, SHR_E_UNKNOWN_STYLE},
-        {0, 0, big, 65, 1, 0, SHR_E_LIMIT},
+        {0, 0, big, ((size_t)1 << 20) + 1, 1, 0, SHR_E_LIMIT},
+        {0, 0, big, 65, 1, 0, SHR_E_CONTROL_CHAR}, /* checked as a whole past the cell limit too */
         {0, 0, "A", 1, SHR_MAX_SPAN + 1, 0, SHR_E_LIMIT},
         {-1, 0, "A", 1, 1, 0, SHR_E_INVALID_ARG},
         {3, 0, "A", 1, 1, 0, SHR_E_INVALID_ARG},
@@ -589,7 +596,6 @@ TEST set_cell_validates_placed_input(void) {
         {0, 0, "\x1F", 1, 1, 0, SHR_E_CONTROL_CHAR},
         {0, 0, "\x80", 1, 1, 0, SHR_E_INVALID_UTF8},
         {0, 0, "\xC2\x85", 2, 1, 0, SHR_E_CONTROL_CHAR},
-        {0, 0, many, 33, 1, 0, SHR_E_LIMIT}, /* the same cluster limit as set_text and measure */
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         shr_text_style s = {WHITE, 0, cases[i].flags};
@@ -598,7 +604,10 @@ TEST set_cell_validates_placed_input(void) {
     }
     ASSERT_STR_EQ(row_text(l, 0), "Z.......");
 
-    ASSERT_EQ_LL(measure_status(many, 33, NULL), SHR_E_LIMIT);
+    ASSERT_EQ_LL(measure_status(many, 33, NULL), SHR_OK); /* the same cluster rule as set_text and measure */
+    ASSERT(cl[0].flags & SHR_CLUSTER_REPLACEMENT);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 2, 0, many, 33, 1, plain), SHR_OK);
+    ASSERT_STR_EQ(row_text(l, 2), "*.......");
     char full[64]; /* 16 scalars in 64 bytes: both limits */
     for (int i = 0; i < 16; i++) memcpy(full + 4 * i, "\xF0\x9F\x98\x80", 4);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, 0, full, 64, 1, on_blue), SHR_OK);
@@ -612,6 +621,91 @@ TEST set_cell_validates_placed_input(void) {
     ASSERT_EQ_LL(cmd(l, 0, 0)->dst.x1, 3 * CW);
     ASSERT_EQ_LL(set_cell(l, 1, 0, "A", 8, plain), SHR_OK);
     ASSERT_STR_EQ(row_text(l, 1), "A-------");
+    close_grid(l);
+    PASS();
+}
+
+/* The glyph id drawn from column col of a row, or -1. */
+static long long glyph_at(const shr_lyr *l, int32_t row, int32_t col, shr_color *bg) {
+    for (size_t i = 0; i < ncmds(l, row); i++) {
+        const shr__lcmd *c = cmd(l, row, i);
+        if (c->kind != SHR__LCMD_GLYPH || c->dst.x0 / CW != col) continue;
+        if (bg) *bg = c->bg;
+        return (long long)(c->id & (SHR_ID_VALUE | SHR_ID_EMOJI | SHR_ID_CLUSTER));
+    }
+    return -1;
+}
+
+static size_t long_cluster(char *out, const char *base, const char *mark, int marks) {
+    size_t n = strlen(base), m = strlen(mark);
+    memcpy(out, base, n);
+    for (int i = 0; i < marks; i++) memcpy(out + n + (size_t)i * m, mark, m);
+    return n + (size_t)marks * m;
+}
+
+/* Past the profile limits a cluster still replaces what its cells held: set_cell, set_text and a font switch draw
+ * U+FFFD on the new style, and measure reports it as a replacement. */
+TEST long_clusters_draw_a_replacement(void) {
+    static const struct {
+        const char *base, *mark;
+        int marks;
+    } cases[] = {
+        {"e", "\xCC\x81", 16},                         /* 17 scalars, 33 bytes */
+        {"a", "\xE2\x83\x97", 21},                     /* 22 scalars, 64 bytes */
+        {"e", "\xCC\x81", 32},                         /* 33 scalars, 65 bytes */
+        {"a", "\xE2\x83\x97", 33},                     /* 34 scalars, 100 bytes */
+        {"e", "\xCC\x81", 64},                         /* 65 scalars, 129 bytes */
+        {"\xF0\x9D\x90\x80", "\xF0\x9D\x85\xA7", 16},  /* 17 scalars, 68 bytes */
+        {"\xF0\x9D\x90\x80", "\xF0\x9D\x85\xA7", 64},  /* 65 scalars, 260 bytes: Ghostty's longest */
+    };
+    const shr_text_style on_red = {WHITE, RED, SHR_STYLE_BG};
+    shr_lyr *l = open_grid(2, 8, NULL);
+    char s[260];
+    shr_color bg;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t len = long_cluster(s, cases[i].base, cases[i].mark, cases[i].marks);
+        for (uint32_t span = 1; span <= 2; span++)
+            for (int32_t col = 0; col <= 8 - (int32_t)span; col += 8 - (int32_t)span) { /* first and last cell */
+                ASSERT_EQ_LL(set_cell(l, 0, col, "D", span, on_red), SHR_OK);
+                ASSERT_EQ_LL(glyph_at(l, 0, col, NULL), 'D');
+                ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, col, s, len, span, on_blue), SHR_OK);
+                ASSERT_EQ_LL(glyph_at(l, 0, col, &bg), 0xFFFD);
+                ASSERT_EQ_LL(bg, BLUE);
+                ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, col, s, len, span, on_blue), SHR_OK); /* unchanged */
+                ASSERT_EQ_LL(glyph_at(l, 0, col, NULL), 0xFFFD);
+            }
+        ASSERT_EQ_LL(set_cell(l, 1, 0, "D", 1, on_red), SHR_OK);
+        shr_error_info err;
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_text(l, 1, 0, s, len, on_blue, NULL, 0, 0, &err), SHR_OK);
+        ASSERT_EQ_LL(glyph_at(l, 1, 0, &bg), 0xFFFD);
+        ASSERT_EQ_LL(bg, BLUE);
+        ASSERT_EQ_LL(measure_ex(s, len, 8, 0, NULL), SHR_OK);
+        ASSERT_EQ_LL(ext.clusters, 1);
+        ASSERT_EQ_LL(cl[0].byte_length, len);
+        ASSERT_EQ_LL(cl[0].cells, 1);
+        ASSERT(cl[0].flags & SHR_CLUSTER_REPLACEMENT);
+    }
+    /* The texts the cells keep give the same glyph after a font switch. */
+    size_t len = long_cluster(s, "e", "\xCC\x81", 16);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, 0, s, len, 1, on_blue), SHR_OK);
+    len = long_cluster(s, "\xF0\x9D\x90\x80", "\xF0\x9D\x85\xA7", 16);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, 1, s, len, 1, on_blue), SHR_OK);
+    len = long_cluster(s, "\xF0\x9D\x90\x80", "\xF0\x9D\x85\xA7", 64);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, 2, s, len, 2, on_blue), SHR_OK);
+    len = long_cluster(s, "a", "\xE2\x83\x97", 33);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_text(l, 1, 0, s, len, on_blue, NULL, 0, 0, NULL), SHR_OK);
+    shr_pl_res_bitmap_font_desc fd;
+    shr_pl_res_bitmap_font_desc_init(&fd);
+    fd.open = font_dir_open;
+    shr_pl_res_bitmap_font *f2;
+    ASSERT_EQ_LL(shr_pl_res_bitmap_font_create(H.ctx, &fd, &f2), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(l, f2, 2, 8, NULL), SHR_OK);
+    ASSERT_EQ_LL(glyph_at(l, 0, 0, NULL), 0xFFFD);
+    ASSERT_EQ_LL(glyph_at(l, 0, 1, NULL), 0xFFFD);
+    ASSERT_EQ_LL(glyph_at(l, 0, 2, NULL), 0xFFFD);
+    ASSERT_EQ_LL(glyph_at(l, 1, 0, NULL), 0xFFFD);
+    ASSERT_EQ_LL(shr_pl_res_bitmap_font_destroy(H.font), SHR_OK);
+    H.font = f2;
     close_grid(l);
     PASS();
 }
@@ -1485,7 +1579,7 @@ int main(int argc, char **argv) {
     RUN_TEST(tab_spaces_continue_across_a_wrap);
     RUN_TEST(wrap_errors_without_room);
     RUN_TEST(invalid_utf8_and_controls_report_byte_offsets);
-    RUN_TEST(clusters_longer_than_the_profile_limit_fail);
+    RUN_TEST(clusters_longer_than_the_profile_limit_are_replacements);
     RUN_TEST(measure_rejects_bad_arguments);
     RUN_TEST(measure_fills_up_to_capacity);
     RUN_TEST(coordinates_stop_at_the_limit);
@@ -1496,6 +1590,7 @@ int main(int argc, char **argv) {
     RUN_TEST(cluster_glyphs_follow_a_font_switch);
     RUN_TEST(texts_sharing_a_memo_slot_keep_their_glyphs);
     RUN_TEST(set_cell_validates_placed_input);
+    RUN_TEST(long_clusters_draw_a_replacement);
     RUN_TEST(set_cell_clears_the_wide_cells_it_overlaps);
     RUN_TEST(set_text_continues_lines_at_the_start_column);
     RUN_TEST(set_text_drops_what_leaves_the_grid);

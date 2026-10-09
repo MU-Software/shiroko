@@ -11,10 +11,19 @@
 #define SHR_MAX_SPAN 256u
 #define SHR_MAX_GRID (1 << 15)
 #define SHR_MAX_LAYOUT_COORD (1 << 20)
+#define SHR_REPLACEMENT_UTF8 "\xEF\xBF\xBD"
 
 const char *shr__utf8_next(const uint8_t *s, size_t len, size_t *pos, uint32_t *cp);
 
 static inline bool shr__is_control(uint32_t cp) { return cp < 0x20 || (cp >= 0x7F && cp <= 0x9F); }
+
+/* A cluster of n scalars whose first ones (up to the profile limit) are in cps: past the limit it is drawn as U+FFFD
+ * in the cells its first scalars take. */
+static inline void shr__classify_cluster(const uint32_t *cps, size_t n, shr__cluster_class *out) {
+    bool over = n > shr__cluster_max_scalars;
+    shr__classify(cps, over ? shr__cluster_max_scalars : n, out);
+    if (over && out->cells) *out = (shr__cluster_class){out->cells, SHR_CLUSTER_REPLACEMENT, SHR_GLYPH_REPLACEMENT, 0};
+}
 
 static inline shr_status shr__style_check(const shr_text_style *s, shr_error_info *err, size_t item) {
     if (s->flags & ~SHR_STYLE_KNOWN_FLAGS) return shr__fail(err, SHR_E_UNKNOWN_STYLE, 0, item, "unknown style flag");

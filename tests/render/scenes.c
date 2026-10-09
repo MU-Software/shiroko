@@ -173,12 +173,12 @@ static shr_status combining(stage *s) {
     };
     shr_lyr *l = stage_grid(s, 1, cells(1, 1, 38, (int32_t)N(rows)), NULL);
     for (size_t i = 0; i < N(rows); i++) stage_text(s, l, (int32_t)i, 0, rows[i], plain, 0);
-    /* More scalars than one cluster may hold. */
+    /* More scalars than one cluster may hold: U+FFFD. */
     char big[128] = "x";
     for (int i = 0; i < 20; i++) strcat(big, "́");
     shr_error_info err;
     if (l)
-        stage_expect(s, shr_pl_lyr_tilemap_set_text(l, 0, 30, big, strlen(big), plain, NULL, 0, 0, &err), SHR_E_LIMIT,
+        stage_expect(s, shr_pl_lyr_tilemap_set_text(l, 0, 30, big, strlen(big), plain, NULL, 0, 0, &err), SHR_OK,
                      "cluster over the profile limit");
     return s->st;
 }

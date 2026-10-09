@@ -143,19 +143,18 @@ shr_status shr__layout(const shr__layout_in *in, int32_t *out_rows, int32_t *out
                 pending = true;
                 break;
             }
-            /* The generator keeps the byte limit at 4 bytes per scalar or more. */
-            if (n == shr__cluster_max_scalars)
-                return shr__fail(err, SHR_E_LIMIT, boff, SIZE_MAX, "cluster exceeds profile length limit");
-            cps[n++] = next;
+            if (n < shr__cluster_max_scalars) cps[n] = next;
+            n++;
         }
         size_t blen = (pending ? next_off : pos) - boff;
         if ((st = edges_reach(in, &edge, boff, err)) != SHR_OK) return st;
         while (cursor < in->run_count && in->runs[cursor].byte_end <= boff) cursor++;
-        shr__piece p = {boff, blen, 0, 0, 0, 0, 0, cps, n, NULL};
+        size_t kept = n < shr__cluster_max_scalars ? n : shr__cluster_max_scalars;
+        shr__piece p = {boff, blen, 0, 0, 0, 0, 0, cps, kept, NULL};
         p.style = cursor < in->run_count && in->runs[cursor].byte_start <= boff ? (uint32_t)cursor + 1 : 0;
         bool nl = cps[0] == '\n' || cps[0] == '\r', tab = cps[0] == '\t';
         shr__cluster_class cls = {0};
-        if (!nl && !tab) shr__classify(cps, n, &cls);
+        if (!nl && !tab) shr__classify_cluster(cps, n, &cls);
         if (in->wrap && (tab || cls.cells > 0)) {
             if (in->avail_cols <= 0) return shr__fail(err, SHR_E_WRAP_NO_SPACE, boff, SIZE_MAX, "no columns available");
             if (cls.cells > in->avail_cols)

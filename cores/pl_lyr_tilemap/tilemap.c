@@ -84,17 +84,19 @@ static shr__cell head(shr_text_style style, uint32_t glyph, size_t len, uint32_t
                        has_glyph};
 }
 
-/* Validates one cluster as set_cell receives it. */
-static shr_status cluster_decode(const char *utf8, size_t len, uint32_t *cps, size_t *n) {
+/* Validates one cluster as set_cell receives it and classifies it; cps keeps its first scalars, n counts them all. */
+static shr_status cluster_decode(const char *utf8, size_t len, uint32_t *cps, size_t *n, shr__cluster_class *cls) {
     size_t pos = 0;
     *n = 0;
     while (pos < len) {
         uint32_t cp;
         if (shr__utf8_next((const uint8_t *)utf8, len, &pos, &cp)) return SHR_E_INVALID_UTF8;
         if (shr__is_control(cp)) return SHR_E_CONTROL_CHAR;
-        if (*n == shr__cluster_max_scalars) return SHR_E_LIMIT;
-        cps[(*n)++] = cp;
+        if (*n < shr__cluster_max_scalars) cps[*n] = cp;
+        ++*n;
     }
+    shr__classify_cluster(cps, *n, cls);
+    if (*n > shr__cluster_max_scalars) *n = shr__cluster_max_scalars;
     return SHR_OK;
 }
 
@@ -307,8 +309,7 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
                 uint32_t cps[SHR_CLUSTER_SCALARS];
                 size_t n;
                 shr__cluster_class cls;
-                cluster_decode(cell_text(d), d->len, cps, &n); /* validated when it was set */
-                shr__classify(cps, n, &cls);
+                cluster_decode(cell_text(d), d->len, cps, &n, &cls); /* validated when it was set */
                 st = cell_glyph(font, d, cps, n, &cls);
             }
         }
@@ -359,8 +360,15 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
     if (st != SHR_OK) return st;
     if ((length && !utf8) || span == 0) return SHR_E_INVALID_ARG;
     if (style.flags & ~SHR_STYLE_KNOWN_FLAGS) return SHR_E_UNKNOWN_STYLE;
-    if (length > shr__cluster_max_bytes || span > SHR_MAX_SPAN) return SHR_E_LIMIT;
+    if (length > SHR_MAX_TEXT_BYTES || span > SHR_MAX_SPAN) return SHR_E_LIMIT;
     if (row < 0 || row >= t->rows || col < 0 || (int64_t)col + span > t->cols) return SHR_E_INVALID_ARG;
+    uint32_t cps[SHR_CLUSTER_SCALARS];
+    size_t n;
+    shr__cluster_class cls;
+    if (length > shr__cluster_max_bytes) { /* past the scalar limit too: the cell keeps U+FFFD */
+        if ((st = cluster_decode(utf8, length, cps, &n, &cls)) != SHR_OK) return st;
+        utf8 = SHR_REPLACEMENT_UTF8, length = 3;
+    }
     uint64_t key = 0, was;
     shr__memo *m = NULL;
     if (length && length <= 8) {
@@ -387,12 +395,8 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
         memcpy(e->text, &key, sizeof(key));
         return SHR_OK;
     }
-    uint32_t cps[SHR_CLUSTER_SCALARS];
-    size_t n;
-    shr__cluster_class cls;
     shr__cell e;
-    if ((st = cluster_decode(utf8, length, cps, &n)) != SHR_OK) return st;
-    shr__classify(cps, n, &cls);
+    if ((st = cluster_decode(utf8, length, cps, &n, &cls)) != SHR_OK) return st;
     if ((st = cell_make(t, utf8, length, span, style, cps, n, &cls, &e)) != SHR_OK) return st;
     if (m) *m = (shr__memo){key, e.glyph, (uint8_t)length, e.has_glyph};
     t->long_text |= length > CELL_INLINE;
@@ -414,15 +418,16 @@ static shr_status text_emit(void *user, const shr__piece *p) {
     shr__tilemap *t = k->t;
     int32_t r = k->row + p->row, c = k->col + p->column;
     shr_text_style s = p->style ? k->runs[p->style - 1].style : k->style;
-    bool cut = !p->cls || c + p->cells > t->cols;
+    /* Past the byte limit also past the scalar limit (the generator keeps 4 bytes per scalar or more): a replacement. */
+    bool cut = !p->cls || c + p->cells > t->cols, over = p->byte_length > shr__cluster_max_bytes;
     int32_t n = cut ? (p->cells < t->cols - c ? p->cells : t->cols - c) : p->cells > 0;
     for (int32_t i = 0; i < n; i++) {
         shr__placed *d = shr__vec_push(&t->placed, &t->al);
         if (!d) return SHR_E_NO_MEMORY;
         *d = (shr__placed){r, c + i, blank(s)};
         shr_status st = cut ? SHR_OK
-                            : cell_make(t, k->utf8 + p->byte_offset, p->byte_length, (uint32_t)p->cells, s, p->cps, p->n,
-                                        p->cls, &d->cell);
+                            : cell_make(t, over ? SHR_REPLACEMENT_UTF8 : k->utf8 + p->byte_offset, over ? 3 : p->byte_length,
+                                        (uint32_t)p->cells, s, p->cps, p->n, p->cls, &d->cell);
         if (st != SHR_OK) {
             t->placed.len--;
             return st;

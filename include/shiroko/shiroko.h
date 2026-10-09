@@ -361,7 +361,7 @@ shr_status shr_pl_lyr_tilemap_profile_get(shr_text_profile_info *out);
 
 typedef struct shr_text_limits {
     size_t max_text_bytes;
-    uint32_t max_cell_bytes;   /* one cluster (set_cell, set_text, measure): the profile's cluster limits */
+    uint32_t max_cell_bytes;   /* one cluster: the profile's limits; longer clusters draw U+FFFD (SHR_CLUSTER_REPLACEMENT) */
     uint32_t max_cell_scalars;
     uint32_t max_span;
     int32_t max_rows;
@@ -378,14 +378,16 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
                                      const shr_color *background);
 /* One cluster as the VT engine placed it: never re-segmented, re-measured or combined. It occupies
  * `span` cells from (row, col); cells it overlaps are cleared. Empty UTF-8 draws background and
- * decorations only. */
+ * decorations only. A cluster past the profile's limits (shr_text_limits) draws U+FFFD; past max_cell_bytes the cell
+ * keeps only U+FFFD. */
 shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col, const char *utf8, size_t length,
                                        uint32_t span, shr_text_style style);
 /* Text laid out by the renderer from (row, col) as shr_pl_lyr_tilemap_measure() lays it out in
  * `cols - col` columns: Unicode clusters and widths, LF/CR/CRLF, TAB stops counted from `col` and,
  * with SHR_TEXT_WRAP, wrapping at the last column; lines continue at column `col`. Only what lies in
  * the grid is placed: without wrap a cluster cut by the last column becomes blank cells of its style,
- * later ones are dropped; rows past the grid are dropped. Zero-width clusters occupy no cell. The whole
+ * later ones are dropped; rows past the grid are dropped. Zero-width clusters occupy no cell; clusters past the
+ * profile's limits take the cells of their first max_cell_scalars scalars and draw U+FFFD as in set_cell. The whole
  * text is validated; on error nothing changes. `runs` (NULL: `style` everywhere) restyle byte ranges.
  * The tilemap keeps the memory the cells wait in until the text is valid: 40 bytes per cell of the largest call so
  * far (cells at most the grid's, rounded up to a power of two), so later calls placing no more cells allocate only
