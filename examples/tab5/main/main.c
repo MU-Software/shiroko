@@ -557,7 +557,8 @@ static const shr_software_copier p4_copier = {.copy = keep_copy, .wait = keep_wa
 /* ===== Moves: a COPY of the frame buffer onto itself, on the DMA2D ===== */
 
 /* The DMA2D moves a window onto an overlapping one toward lower addresses right, toward higher ones only by less than
- * its burst along a row (measured, not documented): the boot self-test finds how far one copy goes (up_max pixels).
+ * its burst along a row (measured, not documented; a burst or more can pass the self-test yet go wrong while the CPU
+ * writes PSRAM): the boot self-test finds how far one copy goes below a burst (up_max pixels).
  * Farther along a row, the window moves in columns as wide as the move, from the far end on, each started once the
  * one before is done; other moves take two copies through `tmp`. A copy runs in TAB5_MOVE_CHUNKS runs of rows, which
  * dma_mbps spaces out. Moves start once the rotations queued before them are done. */
@@ -652,7 +653,7 @@ static void move_setup(void) {
         for (int rep = 0; rep < 3; rep++) ok &= (t = move_try(s, MOVE_ONE, 0)) >= 0 && move_try(s, MOVE_ONE, CH) >= 0;
         printf(" %+ld %s", (long)s, ok ? "ok" : "WRONG");
         if (ok) printf(" %.2f ms", (double)t / 1000);
-        if (s > 0 && ok && !gap) mv.up_max = s;
+        if (s > 0 && ok && !gap && s * 2 < DMA_BURST) mv.up_max = s;
         gap |= s > 0 && !ok;
         down &= s > 0 || ok;
     }
