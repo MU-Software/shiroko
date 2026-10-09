@@ -50,16 +50,11 @@ typedef struct shr_output {
 
 shr_status shr_output_init(shr_output *output);
 
-typedef enum shr_blink_restart {
-    SHR_BLINK_RESTART_NONE = 0,
-    SHR_BLINK_RESTART_ON_SUBMIT /* phase restarts (visible) at the next shr_submit() */
-} shr_blink_restart;
-
+/* The phase follows the clock alone; shr_submit() does not restart it. */
 typedef struct shr_blink_profile {
     uint64_t interval_ns; /* 0 = never blinks (always visible) */
     uint64_t epoch_ns;
     bool start_visible;
-    shr_blink_restart restart;
 } shr_blink_profile;
 
 typedef enum shr_trace_kind {

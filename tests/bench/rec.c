@@ -188,7 +188,7 @@ static size_t header(uint8_t *h, const rec_profile *p, const shr_driver_caps *k,
                            s->band_count, s->band_align};
     size_t o = 60;
     for (size_t i = 0; i < sizeof(sv) / sizeof(sv[0]); i++, o += 4) rec_put32(h + o, sv[i]);
-    const uint64_t cv[] = {c->blink.interval_ns, c->blink.epoch_ns, c->blink.start_visible, c->blink.restart,
+    const uint64_t cv[] = {c->blink.interval_ns, c->blink.epoch_ns, c->blink.start_visible, 0 /* was blink restart */,
                            c->event_capacity, c->max_unreleased_frames, c->max_commands, c->max_reads,
                            c->page_cache_bytes, c->image_bytes, c->io_retry_limit, c->io_retry_ns, c->io_timeout_ns,
                            c->min_frame_interval_ns, k->domains, k->address_align, k->stride_align,
@@ -340,7 +340,7 @@ shr_status rec_header_read(const uint8_t *rec, size_t len, rec_header *out) {
     shr_context_desc *c = &out->context;
     shr_driver_caps *k = &out->caps;
     shr_context_desc_init(c);
-    c->blink = (shr_blink_profile){v[0], v[1], v[2] != 0, (shr_blink_restart)v[3]};
+    c->blink = (shr_blink_profile){v[0], v[1], v[2] != 0}; /* v[3] (a removed blink restart) is ignored */
     c->event_capacity = (uint32_t)v[4], c->max_unreleased_frames = (uint32_t)v[5], c->max_commands = (uint32_t)v[6];
     c->max_reads = (uint32_t)v[7], c->page_cache_bytes = v[8], c->image_bytes = v[9], c->io_retry_limit = (uint32_t)v[10];
     c->io_retry_ns = v[11], c->io_timeout_ns = v[12], c->min_frame_interval_ns = v[13];

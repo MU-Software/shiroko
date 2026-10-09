@@ -212,7 +212,7 @@ static shr_status run_open(run *r, const backend *b, const scene *sc, int page) 
     shr_context_desc_init(&cd);
     cd.user = r, cd.now_ns = scene_clock, cd.log = on_log;
     cd.driver = &r->drv, cd.output = &output;
-    cd.blink = (shr_blink_profile){BLINK_NS, 0, true, SHR_BLINK_RESTART_NONE};
+    cd.blink = (shr_blink_profile){BLINK_NS, 0, true};
     cd.max_commands = 1u << 20, cd.page_cache_bytes = 64u << 20, cd.image_bytes = 64u << 20;
     cd.io_retry_ns = cd.io_timeout_ns = 0;
     if (!stage_ok(s, shr_create(&cd, &s->ctx), "create")) return s->st;

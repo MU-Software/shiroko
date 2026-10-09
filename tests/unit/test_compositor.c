@@ -75,7 +75,7 @@ static void tweak_oom(shr_context_desc *d, shr_framebuffer_driver *drv) {
 
 static void tweak_blink(shr_context_desc *d, shr_framebuffer_driver *drv) {
     tweak_rec(d, drv);
-    d->blink = (shr_blink_profile){100 * MS, 0, true, SHR_BLINK_RESTART_NONE};
+    d->blink = (shr_blink_profile){100 * MS, 0, true};
 }
 
 static void tweak_timeout(shr_context_desc *d, shr_framebuffer_driver *drv) {
@@ -287,7 +287,7 @@ TEST test_create_rejects_invalid_descriptors(void) {
     ASSERT_EQ_LL(shr_create(&d, NULL), SHR_E_INVALID_ARG);
     fail_alloc f = {-1, 0};
     const shr_allocator half[3] = {{&f, fa_alloc, NULL, 0}, {&f, NULL, fa_free, 0}, {&f, fa_alloc, fa_free, 1}};
-    for (int i = 0; i < 22; i++) {
+    for (int i = 0; i < 21; i++) {
         shr_context_desc dd = d;
         shr_framebuffer_driver drv = h.driver;
         shr_output o = out;
@@ -304,21 +304,20 @@ TEST test_create_rejects_invalid_descriptors(void) {
         case 8: dd.event_capacity = 1; break;
         case 9: dd.event_capacity = dd.max_unreleased_frames + 1; break;
         case 10: dd.max_reads = 0; break;
-        case 11: dd.blink.restart = (shr_blink_restart)(SHR_BLINK_RESTART_ON_SUBMIT + 1); break;
-        case 12: o.timestamp = (shr_timestamp_kind)(SHR_TIMESTAMP_COMPOSITOR + 1); break;
-        case 13: o.flags = 1u << 2; break;
+        case 11: o.timestamp = (shr_timestamp_kind)(SHR_TIMESTAMP_COMPOSITOR + 1); break;
+        case 12: o.flags = 1u << 2; break;
         /* Without a clock no timer could ever expire. */
-        case 14: dd.now_ns = NULL, dd.io_timeout_ns = 0; break;
-        case 15: dd.now_ns = NULL, dd.io_retry_ns = 0; break;
-        case 16: dd.now_ns = NULL, dd.io_retry_ns = dd.io_timeout_ns = 0, drv.caps.timeout_ns = 1; break;
-        case 17: dd.now_ns = NULL, dd.io_retry_ns = dd.io_timeout_ns = 0, dd.min_frame_interval_ns = 1; break;
-        case 18: dd.allocator = &half[0]; break;
-        case 19: dd.allocator = &half[1]; break;
-        case 20: dd.allocator = &half[2]; break; /* an unknown flag */
+        case 13: dd.now_ns = NULL, dd.io_timeout_ns = 0; break;
+        case 14: dd.now_ns = NULL, dd.io_retry_ns = 0; break;
+        case 15: dd.now_ns = NULL, dd.io_retry_ns = dd.io_timeout_ns = 0, drv.caps.timeout_ns = 1; break;
+        case 16: dd.now_ns = NULL, dd.io_retry_ns = dd.io_timeout_ns = 0, dd.min_frame_interval_ns = 1; break;
+        case 17: dd.allocator = &half[0]; break;
+        case 18: dd.allocator = &half[1]; break;
+        case 19: dd.allocator = &half[2]; break; /* an unknown flag */
         default: dd.max_reads = 0x10000; break;
         }
         ctx = (shr_context *)&h;
-        ASSERT_EQ_LL(shr_create(&dd, &ctx), i < 21 ? SHR_E_INVALID_ARG : SHR_E_LIMIT);
+        ASSERT_EQ_LL(shr_create(&dd, &ctx), i < 20 ? SHR_E_INVALID_ARG : SHR_E_LIMIT);
         ASSERT(ctx == NULL);
     }
     d.max_reads = 0xFFFF, d.event_capacity = d.max_unreleased_frames + 2;
@@ -1757,33 +1756,28 @@ TEST test_blink_phase(void) {
     PASS();
 }
 
-static void tweak_blink_restart(shr_context_desc *d, shr_framebuffer_driver *drv) {
-    tweak_blink(d, drv);
-    d->blink.restart = SHR_BLINK_RESTART_ON_SUBMIT;
-}
-
-TEST test_blink_restarts_on_submit(void) {
+/* Output submitted every 33 ms does not hold the phase: it changes every 100 ms of the clock. */
+TEST test_blink_ignores_output(void) {
     harness h;
-    shr_context *ctx = harness_open(&h, PRESERVED, tweak_blink_restart);
-    shr_lyr *l = blink_layer(ctx, FULL);
-    fake_now = 50 * MS;
-    frame(ctx);
-    ASSERT_EQ_LL(deadline_at(ctx), 150 * MS);
-    fake_now = 160 * MS;
-    shr_pump(ctx);
-    ASSERT_EQ_LL(px(h.out.shown, 0, 0), 0);
-    fake_now = 170 * MS;
-    frame(ctx); /* visible again at once */
-    ASSERT_EQ_LL(px(h.out.shown, 0, 0), WHITE);
-    ASSERT_EQ_LL(deadline_at(ctx), 270 * MS);
-    destroy_layers(&l, 1);
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_blink);
+    shr_lyr *b = blink_layer(ctx, FULL), *s = solid(ctx, 1, (shr_rect){40, 0, 48, 16}, RED);
+    for (uint64_t t = 0; t <= 400 * MS; t += 33 * MS) {
+        fake_now = t;
+        shr__lcmd c = fill((shr_rect){0, 0, 8, 16}, (t / (33 * MS)) % 2 ? RED : GREEN);
+        paint(s, 1, &c);
+        frame(ctx);
+        ASSERT_EQ_LL(px(h.out.shown, 0, 0), (t / (100 * MS)) % 2 ? 0 : WHITE);
+        ASSERT_EQ_LL(deadline_at(ctx), (t / (100 * MS) + 1) * 100 * MS);
+    }
+    shr_lyr *ls[2] = {b, s};
+    destroy_layers(ls, 2);
     harness_close(&h);
     PASS();
 }
 
 static void tweak_blink_later(shr_context_desc *d, shr_framebuffer_driver *drv) {
     tweak_rec(d, drv);
-    d->blink = (shr_blink_profile){100 * MS, 500 * MS, false, SHR_BLINK_RESTART_NONE};
+    d->blink = (shr_blink_profile){100 * MS, 500 * MS, false};
 }
 
 TEST test_blink_epoch_in_future(void) {
@@ -1802,7 +1796,7 @@ TEST test_blink_epoch_in_future(void) {
 }
 
 static void tweak_blink_no_clock(shr_context_desc *d, shr_framebuffer_driver *drv) {
-    tweak_blink_restart(d, drv);
+    tweak_blink(d, drv);
     d->now_ns = NULL, d->io_retry_ns = d->io_timeout_ns = 0;
 }
 
@@ -2915,7 +2909,7 @@ TEST test_automatic_frames_wait_for_submit(void) {
 
 static void tweak_huge_timers(shr_context_desc *d, shr_framebuffer_driver *drv) {
     tweak_rec(d, drv);
-    d->blink = (shr_blink_profile){1ull << 63, 0, true, SHR_BLINK_RESTART_NONE};
+    d->blink = (shr_blink_profile){1ull << 63, 0, true};
     d->io_timeout_ns = UINT64_MAX;
     drv->caps.timeout_ns = UINT64_MAX;
 }
@@ -5700,7 +5694,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_device_surface_identity);
     RUN_TEST(test_request_redraw);
     RUN_TEST(test_blink_phase);
-    RUN_TEST(test_blink_restarts_on_submit);
+    RUN_TEST(test_blink_ignores_output);
     RUN_TEST(test_blink_epoch_in_future);
     RUN_TEST(test_blink_needs_clock);
     RUN_TEST(test_blink_outside_screen_draws_nothing);

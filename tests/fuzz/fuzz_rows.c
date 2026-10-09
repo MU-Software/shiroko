@@ -94,7 +94,7 @@ static void open_side(side *s, uint8_t cfg) {
     shr_context_desc cd;
     shr_context_desc_init(&cd);
     cd.driver = &s->rec, cd.output = &o, cd.now_ns = clock_fn;
-    if (cfg & 4) cd.blink = (shr_blink_profile){100, 0, (cfg & 8) != 0, SHR_BLINK_RESTART_NONE};
+    if (cfg & 4) cd.blink = (shr_blink_profile){100, 0, (cfg & 8) != 0};
     FUZZ_CHECK(shr_create(&cd, &s->ctx) == SHR_OK);
     shr_screen_desc sd;
     shr_screen_desc_init(&sd);

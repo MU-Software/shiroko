@@ -218,7 +218,6 @@ struct shr_context {
     shr_context_desc desc;
     shr_framebuffer_driver driver;
     shr_output output;
-    shr_blink_profile blink;
     bool shutting_down, in_callback;
 
     const void *plugin_kind[SHR_PLUGIN_SLOTS];

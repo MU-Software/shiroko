@@ -158,7 +158,7 @@ shr_status shr_create(const shr_context_desc *d, shr_context **out) {
     const shr_output *o = d->output;
     if (!drv->execute || !o->acquire || !o->present || !o->discard || !d->max_commands || !d->max_unreleased_frames ||
         d->event_capacity < 2 || d->event_capacity - 2 < d->max_unreleased_frames || !d->max_reads ||
-        (unsigned)d->blink.restart > SHR_BLINK_RESTART_ON_SUBMIT || (unsigned)o->timestamp > SHR_TIMESTAMP_COMPOSITOR ||
+        (unsigned)o->timestamp > SHR_TIMESTAMP_COMPOSITOR ||
         (o->flags & ~(uint32_t)(SHR_OUTPUT_RELEASE_ON_PRESENT | SHR_OUTPUT_PRESERVES_CONTENT)) ||
         (!d->now_ns && (d->io_retry_ns || d->io_timeout_ns || d->min_frame_interval_ns || drv->caps.timeout_ns)) ||
         !shr__alloc_init(&al, d->allocator))
@@ -173,7 +173,6 @@ shr_status shr_create(const shr_context_desc *d, shr_context **out) {
     if (ctx->desc.io_retry_limit > 0xFFFF) ctx->desc.io_retry_limit = 0xFFFF;
     ctx->driver = *drv;
     ctx->output = *o;
-    ctx->blink = d->blink;
     ctx->blink_shown = true;
     ctx->nio = d->max_reads;
     ctx->event_cap = d->event_capacity;
@@ -518,7 +517,7 @@ uint64_t shr__sat_add(uint64_t a, uint64_t b) {
 }
 
 bool shr__blink_visible(const shr_context *ctx, uint64_t *next) {
-    const shr_blink_profile *p = &ctx->blink;
+    const shr_blink_profile *p = &ctx->desc.blink;
     if (next) *next = 0;
     if (!p->interval_ns || !ctx->desc.now_ns) return true;
     uint64_t now = shr__ctx_now(ctx);

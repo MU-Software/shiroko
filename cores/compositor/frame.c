@@ -1169,10 +1169,6 @@ shr_status shr_submit(shr_context *ctx) {
     ctx->staged.nmoves = 0;
     ctx->submitted = ctx->has_submitted = true;
     ctx->failed = false;
-    if (ctx->blink.restart == SHR_BLINK_RESTART_ON_SUBMIT && ctx->desc.now_ns) {
-        ctx->blink.epoch_ns = shr__ctx_now(ctx);
-        ctx->blink.start_visible = true;
-    }
     shr__ctx_trace(ctx, SHR_TRACE_SUBMIT, ctx->next_frame_id, 0, 0);
     return first;
 }

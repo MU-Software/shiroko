@@ -142,7 +142,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     shr_context_desc_init(&cd);
     cd.driver = &checked, cd.output = &o, cd.now_ns = clock_fn;
     cd.io_retry_ns = cd.io_timeout_ns = 0;
-    if (cfg & 4) cd.blink = (shr_blink_profile){100, 0, (cfg & 8) != 0, SHR_BLINK_RESTART_NONE};
+    if (cfg & 4) cd.blink = (shr_blink_profile){100, 0, (cfg & 8) != 0};
     shr_context *ctx;
     FUZZ_CHECK(shr_create(&cd, &ctx) == SHR_OK);
     shr_screen_desc sd;
