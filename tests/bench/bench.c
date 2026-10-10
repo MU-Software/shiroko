@@ -376,6 +376,52 @@ static void fill_screen(term *t, int shift) {
         }
 }
 
+/* fill_screen() through set_row, a row per call, from the samples' code points decoded once. */
+typedef struct row_term {
+    term t;
+    uint32_t cps[8][4];
+    uint8_t n[8];
+} row_term;
+
+static void row_term_init(row_term *rt) {
+    for (int k = 0; k < rt->t.nsample; k++) {
+        const uint8_t *u = (const uint8_t *)rt->t.sample[k];
+        int n = 0;
+        while (*u) {
+            int len = *u < 0x80 ? 1 : *u < 0xE0 ? 2 : *u < 0xF0 ? 3 : 4;
+            uint32_t cp = len == 1 ? *u : (uint32_t)(*u & (0x7F >> len));
+            for (int i = 1; i < len; i++) cp = cp << 6 | (u[i] & 0x3F);
+            rt->cps[k][n++] = cp, u += len;
+        }
+        rt->n[k] = (uint8_t)n;
+    }
+}
+
+static void op_set_rows(void *arg) {
+    static const uint32_t space[] = {' '};
+    row_term *rt = arg;
+    term *t = &rt->t;
+    int shift = ++t->shift;
+    for (int r = 0; r < ROWS; r++) {
+        shr_row_cell cells[COLS];
+        uint32_t scalars[4 * COLS];
+        size_t n = 0, ns = 0;
+        for (int c = 0; c < COLS;) {
+            int k = (int)((unsigned)(r + shift + c * 7) % (unsigned)t->nsample);
+            uint32_t span = (unsigned char)t->sample[k][0] >= 0xEA ? 2 : 1;
+            const uint32_t *cp = rt->cps[k];
+            uint8_t m = rt->n[k];
+            if (c + (int)span > COLS) span = 1, cp = space, m = 1;
+            cells[n++] = (shr_row_cell){m == 1 ? cp[0] : (uint32_t)ns, 0, (uint8_t)span, m};
+            if (m > 1) memcpy(scalars + ns, cp, m * sizeof(*cp)), ns += m;
+            c += (int)span;
+        }
+        shr_text_style st = {SHR_RGB(220, 220, 220), SHR_RGB(20, 20, (r + shift) * 3 % 64), 0};
+        shr_row row = {cells, n, &st, 1, scalars, ns, NULL, 0};
+        check("set_row", shr_pl_lyr_tilemap_set_row(t->l, r, 0, &row, NULL));
+    }
+}
+
 static void op_set_cells(void *arg) {
     term *t = arg;
     fill_screen(t, ++t->shift);
@@ -438,6 +484,20 @@ static void bench_tilemap(void) {
         term_open(&t, &e, font, sets[k].sample, sets[k].n, NULL);
         run(name, op_set_cells, &t, (double)ROWS * COLS, "cell");
         shr_lyr_destroy(t.l);
+        env_close(&e, font);
+    }
+    for (size_t k = 0; k < sizeof(sets) / sizeof(sets[0]); k++) {
+        char name[96];
+        snprintf(name, sizeof(name), "tilemap/set_row-%s", sets[k].name);
+        if (filter && !strstr(name, filter)) continue;
+        env e;
+        env_open(&e, -1);
+        shr_pl_res_bitmap_font *font = font_open(&e, FONT_BUILTIN);
+        row_term rt;
+        term_open(&rt.t, &e, font, sets[k].sample, sets[k].n, NULL);
+        row_term_init(&rt);
+        run(name, op_set_rows, &rt, (double)ROWS * COLS, "cell");
+        shr_lyr_destroy(rt.t.l);
         env_close(&e, font);
     }
     if (!filter || strstr("tilemap/set+flush+frame-all-rows", filter)) {

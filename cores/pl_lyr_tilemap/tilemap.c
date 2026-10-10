@@ -468,8 +468,9 @@ static shr__memo *memo_slot(shr__tilemap *t, uint64_t key) {
 }
 
 /* The head at (r, c) already holds this cluster: its text in `key` up to 8 bytes, else at `utf8`. */
-static bool cell_same(const shr__tilemap *t, int32_t r, int32_t c, const char *utf8, size_t len, uint64_t key,
-                      uint32_t span, shr_text_style s) {
+static inline __attribute__((always_inline)) bool cell_same(const shr__tilemap *t, int32_t r, int32_t c,
+                                                            const char *utf8, size_t len, uint64_t key, uint32_t span,
+                                                            shr_text_style s) {
     const shr__cell *old = &row_at(t, r)[c];
     uint64_t was;
     memcpy(&was, old->text, sizeof(was));
@@ -480,7 +481,7 @@ static bool cell_same(const shr__tilemap *t, int32_t r, int32_t c, const char *u
 
 /* A text of 1 to 8 bytes zero-padded into a word, without reads past its end: the first 4 bytes and the ones after them
  * as words, and bytes 0, len / 2 and len - 1 of up to 3 (from 4 bytes on, ones the first word holds). */
-static uint64_t text_key(const char *utf8, size_t len) {
+static inline __attribute__((always_inline)) uint64_t text_key(const char *utf8, size_t len) {
     static const uint8_t none[4];
     const uint8_t *u = (const uint8_t *)utf8;
     size_t h = (len >> 1) & 3, l = (len - 1) & 3;
@@ -489,6 +490,16 @@ static uint64_t text_key(const char *utf8, size_t len) {
     lo |= u[0] | (uint32_t)u[h] << 8 * h | (uint32_t)u[l] << 8 * l;
     hi >>= 8 * (8 - len) & 31;
     return lo | (uint64_t)hi << 32;
+}
+
+/* The head of a valid cluster within the cell limits, its glyph from the font. */
+static shr_status cell_new(shr__tilemap *t, const char *utf8, size_t len, uint32_t span, shr_text_style s,
+                           shr__cell *out) {
+    uint32_t cps[SHR_CLUSTER_SCALARS];
+    size_t n;
+    shr__cluster_class cls;
+    shr_status st = cluster_decode(utf8, len, cps, &n, &cls);
+    return st == SHR_OK ? cell_make(t, utf8, len, span, s, cps, n, &cls, out) : st;
 }
 
 /* The head a valid cluster within the cell limits makes at (r, c), from the memo when it holds the text; an empty
@@ -503,11 +514,7 @@ static shr_status cell_for(shr__tilemap *t, int32_t r, int32_t c, const char *ut
         memcpy(out->text, &key, sizeof(key));
         return SHR_OK;
     }
-    uint32_t cps[SHR_CLUSTER_SCALARS];
-    size_t n;
-    shr__cluster_class cls;
-    shr_status st = cluster_decode(utf8, len, cps, &n, &cls);
-    if (st == SHR_OK) st = cell_make(t, utf8, len, span, s, cps, n, &cls, out);
+    shr_status st = cell_new(t, utf8, len, span, s, out);
     if (st == SHR_OK && m) *m = (shr__memo){key, out->glyph, (uint8_t)len, out->has_glyph};
     return st;
 }
@@ -516,6 +523,28 @@ static void cell_put(shr__tilemap *t, int32_t r, int32_t c, const shr__cell *e) 
     if (e->kind != CELL_HEAD) return;
     t->long_text |= e->len > CELL_INLINE;
     *place(t, r, c, e->span) = *e;
+}
+
+/* cell_for() and cell_put(), a head from the memo written in place. Forced inline, as are cell_same() and text_key():
+ * clang takes the code after set_cell's checks for cold and inlines next to nothing there. */
+static inline __attribute__((always_inline)) shr_status cell_set(shr__tilemap *t, int32_t r, int32_t c,
+                                                                 const char *utf8, size_t len, uint32_t span,
+                                                                 shr_text_style s) {
+    uint64_t key = len && len <= 8 ? text_key(utf8, len) : 0;
+    if (cell_same(t, r, c, utf8, len, key, span, s)) return SHR_OK;
+    shr__memo *m = len && len <= 8 ? memo_slot(t, key) : NULL;
+    if (m && m->len == len && m->key == key) {
+        shr__cell *e = place(t, r, c, span);
+        *e = head(s, m->glyph, len, span, m->has_glyph);
+        memcpy(e->text, &key, sizeof(key));
+        return SHR_OK;
+    }
+    shr__cell e;
+    shr_status st = cell_new(t, utf8, len, span, s, &e);
+    if (st != SHR_OK) return st;
+    if (m) *m = (shr__memo){key, e.glyph, (uint8_t)len, e.has_glyph};
+    cell_put(t, r, c, &e);
+    return SHR_OK;
 }
 
 shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col, const char *utf8, size_t length,
@@ -534,10 +563,7 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
         if ((st = cluster_decode(utf8, length, cps, &n, &cls)) != SHR_OK) return st;
         utf8 = SHR_REPLACEMENT_UTF8, length = 3;
     }
-    shr__cell e;
-    if ((st = cell_for(t, row, col, utf8, length, span, style, &e)) != SHR_OK) return st;
-    cell_put(t, row, col, &e);
-    return SHR_OK;
+    return cell_set(t, row, col, utf8, length, span, style);
 }
 
 static shr_status lines_check(const shr__tilemap *t, const shr_text_line *in, size_t n, shr_error_info *err) {
@@ -655,15 +681,13 @@ shr_status shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t col, 
         const shr_row_cell *e = &in->cells[i];
         int32_t at = (int32_t)c;
         c += e->span;
-        shr__cell m;
         if (e->scalars > 1) {
-            m = SHR_VEC_AT(&t->placed, shr__placed, made++)->cell;
+            cell_put(t, row, at, &SHR_VEC_AT(&t->placed, shr__placed, made++)->cell);
         } else {
             uint64_t w = 0;
             size_t len = e->scalars ? cp_utf8(e->text, &w) : 0;
-            cell_for(t, row, at, (const char *)&w, len, e->span, in->styles[e->style], &m);
+            cell_set(t, row, at, (const char *)&w, len, e->span, in->styles[e->style]);
         }
-        cell_put(t, row, at, &m);
     }
     t->placed.len = 0;
     if (in->lines) lines_set(t, row, in->lines, in->line_count);
