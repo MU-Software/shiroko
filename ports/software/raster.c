@@ -786,7 +786,9 @@ static void do_image(const shr_surface *dst, const shr_draw_cmd *c, const shr_im
         image_rows(dst, c, b, r, s, SHR_FORMAT_RGBX8888);
 }
 
-/* A SCALED IMAGE: the scaled pixels a SPAN at a time, blended as image_px() blends. */
+/* A SCALED IMAGE: a span of columns at a time down every row, so that each source row is blended once. Pixels blend as
+ * image_px() blends; opaque ones into RGB565 quantise red and blue side by side (shr__quantize() with (n - 1) / 255 as
+ * (n + (n >> 8)) >> 8). */
 static inline __attribute__((always_inline)) void scaled_rows(const shr_surface *dst, const shr_draw_cmd *c,
                                                               const shr_image *b, shr_rect r, shr_point s,
                                                               shr_pixel_format f) {
@@ -794,16 +796,30 @@ static inline __attribute__((always_inline)) void scaled_rows(const shr_surface 
                      .format = SHR_IMAGE_SRC_RGBA8888, .src = c->src_rect, .dw = c->scale_w, .dh = c->scale_h,
                      .filter = SHR_SCALE_BILINEAR};
     size_t bpp = shr__px_bytes(f);
-    uint8_t px[SPAN * 4];
-    for (int32_t y = r.y0; y < r.y1; y++) {
-        uint8_t *line = pixel_at(dst, r.x0, y);
-        for (int32_t x = 0; x < r.x1 - r.x0; x += SPAN) {
-            int32_t n = r.x1 - r.x0 - x < SPAN ? r.x1 - r.x0 - x : SPAN;
-            shr__scale_row(&sc, s.y + (y - r.y0), s.x + x, n, px);
-            for (int32_t k = 0; k < n; k++) {
-                uint32_t v;
-                __builtin_memcpy(&v, px + 4 * k, 4);
-                image_px(f, line + (size_t)(x + k) * bpp, v);
+    shr__bilin bl;
+    for (int32_t x = 0; x < r.x1 - r.x0; x += SHR__SCALE_SPAN) {
+        int32_t n = r.x1 - r.x0 - x < SHR__SCALE_SPAN ? r.x1 - r.x0 - x : SHR__SCALE_SPAN;
+        uint8_t *line = pixel_at(dst, r.x0 + x, r.y0);
+        shr__bilin_start(&bl, &sc, s.x + x, n, s.y);
+        for (int32_t y = r.y0; y < r.y1; y++, line += dst->stride) {
+            const uint32_t *bot;
+            uint32_t fy;
+            const uint32_t *top = shr__bilin_rows(&bl, &bot, &fy);
+            uint8_t *p = line;
+            for (int32_t i = 0; i < n; i++, p += bpp) {
+                uint32_t rb = shr__bilin_lerp(top[2 * i], bot[2 * i], fy);
+                uint32_t ga = shr__bilin_lerp(top[2 * i + 1], bot[2 * i + 1], fy);
+                if (ga < 0x00FF0000u) {
+                    if (ga >> 16) blend_px(f, p, (rgb){rb & 255, ga & 255, rb >> 16}, ga >> 16);
+                } else if (f == SHR_FORMAT_RGB565) {
+                    uint32_t q = rb * 31 + 0x00800080u, g = (ga & 255) * 63 + 128;
+                    q = (q + (q >> 8 & 0x00FF00FFu)) >> 8 & 0x001F001Fu, g = (g + (g >> 8)) >> 8;
+                    uint16_t o = (uint16_t)(q << 11 | g << 5 | q >> 16);
+                    __builtin_memcpy(p, &o, 2);
+                } else {
+                    uint32_t o = rb | ga << 8;
+                    __builtin_memcpy(p, &o, 4);
+                }
             }
         }
     }

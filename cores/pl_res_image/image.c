@@ -234,7 +234,7 @@ static shr_status scaled_new(shr_context *ctx, const shr__scale *s, shr_pl_res_i
     shr_status st = img_new(ctx, s->dw, s->dh, out);
     if (st != SHR_OK) return st;
     const shr_image *m = &(*out)->buf[0].mem;
-    for (int32_t y = 0; y < s->dh; y++) shr__scale_row(s, y, 0, s->dw, (uint8_t *)m->pixels + (size_t)y * m->stride);
+    shr__scale_rows(s, (uint8_t *)m->pixels, m->stride);
     return SHR_OK;
 }
 

@@ -51,4 +51,37 @@ static inline void shr__scale_taps(int32_t s0, int32_t s, int32_t d, int32_t n, 
 /* Scaled pixels [x0, x0 + n) of row y as RGBA8888 into `out` (4n bytes); 0 <= x0, x0 + n <= dw, 0 <= y < dh. */
 void shr__scale_row(const shr__scale *s, int32_t y, int32_t x0, int32_t n, uint8_t *out);
 
+/* Every scaled row, row y at out + y * stride. */
+void shr__scale_rows(const shr__scale *s, uint8_t *out, size_t stride);
+
+#define SHR__SCALE_SPAN 64
+
+/* BILINEAR rows y, y + 1, ... of scaled columns [x0, x0 + n), n <= SHR__SCALE_SPAN: the column taps are computed once
+ * and each source row's horizontal blend once, kept while the next rows read it. Blends hold two channels in 16-bit
+ * lanes (R | B << 16 and G | A << 16): a lane's blend is at most 255 * 256. */
+typedef struct shr__bilin {
+    const shr__scale *s;
+    int32_t n, held[2];
+    uint32_t t, r, dq, dr; /* the next row's shr__scale_t(), stepped exactly */
+    uint32_t tap[SHR__SCALE_SPAN]; /* column a << 9 | (b - a) << 8 | weight of b */
+    uint32_t h[2][2 * SHR__SCALE_SPAN];
+} shr__bilin;
+
+void shr__bilin_start(shr__bilin *b, const shr__scale *s, int32_t x0, int32_t n, int32_t y);
+
+/* The next row as n RGBA8888 words (R in the low byte). */
+void shr__bilin_next(shr__bilin *b, uint32_t *out);
+
+/* The next row as blends: returns its top source row's (2n words: R | B, then G | A, per column), *bot the bottom's
+ * and *fy the bottom's weight; shr__bilin_lerp() of a top and a bottom word gives two channels of a scaled pixel. */
+const uint32_t *shr__bilin_rows(shr__bilin *b, const uint32_t **bot, uint32_t *fy);
+
+/* Lanes of (top (256 - fy) + bottom fy + 32768) >> 16, split at bit 8 so that each product stays in its lane:
+ * with top = 256 th + tl and likewise bottom, that is (hi + (lo >> 8) + 128) >> 8. */
+static inline uint32_t shr__bilin_lerp(uint32_t top, uint32_t bot, uint32_t fy) {
+    uint32_t gy = 256 - fy, hi = (top >> 8 & 0x00FF00FFu) * gy + (bot >> 8 & 0x00FF00FFu) * fy;
+    uint32_t lo = (top & 0x00FF00FFu) * gy + (bot & 0x00FF00FFu) * fy;
+    return (hi + (lo >> 8 & 0x00FF00FFu) + 0x00800080u) >> 8 & 0x00FF00FFu;
+}
+
 #endif

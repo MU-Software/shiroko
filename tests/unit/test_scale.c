@@ -103,6 +103,40 @@ TEST sources_scale_as_rgba(void) {
     PASS();
 }
 
+/* Whole copies, which keep each source row's horizontal blend while the rows below read it, in every source format. */
+TEST copies_match_reference(void) {
+    for (int k = 0; k < NCASE; k++) {
+        kase c = case_at(k);
+        uint8_t *rgba = image(&c, k % 3 == 0), *out = malloc((size_t)c.dw * (size_t)c.dh * 4);
+        for (uint32_t fmt = SHR_IMAGE_SRC_RGBA8888; fmt <= SHR_IMAGE_SRC_GRAY_ALPHA88; fmt++) {
+            size_t bpp = shr__src_bytes(fmt), stride = (size_t)c.w * bpp + 1;
+            uint8_t *src = malloc(stride * (size_t)c.h), *wide = malloc((size_t)c.w * (size_t)c.h * 4);
+            for (int32_t y = 0; y < c.h; y++) {
+                memcpy(src + (size_t)y * stride, rgba + (size_t)y * c.w * bpp, (size_t)c.w * bpp);
+                for (int32_t x = 0; x < c.w; x++)
+                    shr__src_rgba(fmt, src + (size_t)y * stride + (size_t)x * bpp, wide + ((size_t)y * c.w + x) * 4);
+            }
+            shr_scale_src m = {wide, (size_t)c.w * 4, c.w, c.h, c.sx, c.sy, c.sw, c.sh, c.dw, c.dh};
+            for (uint32_t f = SHR_SCALE_BILINEAR; f <= SHR_SCALE_BOX; f++) {
+                shr__scale s = scale_of(&c, src, stride, fmt, f);
+                shr__scale_rows(&s, out, (size_t)c.dw * 4);
+                for (int32_t y = 0; y < c.dh; y++)
+                    for (int32_t x = 0; x < c.dw; x++) {
+                        uint8_t want[4];
+                        shr_scale_px(&m, f == SHR_SCALE_BOX ? SHR_FILTER_BOX : SHR_FILTER_BILINEAR, x, y, want);
+                        if (memcmp(want, out + ((size_t)y * (size_t)c.dw + (size_t)x) * 4, 4)) {
+                            fprintf(stderr, "case %d format %u filter %u (%d, %d)\n", k, fmt, f, x, y);
+                            FAIL();
+                        }
+                    }
+            }
+            free(src), free(wide);
+        }
+        free(out), free(rgba);
+    }
+    PASS();
+}
+
 static shr_draw_cmd scaled_cmd(const kase *c, uint32_t id, shr_rect dst, shr_point at) {
     shr_draw_cmd d = {0};
     d.kind = SHR_CMD_IMAGE, d.flags = SHR_IMAGE_SCALED;
@@ -457,6 +491,7 @@ int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(rows_match_reference);
     RUN_TEST(sources_scale_as_rgba);
+    RUN_TEST(copies_match_reference);
     RUN_TEST(draws_match_reference_in_parts);
     RUN_TEST(scaled_draws_checked);
     RUN_TEST(copies_equal_driver_views);
