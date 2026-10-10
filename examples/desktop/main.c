@@ -119,7 +119,9 @@ static shr_status track_execute(void *user, const shr_surface *dst, const shr_dr
         shr_cmd_kind k = cmds[i].kind;
         group = k == SHR_CMD_KEEP_BEGIN || (group && k != SHR_CMD_KEEP_END);
         shr_rect r = cmds[i].dst, d = a->dirty;
-        if (group || k == SHR_CMD_KEEP_END || k > SHR_CMD_KEEP_DRAW || r.x0 >= r.x1 || r.y0 >= r.y1) continue;
+        if (group || k == SHR_CMD_KEEP_END || (k > SHR_CMD_KEEP_DRAW && k != SHR_CMD_LINE) || r.x0 >= r.x1 ||
+            r.y0 >= r.y1)
+            continue;
         a->dirty = d.x0 < d.x1 ? (shr_rect){SDL_min(d.x0, r.x0), SDL_min(d.y0, r.y0), SDL_max(d.x1, r.x1), SDL_max(d.y1, r.y1)}
                                : r;
     }
