@@ -248,8 +248,8 @@ shr_status shr_lyr_cmd_commit(shr_lyr *layer);
 
 /* ===== Image resource =====
  * Pixels are copied into a buffer the driver draws from within desc.image_bytes: RGBA8888 (straight alpha), or RGB565
- * when the screen is RGB565, the driver has SHR_DRIVER_IMAGE_565 and every alpha is 255 (the same pixels on screen in
- * half the bytes). SHR_E_UNSUPPORTED beyond the driver's buffer limits. */
+ * when the screen is RGB565, the driver has SHR_DRIVER_IMAGE_565 and every alpha is 255 (drawn unscaled, the same
+ * pixels on screen in half the bytes). SHR_E_UNSUPPORTED beyond the driver's buffer limits. */
 
 /* Pixel layouts of application rows. */
 typedef enum shr_image_source_format {
@@ -293,7 +293,7 @@ shr_status shr_pl_res_image_create_scaled(shr_context *ctx, const shr_image_sour
 enum { SHR_SCALE_COPY = 1u << 4, SHR_SCALE_DRIVER = 1u << 5 };
 /* A width x height image showing `src` of `image` scaled, drawn and released like an image. A view the driver scales
  * holds no pixels of its own, keeps `image` until the view is freed and shows its updates; a copy does neither and
- * takes updates itself. */
+ * takes updates itself. Either scales an image kept as RGB565 from its RGB565 levels. */
 shr_status shr_pl_res_image_view(shr_pl_res_image *image, shr_rect src, int32_t width, int32_t height, uint32_t flags,
                                  shr_pl_res_image **out);
 
@@ -432,8 +432,10 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
 shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col, const char *utf8, size_t length,
                                        uint32_t span, shr_text_style style);
 /* Replaces the lines of `row` with `lines` (drawn in this order); an equal list changes nothing. Each lies inside the
- * grid with cols >= 1; at most 4 per column of the grid (SHR_E_LIMIT). SHR_E_UNKNOWN_STYLE: an unknown kind, shape or
- * flag or a colour alpha other than 0, 128 and 255 (err->item_index: the line). On error nothing changes. */
+ * grid with cols >= 1; at most 4 per column of the grid (SHR_E_LIMIT). The limit is checked on `lines` alone: clears
+ * that split lines and resizes that cut them can leave a row holding more; such a list passed back gives SHR_E_LIMIT.
+ * SHR_E_UNKNOWN_STYLE: an unknown kind, shape or flag or a colour alpha other than 0, 128 and 255 (err->item_index:
+ * the line). On error nothing changes. */
 shr_status shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_text_line *lines, size_t count,
                                         shr_error_info *err);
 

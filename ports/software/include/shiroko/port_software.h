@@ -15,7 +15,8 @@ extern "C" {
  * keep takes memory of its own size, freed by KEEP_RELEASE. Buffer ids are 1..max_buffers, RGB565 image buffers
  * included (SHR_DRIVER_IMAGE_565); the driver draws from registered memory in place (no SHR_BUFFER_COPIES), except
  * RGBA8888 IMAGE into RGB565 where shr_software_driver_image_planes() lets it draw from a plane. It moves pixels with
- * memmove and says so (SHR_DRIVER_CHEAP_MOVE); a port wrapping it where memory is slow clears that flag. The driver keeps its state until shr_software_driver_destroy(). */
+ * memmove and says so (SHR_DRIVER_CHEAP_MOVE); a port wrapping it where memory is slow clears that flag. The driver
+ * keeps its state until shr_software_driver_destroy(). */
 shr_status shr_software_driver_create(const shr_allocator *allocator, uint64_t keep_bytes, uint32_t max_keeps,
                                       uint32_t max_buffers, shr_framebuffer_driver *out);
 /* BOLD and ITALIC GLYPHs draw from coverage the driver synthesizes once per buffer region and keeps until a REGISTER,

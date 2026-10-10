@@ -59,7 +59,8 @@ void shr__raster_draw(const shr_surface *dst, const shr_draw_cmd *c, const shr_i
                       shr_rect clip, shr__pal_memo *memo) SHR_NONBLOCKING;
 
 /* The coverage (before DIM) of the w x h LINE pattern cell of `shape`, as shiroko_driver.h defines it, row by row into
- * out[w * h]. DOTTED and CURLY take some 10^5 float operations: drivers keep them. */
+ * out[w * h]. By size DOTTED takes some 10^4 to 10^6 float operations and CURLY 10^6 to 10^8 (8 x 3 near 1 ms on a
+ * desktop CPU): drivers keep them, so each shape and size is made once per driver. */
 void shr__raster_line_coverage(uint8_t *out, uint32_t shape, int32_t w, int32_t h) SHR_NONBLOCKING;
 /* The CURLY and DOTTED cells a driver keeps between commands: key w << 8 | h, 0 for none. */
 typedef struct shr__line_memo {
