@@ -2,7 +2,8 @@
 # from the sources in FONT_CACHE, which Make fetches first together with the uv tools environment.
 # Run `make fontpack-fetch` once before running targets in parallel with -j.
 
-.PHONY: test test-nozstd core-test render-test render-export headless-run bench replay replay-tab5 replay-cost replay-dma \
+.PHONY: test test-nozstd test-tab5 core-test render-test render-export headless-run bench replay replay-tab5 replay-cost \
+        replay-dma \
         tools-env fontpack-fetch fontpack fontpack-locales \
         test-asan test-ubsan test-tsan sanitizer-image test-asan-linux test-lsan-linux test-msan-linux \
         test-tsan-linux test-ubsan-linux test-hwasan-linux test-rtsan-linux test-sanitizers \
@@ -60,6 +61,12 @@ test-nozstd: $(FETCHED)
 	cmake --build build/nozstd
 	cd build/nozstd && ctest --output-on-failure -j$(NPROC)
 
+# At the Tab5's cell size (TAB5_CELL_WIDTH x TAB5_CELL_HEIGHT); the render goldens are 8x16 only and skip there.
+test-tab5: $(FETCHED)
+	cmake -S . -B build/host-tab5 $(CMAKE_TAB5) -DCMAKE_BUILD_TYPE=Debug
+	cmake --build build/host-tab5
+	cd build/host-tab5 && ctest --output-on-failure -j$(NPROC)
+
 core-test: $(FETCHED)
 	cmake --preset $(PRESET) $(CMAKE_HOST)
 	cmake --build --preset $(PRESET) --target test_tilemap test_grapheme
@@ -115,9 +122,9 @@ bench: $(FETCHED)
 
 # Replay (tests/bench/replay.c): the Tab5 example's scenes recorded on its screen configuration, then replayed into the
 # software driver alone and into the compositor over a driver drawing nothing; REPLAY_ARGS = [SCENE[,SCENE...]|all|cost]
-# [FRAMES]. replay-tab5 takes the Tab5's packages, so its recording hashes match the device's (TAB5_DEFS="-D
-# TAB5_REPLAY=1"; for a firmware with other keep screens, bands or rotation, the same SHR_REPLAY_KEEPS,
-# SHR_REPLAY_BANDS and SHR_REPLAY_ROTATION).
+# [FRAMES]. replay-tab5 takes the Tab5's packages and cell size (built into build/tab5-replay), so its recording hashes
+# match the device's (TAB5_DEFS="-D TAB5_REPLAY=1"; for a firmware with other keep screens, bands or rotation, the same
+# SHR_REPLAY_KEEPS, SHR_REPLAY_BANDS and SHR_REPLAY_ROTATION).
 # replay-cost: the app cost table's scenes (README; on the Tab5: TAB5_DEFS="-D TAB5_COST=1"), as
 # tools/bench/benchlog.py cost TAB5_LOG [DESKTOP_LOG] tabulates them.
 replay: $(FETCHED)
@@ -126,9 +133,9 @@ replay: $(FETCHED)
 	./build/release/tests/shiroko_replay build/release/fonts $(REPLAY_ARGS)
 
 replay-tab5: tab5-host
-	cmake --preset release $(CMAKE_HOST)
-	cmake --build --preset release --target shiroko_replay
-	./build/release/tests/shiroko_replay $(TAB5_HOST)/fonts $(REPLAY_ARGS)
+	cmake -S . -B build/tab5-replay $(CMAKE_TAB5) -DCMAKE_BUILD_TYPE=Release
+	cmake --build build/tab5-replay --target shiroko_replay
+	./build/tab5-replay/tests/shiroko_replay $(TAB5_HOST)/fonts $(REPLAY_ARGS)
 
 replay-cost:
 	$(MAKE) replay-tab5 REPLAY_ARGS=cost
@@ -246,14 +253,21 @@ desktop-run: $(FETCHED)
 # M5Stack Tab5 (ESP32-P4) example: the host generates the sources and the packages into TAB5_HOST (64x512 pages, which
 # draw CJK text faster on the P4) and, with TAB5_ZSTD=ON (default), bakes them with zstd and installs zstd's decoder
 # sources there through vcpkg (cmake/ports/zstd-source); then ESP-IDF builds examples/tab5 in its stock image into
-# build/tab5, compiling those sources with its own toolchain. TAB5_ZSTD=OFF: stored packages, no decoder. The container
-# cannot see USB devices, so flashing and the monitor run on the host (pinned esptool / esp-idf-monitor through uvx);
+# build/tab5, compiling those sources with its own toolchain. TAB5_ZSTD=OFF: stored packages (they fit the partitions
+# at 8x16 only), no decoder. The container cannot see USB devices, so flashing and the monitor run on the host (pinned
+# esptool / esp-idf-monitor through uvx);
 # PORT=/dev/cu.usbmodem... picks the board.
 # IDF_ARGS runs any idf.py command on the same build (e.g. make tab5-idf IDF_ARGS=size-components); TAB5_DEFS passes
 # the example's build options (e.g. TAB5_DEFS="-D TAB5_REPLAY=1 -D TAB5_LOADS=0xff"; CMake keeps them until changed).
 # TAB5_BOARD=headless builds for an ESP32-P4 board without a panel into build/tab5-headless (sdkconfig.defaults.headless).
 # The build folder's sdkconfig is made anew when the defaults or the Kconfig change (menuconfig edits are lost).
 TAB5_HOST := build/tab5-host
+# Tab5's own cell size, whatever CELL is.
+TAB5_CELL_WIDTH ?= 12
+TAB5_CELL_HEIGHT ?= 24
+TAB5_CELL := $(TAB5_CELL_WIDTH)x$(TAB5_CELL_HEIGHT)
+CMAKE_TAB5 := $(filter-out -DSHIROKO_CELL_%,$(CMAKE_HOST)) -DSHIROKO_CELL_WIDTH=$(TAB5_CELL_WIDTH) \
+    -DSHIROKO_CELL_HEIGHT=$(TAB5_CELL_HEIGHT)
 TAB5_ZSTD ?= ON
 IDF_IMAGE ?= espressif/idf:v6.1
 PORT ?= $(firstword $(wildcard /dev/cu.usbmodem*) $(wildcard /dev/ttyACM*))
@@ -262,7 +276,7 @@ TAB5_BUILD := build/tab5$(if $(filter headless,$(TAB5_BOARD)),-headless)
 TAB5_IDF := $(DOCKER_RUN) -w /src/examples/tab5 -e IDF_TARGET=esp32p4 $(IDF_IMAGE) \
     idf.py -B /src/$(TAB5_BUILD) -D SDKCONFIG=/src/$(TAB5_BUILD)/sdkconfig \
     $(if $(filter headless,$(TAB5_BOARD)),-D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.headless') \
-    -D SHIROKO_CELL_WIDTH=$(CELL_WIDTH) -D SHIROKO_CELL_HEIGHT=$(CELL_HEIGHT) -D SHIROKO_PIXEL_FORMAT=RGB565 \
+    -D SHIROKO_CELL_WIDTH=$(TAB5_CELL_WIDTH) -D SHIROKO_CELL_HEIGHT=$(TAB5_CELL_HEIGHT) -D SHIROKO_PIXEL_FORMAT=RGB565 \
     -D SHIROKO_TAB5_ZSTD=$(TAB5_ZSTD) $(TAB5_DEFS)
 TAB5_DEFAULTS := examples/tab5/sdkconfig.defaults $(if $(filter headless,$(TAB5_BOARD)),examples/tab5/sdkconfig.defaults.headless) \
     examples/tab5/main/Kconfig.projbuild
@@ -271,11 +285,11 @@ $(TAB5_BUILD)/sdkconfig: $(TAB5_DEFAULTS)
 	rm -f $@
 
 tab5-host: $(FETCHED)
-	cmake -S . -B $(TAB5_HOST) $(CMAKE_HOST) -DCMAKE_BUILD_TYPE=Release -DSHIROKO_ZSTD=OFF \
+	cmake -S . -B $(TAB5_HOST) $(CMAKE_TAB5) -DCMAKE_BUILD_TYPE=Release -DSHIROKO_ZSTD=OFF \
 	    -DSHIROKO_BUILD_TESTS=OFF -DSHIROKO_BUILD_EXAMPLES=OFF \
 	    $(if $(filter ON,$(TAB5_ZSTD)),-DVCPKG_OVERLAY_PORTS=$(CURDIR)/cmake/ports -DVCPKG_MANIFEST_FEATURES=zstd-source)
 	cmake --build $(TAB5_HOST) --target shiroko_unicode_tables shiroko_pl_res_bitmap_font
-	$(UV) tools/fontpack/fontpack.py build --cell $(CELL) --out $(TAB5_HOST)/fonts --method $(if $(filter ON,$(TAB5_ZSTD)),zstd,stored) \
+	$(UV) tools/fontpack/fontpack.py build --cell $(TAB5_CELL) --out $(TAB5_HOST)/fonts --method $(if $(filter ON,$(TAB5_ZSTD)),zstd,stored) \
 	    --page-atlas 64x512 latin cjk-ko symbols emoji nerd
 
 tab5-build: tab5-host $(TAB5_BUILD)/sdkconfig

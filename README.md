@@ -31,9 +31,10 @@ The build generates the Unicode tables (`<build dir>/generated/shr_gen_unicode_t
 `test_grapheme` reads `GraphemeBreakTest.txt` from there.
 
 The build bakes the fonts for one cell size, `SHIROKO_CELL_WIDTH` x `SHIROKO_CELL_HEIGHT` (default 8x16; width 6..64,
-height 8..127; `make CELL_WIDTH=10 CELL_HEIGHT=20 ...`). The built-in package (ASCII + U+FFFD) is compiled into the
-library; the other packages go to `<build dir>/fonts` with their NOTICE, LICENSES/ and inventory.json (target
-`shiroko_fonts`, part of the default build when Shiroko is the top-level project).
+height 8..127; `make CELL_WIDTH=10 CELL_HEIGHT=20 ...`; the Tab5 targets take `TAB5_CELL_WIDTH` x `TAB5_CELL_HEIGHT`,
+default 12x24). The built-in package (ASCII + U+FFFD) is compiled into the library; the other packages go to
+`<build dir>/fonts` with their NOTICE, LICENSES/ and inventory.json (target `shiroko_fonts`, part of the default build
+when Shiroko is the top-level project).
 
 The default packages are `latin`, `cjk-ko`, `symbols`, `emoji` and `nerd`, so the only CJK glyph variant is
 Korean. For the `ja`, `zh-Hans`, `zh-Hant` and `zh-HK` variants (`shr_pl_res_bitmap_font_desc.locale`),
@@ -66,6 +67,7 @@ redraws per scene after the first frame; with `SHIROKO_PORT_ANGLE`, `--backend a
 
 ```
 make test          # unit/golden tests, fontpack selftest, headless example, fuzz corpus replay
+make test-tab5     # the same at the Tab5's cell size (12x24; the goldens skip)
 make core-test     # text measurement tests only
 make fontpack      # font packages into build/host/fonts
 make fontpack-locales  # all packages, every CJK locale, into build/fonts-locales
@@ -78,7 +80,7 @@ make tab5-build    # M5Stack Tab5 firmware (examples/tab5) into build/tab5; tab5
 make bench         # per-part throughput (BENCH=software|compositor|tilemap|font|image|terminal filters;
                    #   SHR_BENCH_SECONDS=5 lengthens one case for a profiler)
 make replay        # the Tab5 scenes recorded, then replayed into the software driver and the compositor alone
-                   #   (REPLAY_ARGS='scroll,code 60'; replay-tab5 with the Tab5's packages; replay-cost: the
+                   #   (REPLAY_ARGS='scroll,code 60'; replay-tab5 as built for the Tab5; replay-cost: the
                    #   app cost table's scenes)
 make replay-dma    # the same with the Tab5 example's keep copier (SHR_REPLAY_COPIER=tab5) for 8x16 10x20 12x24
                    #   16x32 (DMA_CELLS=...): fails when a copy the DMA2D could take, or a band rotation, goes to the CPU
@@ -246,7 +248,7 @@ still hold a window to the display rate (not always), so frames shorter than tha
 
 `examples/tab5` renders on core 0; core 1 is the application's. Both cores and the panel's scan-out share PSRAM, and
 what slows the renderer is not the bytes the app moves but how often the app's CPU misses its caches into PSRAM.
-Measured on Tab5 (ST7121 panel, 2026-10-04) with a probe task on core 1, renderer busy time per frame grew by:
+Measured on Tab5 (ST7121, 8x16 cells, 2026-10-04) with a probe task on core 1, renderer busy time per frame grew by:
 
 | App CPU traffic to PSRAM (cache misses) | Renderer slower by |
 |---|---|
@@ -262,24 +264,25 @@ Measured on Tab5 (ST7121 panel, 2026-10-04) with a probe task on core 1, rendere
   its channels with the PPA rotation, so it can lengthen frames (not busy time); 1-D GDMA avoids that.
 - Preload the font pages you will use (`shr_pl_res_bitmap_font_preload()`, e.g. the hot pages fontpack reports for each
   package) before the first frame. A page first needed mid-scene is read from flash inside that frame, and the rows
-  drawn with fallback glyphs meanwhile are drawn again and not kept. In the example's blink scene (emoji appearing
-  after the first frame) preloading the emoji package's 9 hot pages cut the worst frame from ~51 to ~40 ms (23 ms
-  with `SHR_DRIVER_CHEAP_STORE`), and the first frame of the other scenes from ~150 to ~50 ms.
+  drawn with fallback glyphs meanwhile are drawn again and not kept. In the example's blink scene at 8x16 (emoji
+  appearing after the first frame) preloading the emoji package's 9 hot pages cut the worst frame from ~51 to ~40 ms
+  (23 ms with `SHR_DRIVER_CHEAP_STORE`), and the first frame of the other scenes from ~150 to ~50 ms.
 - `make tab5-build` bakes the packages with zstd and builds the decoder in (`TAB5_ZSTD=OFF`: stored packages and no
-  decoder; a firmware with it reads either, and the partitions hold either): 3.6 instead of 7.8 MB of flash (cjk-ko 3.0
-  instead of 6.3 MB) for 47 KiB more firmware, and the decoder's 94 KiB context in PSRAM. Loading pages costs more CPU:
-  on Tab5 (ILI9881C, 2026-10-06) the example's preload of 26 pages took 184 instead of 120 ms, a page first needed later
-  ~1-1.5 ms more (cjk-mix's first frame, 40 pages: 201 instead of 157 ms); frames that load no page draw as fast.
+  decoder; a firmware with it reads either): 6.0 instead of 14.1 MB of flash at 12x24 (cjk-ko 4.9 instead of 10.9 MB)
+  for 47 KiB more firmware, and the decoder's 94 KiB context in PSRAM. Stored packages fit the example's partitions only
+  at 8x16. Loading pages costs more CPU: on Tab5 (ILI9881C, 8x16 cells, 2026-10-06) the example's preload of 26 pages
+  took 184 instead of 120 ms, a page first needed later ~1-1.5 ms more (cjk-mix's first frame, 40 pages: 201 instead of
+  157 ms); frames that load no page draw as fast.
 - Run app tasks at priority 1 or higher: at priority 0 a task shares its core's ticks with the idle task and gets
   half the throughput (the renderer, on the other core, is unaffected either way).
 - Cap the frame rate (`min_frame_interval_ns`, Kconfig `SHIROKO_TAB5_FPS_CAP` in the example, default 30): renderer
   PSRAM traffic falls in proportion to the frames it no longer draws, which helps only while the renderer is faster than
-  the cap (most of the example's scenes draw in 13-39 ms a frame there, worst frames up to ~65 ms, so the cap limits
-  most of them). With the ~42 MB/s app above, a screen of blinking text drew 31.6 frames per second and 117 MB/s of
-  renderer PSRAM traffic; capped at 15 it drew 56 MB/s, and the app's PSRAM-to-internal-RAM copies went from 69 % to
+  the cap (at 8x16 most of the example's scenes draw in 13-39 ms a frame there, worst frames up to ~65 ms, so the cap
+  limits most of them). With the ~42 MB/s app above, a screen of blinking text drew 31.6 frames per second and 117 MB/s
+  of renderer PSRAM traffic; capped at 15 it drew 56 MB/s, and the app's PSRAM-to-internal-RAM copies went from 69 % to
   85 % of their speed beside an idle renderer.
 - Size the keeps to the screens or looks the app switches among (Kconfig `SHIROKO_TAB5_KEEP_SCREENS` in the example,
-  default 4: slots for the rows of that many screens, 45 x 40 KiB = 1.8 MiB of PSRAM each). On Tab5 (uncapped), 4
+  default 4: slots for the rows of that many screens, 30 x 60 KiB = 1.8 MiB of PSRAM each). On Tab5 (8x16, uncapped), 4
   fits rows cycling through four looks (restyle4: 180 stores over 60 frames, frame p50 ~28 ms; its worst frame,
   ~65 ms, stays); 3 frees 1.8 MiB and runs the example's other scenes as fast, but such rows are drawn instead of
   copied (restyle4: 600 stores, p50 47.6 ms); 2 frees 3.6 MiB (restyle4 p50 55.7 ms; a new screen every 20 frames
@@ -343,11 +346,11 @@ over 12 bytes (each new one, and `shr_pl_lyr_tilemap_set_text` even when unchang
   internal RAM while it fits in 64 KiB (Kconfig `SHIROKO_TAB5_INTERNAL_BUDGET_KB`) and the rest of it and all other
   memory in PSRAM: at the end of each scene about 360 KiB of internal RAM is free, and the least since boot is about
   330 KiB. 216 KiB leaves the app about 150 KiB less and draws the example's scenes about 4 % faster on Tab5
-  (uncapped, ST7121, p50 summed over the scenes; the Hangul scenes 3-4 ms a frame).
+  (8x16, uncapped, ST7121, p50 summed over the scenes; the Hangul scenes 3-4 ms a frame).
 - Draw with two bands (Kconfig `SHIROKO_TAB5_BANDS`, default 2: 2 x 40 KiB of internal RAM) so the CPU draws one
-  while the PPA turns the other. One band leaves the app 40 KiB more, but on Tab5 (uncapped, ST7121, 64 KiB budget) the
-  scenes took about 12 % longer (p50 summed) and a scrolling screen 34 ms a frame instead of 29. The replay bench's
-  `SHR_REPLAY_BANDS` sets the same count.
+  while the PPA turns the other. One band leaves the app 40 KiB more, but on Tab5 (8x16, uncapped, ST7121, 64 KiB
+  budget) the scenes took about 12 % longer (p50 summed) and a scrolling screen 34 ms a frame instead of 29. The replay
+  bench's `SHR_REPLAY_BANDS` sets the same count.
 - Turn the screen so that scrolling up moves rows toward the start of the frame buffer (Kconfig
   `SHIROKO_TAB5_ROTATION` in the example, default 90° counterclockwise, also the right way up on Tab5 with the keyboard
   side down): DMA2D moves rows that way in one copy at any distance, the other way only up to 48 px. On Tab5 (capped

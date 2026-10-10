@@ -11,8 +11,10 @@
 
 #include "check.h"
 
+#ifndef HW /* a suite may size the screen itself, before including this */
 #define HW 64
 #define HH 48
+#endif
 #define NBUF 3
 #define HBUFS 64 /* buffer ids of the mock driver */
 #define SCREEN_BPP (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? 2 : 4)

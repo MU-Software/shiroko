@@ -1,4 +1,6 @@
 #include "compositor.h"
+#define HW (8 * SHR_CELL_WIDTH) /* row commands span whole cells: 8 columns at any cell size */
+#define HH 48
 #include "harness.h"
 
 #define MS 1000000ull
@@ -2804,7 +2806,7 @@ TEST test_scattered_damage(void) {
     frame(ctx);
     ASSERT(rec.damaged >= 70 && rec.damaged < HW * HH);
     ASSERT(count_color(&h, GREEN) == 70 && count_color(&h, RED) == 0);
-    c[0] = fill((shr_rect){0, 0, 60, 48}, BLUE); /* most of the screen: redrawn whole */
+    c[0] = fill((shr_rect){0, 0, HW - 4, HH}, BLUE); /* most of the screen: redrawn whole */
     paint(l, 1, c);
     frame(ctx);
     ASSERT_EQ_LL(rec.damaged, HW * HH);
@@ -3609,10 +3611,11 @@ TEST test_large_group_blocks_skipped(void) {
         for (int32_t x = 0; x < HW; x += 4) cells[n++] = fill((shr_rect){x, y, x + 4, y + 4}, (x / 4 + y / 4) % 2 ? RED : BLUE);
     paint(l, n, cells);
     frame(ctx);
-    cells[64].color = GREEN; /* the first command of the second block (x 0, y 16) */
+    const int32_t bx = SHR__BLOCK % (HW / 4) * 4, by = SHR__BLOCK / (HW / 4) * 4;
+    cells[SHR__BLOCK].color = GREEN; /* the first command of the second block (x 0, y 16 at 8x16) */
     paint(l, n, cells);
     frame(ctx);
-    ASSERT(rec.n == 2 && rec.cmds[1].color == GREEN && px(h.out.shown, 0, 16) == GREEN); /* clear, cell */
+    ASSERT(rec.n == 2 && rec.cmds[1].color == GREEN && px(h.out.shown, bx, by) == GREEN); /* clear, cell */
     ASSERT(px(h.out.shown, 0, 0) == BLUE && px(h.out.shown, 4, 0) == RED);
     destroy_layers(&l, 1);
     harness_close(&h);
@@ -5606,18 +5609,18 @@ TEST test_group_placed_elsewhere(void) {
     shr_lyr *l;
     ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
     shr__rcmd *c = shr__lyr_row_begin(l, 1);
-    c[0] = row_of(fill((shr_rect){0, 0, 8, 8}, RED));
+    c[0] = row_of(fill((shr_rect){0, 0, SHR_CELL_WIDTH, 8}, RED));
     ASSERT_EQ_LL(shr__lyr_row_commit(l, 0, 8, NULL, nokey, c, 1), SHR_OK);
     frame(ctx);
     ASSERT(px(h.out.shown, 2, 10) == RED && px(h.out.shown, 2, 2) == 0);
     c = shr__lyr_row_begin(l, 1);
-    c[0] = row_of(fill((shr_rect){0, 0, 8, 8}, RED));
+    c[0] = row_of(fill((shr_rect){0, 0, SHR_CELL_WIDTH, 8}, RED));
     ASSERT_EQ_LL(shr__lyr_row_commit(l, 0, 24, NULL, nokey, c, 1), SHR_OK);
     frame(ctx);
-    ASSERT(rec.damaged == 3 * 64 && px(h.out.shown, 2, 26) == RED && px(h.out.shown, 2, 10) == 0);
+    ASSERT(rec.damaged == 3 * 8 * SHR_CELL_WIDTH && px(h.out.shown, 2, 26) == RED && px(h.out.shown, 2, 10) == 0);
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, NULL, 0), SHR_OK); /* removed from its place */
     frame(ctx);
-    ASSERT(rec.damaged == 64 && px(h.out.shown, 2, 26) == 0);
+    ASSERT(rec.damaged == 8 * SHR_CELL_WIDTH && px(h.out.shown, 2, 26) == 0);
     destroy_layers(&l, 1);
     harness_close(&h);
     PASS();
@@ -5633,27 +5636,29 @@ TEST test_row_groups(void) {
     fake_attach(&r2, ctx, &fk_ops);
     shr_lyr *l;
     ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
-    shr__lcmd full[2] = {fill((shr_rect){0, 0, 16, 16}, RED), glyph(&r, 8, 0, WHITE)};
-    shr__rcmd rows[4] = {row_of((shr__lcmd){.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, 16, 16}}), row_of(full[0]),
+    const int32_t cw = SHR_CELL_WIDTH, area = 2 * cw * 16; /* two cells of 16 rows */
+    shr__lcmd full[2] = {fill((shr_rect){0, 0, 2 * cw, 16}, RED), glyph(&r, cw, 0, WHITE)};
+    full[1].dst.x1 = 2 * cw;
+    shr__rcmd rows[4] = {row_of((shr__lcmd){.kind = SHR__LCMD_CACHE_BEGIN, .dst = {0, 0, 2 * cw, 16}}), row_of(full[0]),
                          row_of(full[1]), row_of((shr__lcmd){.kind = SHR__LCMD_CACHE_END})};
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, full, 2), SHR_OK);
     frame(ctx);
-    ASSERT(px(h.out.shown, 2, 2) == RED && px(h.out.shown, 10, 2) == WHITE);
+    ASSERT(px(h.out.shown, 2, 2) == RED && px(h.out.shown, cw + 2, 2) == WHITE);
     ASSERT_EQ_LL(rows_set(l, 0, 0, &r.res, rows + 1, 2), SHR_OK);
     ASSERT_EQ_LL(r.res.users, 1);
     frame(ctx);
-    ASSERT(rec.damaged == 16 * 16 && px(h.out.shown, 2, 2) == RED && px(h.out.shown, 10, 2) == WHITE);
+    ASSERT(rec.damaged == area && px(h.out.shown, 2, 2) == RED && px(h.out.shown, cw + 2, 2) == WHITE);
     ASSERT_EQ_LL(rows_set(l, 0, 0, &r2.res, rows + 1, 2), SHR_OK);
     ASSERT(r.res.users == 0 && r2.res.users == 1);
     frame(ctx);
-    ASSERT_EQ_LL(rec.damaged, 16 * 16);
+    ASSERT_EQ_LL(rec.damaged, area);
 
     const uint64_t keys[3][2] = {{1, 2}, {1, 3}, {4, 3}};
     for (int i = 0; i < 3; i++) {
         rec.damaged = 0;
         ASSERT_EQ_LL(shr__lyr_row_commit(l, 0, 0, &r2.res, keys[i], rows, 4), SHR_OK);
         frame(ctx);
-        ASSERT_EQ_LL(rec.damaged, i ? 0 : 16 * 16); /* the cache pair added, then only its key */
+        ASSERT_EQ_LL(rec.damaged, i ? 0 : area); /* the cache pair added, then only its key */
         ASSERT_EQ_LL(SHR_VEC_AT(&l->groups, shr__group, 0)->key[0], keys[i][0]);
         ASSERT_EQ_LL(SHR_VEC_AT(&l->groups, shr__group, 0)->key[1], keys[i][1]);
     }
@@ -5666,7 +5671,7 @@ TEST test_row_groups(void) {
     ASSERT_EQ_LL(shr__lyr_group_set(l, 0, full, 2), SHR_OK);
     ASSERT(r.res.users == 1 && r2.res.users == 0);
     frame(ctx);
-    ASSERT(rec.damaged == 16 * 16 && px(h.out.shown, 2, 2) == RED && px(h.out.shown, 10, 2) == WHITE);
+    ASSERT(rec.damaged == area && px(h.out.shown, 2, 2) == RED && px(h.out.shown, cw + 2, 2) == WHITE);
     destroy_layers(&l, 1);
     r.res.dead = r2.res.dead = true;
     harness_close(&h);

@@ -17,12 +17,23 @@
 #define T5_SPRITES 16
 #define T5_SPRITE 96
 /* Preloaded before the first frame: the latin package, the first symbols and Nerd pages, the KS X 1001
- * punctuation, jamo and most frequent Hangul of cjk-ko (7 pages at 8x16 with 64x512 pages: 99.8 % of the Hangul in
- * the 2005 frequency survey of fontpack's order) and the emoji package's hot pages; for tabs also the Nerd pages its
- * editor screen draws from (pages 1-5 at 8x16 with 64x512 pages), which it first shows after the first frame. */
-#define T5_CJK_HOT_PAGES 7
-#define T5_EMOJI_HOT_PAGES 9
-#define T5_TABS_NERD_PAGES 6
+ * punctuation, jamo and most frequent Hangul of cjk-ko (99.8 % of the Hangul in the 2005 frequency survey of
+ * fontpack's order) and the emoji package's hot pages; for tabs also the Nerd pages its editor screen draws from
+ * (at 8x16 pages 0-5, all its icons but the status line's U+F31A), which it first shows after the first frame. Page
+ * counts as fontpack lays out the Tab5 packages (64x512 pages) at 8x16, 10x20, 12x24 and 16x32; other cell sizes
+ * scale the 8x16 ones by the cell area. */
+#if SHR_CELL_WIDTH == 10 && SHR_CELL_HEIGHT == 20
+#define T5_PAGES(p8x16, p10x20, p12x24, p16x32) (p10x20)
+#elif SHR_CELL_WIDTH == 12 && SHR_CELL_HEIGHT == 24
+#define T5_PAGES(p8x16, p10x20, p12x24, p16x32) (p12x24)
+#elif SHR_CELL_WIDTH == 16 && SHR_CELL_HEIGHT == 32
+#define T5_PAGES(p8x16, p10x20, p12x24, p16x32) (p16x32)
+#else
+#define T5_PAGES(p8x16, p10x20, p12x24, p16x32) (((p8x16) * SHR_CELL_WIDTH * SHR_CELL_HEIGHT + 127) / 128)
+#endif
+#define T5_CJK_HOT_PAGES T5_PAGES(7, 11, 17, 30)
+#define T5_EMOJI_HOT_PAGES T5_PAGES(9, 16, 26, 39)
+#define T5_TABS_NERD_PAGES T5_PAGES(6, 10, 14, 23)
 /* The record pass (rec.h): the clock held from T0 and advanced an odd number of blink phases per loop frame, so
  * that blinking cells change at every frame. */
 #define T5_REC_T0_NS 1000000000ull

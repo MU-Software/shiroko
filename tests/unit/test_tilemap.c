@@ -1,3 +1,5 @@
+#define HW (8 * SHR_CELL_WIDTH) /* 8 columns and 3 rows of cells at any cell size */
+#define HH (3 * SHR_CELL_HEIGHT)
 #include "harness.h"
 
 #include "compositor.h"

@@ -1933,11 +1933,17 @@ def selftest(packages):
     if CONFIG.get("generated"):
         sprite_selftest()
     icon_selftest()
-    src = min(pathlib.Path(packages).glob("shiroko-*.shrf"), key=lambda p: p.stat().st_size, default=None)
-    if not src:
+    srcs = sorted(pathlib.Path(packages).glob("shiroko-*.shrf"), key=lambda p: p.stat().st_size)
+    if not srcs:
         sys.exit(f"{packages}: no packages to test with; run `make fontpack` first")
-    blob = src.read_bytes()
-    reader_selftest(blob, pinned_profile())
+    for src in srcs:  # the smallest package the reader test can tamper with (which depends on the cell size)
+        blob = src.read_bytes()
+        try:
+            reader_selftest(blob, pinned_profile())
+            break
+        except SystemExit as e:
+            if src == srcs[-1] or not str(e.code).startswith("selftest needs"):
+                raise
     pid = sha256(blob)
     with tempfile.TemporaryDirectory() as tmp:
         dest = pathlib.Path(tmp) / "dest"

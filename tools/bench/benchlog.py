@@ -14,12 +14,13 @@
 
 import argparse
 import collections
+import re
 import statistics
 import sys
 
 FLAGS = {"ok", "DIFFER", "FULL", "EQUAL", "->"}
 DRIVERS = ("driver-sw", "driver-p4")
-COST = {"cost-cell": "One cell", "cost-row": "One row (160 cells)", "cost-screen": "Every cell (7200)",
+COST = {"cost-cell": "One cell", "cost-row": "One row ({cols} cells)", "cost-screen": "Every cell ({cells})",
         "cost-scroll": "Scroll one line up, write the new line", "cost-restyle": "One row bold and italic, on and off",
         "cost-sprite": "One 96 x 96 sprite moved", "churn-ko": "1000 cells of Hangul text"}
 
@@ -157,8 +158,19 @@ def small(v):
     return "<0.01" if v < 0.005 else f"{v:.2f}"
 
 
+def grid(path):
+    """{cols} and {cells} of the example's landscape grid, from its boot line (portrait panel size, cell size)."""
+    for line in open(path, errors="replace"):
+        s, c = re.search(r"^shiroko on .*: (\d+)x(\d+) ", line), re.search(r" cells (\d+)x(\d+)", line)
+        if s and c:
+            h, v, cw, ch = map(int, s.groups() + c.groups())
+            return {"cols": v // cw, "cells": v // cw * (h // ch)}
+    return {"cols": "?", "cells": "?"}
+
+
 def cost(args):
     t, m = parse(args.tab5), parse(args.mac) if args.mac else None
+    g = grid(args.tab5)
     head = ["Change per frame", "Frame p50 / MAX", "Calls", "Submit", "Build", "Driver busy p50 / MAX"]
     if m:
         head.append("M4 Max (µs)")
@@ -168,7 +180,7 @@ def cost(args):
         rs, c, d = t[0].get(sc, []), t[1].get((sc, "compositor"), []), t[1].get((sc, "driver-p4"), [])
         if not rs or not c:
             continue
-        row = [name, f"{statistics.median(triple(r['frame'])[0] for r in rs):.1f} / "
+        row = [name.format(**g), f"{statistics.median(triple(r['frame'])[0] for r in rs):.1f} / "
                      f"{max(max1(r) for r in rs):.1f}"]
         row += [small(med(c, k)) for k in ("api", "submit", "build")]
         row.append(f"{med(d, 'busy'):.1f} / {med(d, 'busy-max'):.1f}" if d else "-")

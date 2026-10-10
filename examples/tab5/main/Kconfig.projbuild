@@ -71,11 +71,11 @@ menu "shiroko Tab5 example"
         range 1 8
         default 4
         help
-            The software driver keeps rendered rows for this many screens (45 slots of 40 KiB each, about 1.8 MiB
-            of PSRAM per screen), so rows switching among that many screens or looks are copied back instead of
-            drawn. 4 (default) fits rows cycling through four looks (restyle4: stores 180 over 60 frames, frame
-            p50 28.8 ms); 3 saves 1.8 MiB and runs the other scenes as fast (restyle4 p50 47.6 ms); 2 saves 3.6 MiB
-            (restyle4 p50 55.7 ms).
+            The software driver keeps rendered rows for this many screens (a slot per cell row, 30 of 60 KiB at
+            12x24, about 1.8 MiB of PSRAM per screen), so rows switching among that many screens or looks are copied
+            back instead of drawn. 4 (default) fits rows cycling through four looks (restyle4 at 8x16: stores 180
+            over 60 frames, frame p50 28.8 ms); 3 saves 1.8 MiB and runs the other scenes as fast (restyle4 p50
+            47.6 ms); 2 saves 3.6 MiB (restyle4 p50 55.7 ms).
 
     config SHIROKO_TAB5_INTERNAL_BUDGET_KB
         int "Internal RAM for the renderer's per-frame memory (KiB)"

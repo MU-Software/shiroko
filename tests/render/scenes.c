@@ -101,8 +101,10 @@ static shr_status overview(stage *s) {
     stage_cell(s, prompt, 0, 13, "x", 1, STYLE(HIDDEN(FG), PURPLE, 0));
     stage_cell(s, prompt, 0, 14, "b", 1, STYLE(FG, 0, SHR_STYLE_BLINK | SHR_STYLE_BOLD));
     stage_cell(s, prompt, 0, 15, "█", 1, STYLE(GREEN, 0, 0));
-    stage_cell(s, prompt, 0, 16, "─", 1, plain);
-    stage_cell(s, prompt, 0, 17, "�", 1, plain);
+    if (GW / CW > 17) { /* other cell sizes: the grid may be smaller */
+        stage_cell(s, prompt, 0, 16, "─", 1, plain);
+        stage_cell(s, prompt, 0, 17, "�", 1, plain);
+    }
     shr_text_line pl[2] = {{4, 1, SHR_LINE_STRIKE, SHR_LINE_SINGLE, 0, DIM(FG)}, UNDER(7, 2, FG)};
     stage_lines(s, prompt, 0, pl, 2);
 

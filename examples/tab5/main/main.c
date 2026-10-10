@@ -1519,7 +1519,7 @@ void app_main(void) {
 #endif
     size_t row = BSP_LCD_H_RES * 2;
     a.fb = (shr_surface){fb, BSP_LCD_H_RES, BSP_LCD_V_RES, row, row * BSP_LCD_V_RES, SHR_FORMAT_RGB565, 0, SHR_MEMORY_CPU, 0};
-    /* Keeps for the rows of CONFIG_SHIROKO_TAB5_KEEP_SCREENS screens, each in a slot of one logical row (40960 B);
+    /* Keeps for the rows of CONFIG_SHIROKO_TAB5_KEEP_SCREENS screens, each in a slot of one logical row of cells;
      * PSRAM, as place_alloc puts them. */
     uint32_t keeps = CONFIG_SHIROKO_TAB5_KEEP_SCREENS * (BSP_LCD_H_RES / CH);
     check(shr_software_driver_create(DRIVER_ALLOCATOR, keeps * (BSP_LCD_V_RES * CH * 2ull), keeps, 256, &a.sw), "driver");

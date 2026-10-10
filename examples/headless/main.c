@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define W 520
-#define H 224
+#define W (65 * SHR_CELL_WIDTH) /* 65 x 14 cells: 520 x 224 at 8x16 */
+#define H (14 * SHR_CELL_HEIGHT)
 #define BPP (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? 2 : 4)
 
 typedef struct image_output {

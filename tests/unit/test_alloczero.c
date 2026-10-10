@@ -19,7 +19,7 @@
 #ifndef ALLOCZERO_H
 #define ALLOCZERO_H 720
 #endif
-#define BAND_H SHR_CELL_HEIGHT
+#define BAND_H 16 /* as examples/tab5 */
 #define BPP (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 ? 2 : 4)
 #define KEEPS (4 * (ALLOCZERO_H / SHR_CELL_HEIGHT)) /* four screens of rows, as examples/tab5 */
 #define VT LOADS                                     /* the set_text terminal */
