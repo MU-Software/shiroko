@@ -473,33 +473,23 @@ static void bench_tilemap(void) {
         const char *const *sample;
         int n;
     } sets[] = {{"ascii", ascii, 8}, {"hangul", hangul, 4}, {"emoji", emoji, 3}, {"combining", combining, 3}};
-    for (size_t k = 0; k < sizeof(sets) / sizeof(sets[0]); k++) {
-        char name[96];
-        snprintf(name, sizeof(name), "tilemap/set_cell-%s", sets[k].name);
-        if (filter && !strstr(name, filter)) continue;
-        env e;
-        env_open(&e, -1);
-        shr_pl_res_bitmap_font *font = font_open(&e, FONT_BUILTIN);
-        term t;
-        term_open(&t, &e, font, sets[k].sample, sets[k].n, NULL);
-        run(name, op_set_cells, &t, (double)ROWS * COLS, "cell");
-        shr_lyr_destroy(t.l);
-        env_close(&e, font);
-    }
-    for (size_t k = 0; k < sizeof(sets) / sizeof(sets[0]); k++) {
-        char name[96];
-        snprintf(name, sizeof(name), "tilemap/set_row-%s", sets[k].name);
-        if (filter && !strstr(name, filter)) continue;
-        env e;
-        env_open(&e, -1);
-        shr_pl_res_bitmap_font *font = font_open(&e, FONT_BUILTIN);
-        row_term rt;
-        term_open(&rt.t, &e, font, sets[k].sample, sets[k].n, NULL);
-        row_term_init(&rt);
-        run(name, op_set_rows, &rt, (double)ROWS * COLS, "cell");
-        shr_lyr_destroy(rt.t.l);
-        env_close(&e, font);
-    }
+    for (int row = 0; row < 2; row++)
+        for (size_t k = 0; k < sizeof(sets) / sizeof(sets[0]); k++) {
+            char name[96];
+            snprintf(name, sizeof(name), row ? "tilemap/set_row-%s" : "tilemap/set_cell-%s", sets[k].name);
+            if (filter && !strstr(name, filter)) continue;
+            env e;
+            env_open(&e, -1);
+            shr_pl_res_bitmap_font *font = font_open(&e, FONT_BUILTIN);
+            row_term rt;
+            term_open(&rt.t, &e, font, sets[k].sample, sets[k].n, NULL);
+            if (row)
+                row_term_init(&rt), run(name, op_set_rows, &rt, (double)ROWS * COLS, "cell");
+            else
+                run(name, op_set_cells, &rt.t, (double)ROWS * COLS, "cell");
+            shr_lyr_destroy(rt.t.l);
+            env_close(&e, font);
+        }
     if (!filter || strstr("tilemap/set+flush+frame-all-rows", filter)) {
         env e;
         env_open(&e, -1);
