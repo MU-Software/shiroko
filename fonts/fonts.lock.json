@@ -166,9 +166,17 @@
       "url": "https://www.korean.go.kr/common/download.do?file_path=reportData&c_file_name=2c6f86ef-d5fe-489d-a545-9f6115c3d594_0.zip&o_file_name=%ED%98%84%EB%8C%80%20%EA%B5%AD%EC%96%B4%20%EC%82%AC%EC%9A%A9%20%EB%B9%88%EB%8F%84%20%EC%A1%B0%EC%82%AC%202.zip",
       "sha256": "e9d5b0baf3880dee5bff7681fc641f6b014a365705b674e0ea7105ba2c8a9251",
       "cache": "fonts",
-      "member": "음절통계.txt",
-      "member_encoding": "cp949",
-      "member_sha256": "cdb39168e789482486cba77d87f604a8be5e6cdfe90c20c35849c9926e7769b6",
+      "name_encoding": "cp949",
+      "members": {
+        "음절통계.txt": {
+          "encoding": "cp949",
+          "sha256": "cdb39168e789482486cba77d87f604a8be5e6cdfe90c20c35849c9926e7769b6"
+        },
+        "일반어휘통계.txt": {
+          "encoding": "utf-16",
+          "sha256": "343a291a801fd3f9345e254114e5669adbf855009e22f98b4dbcb801696c350e"
+        }
+      },
       "page": "https://www.korean.go.kr/front/reportData/reportDataView.do?mn_id=45&report_seq=1",
       "license": "KOGL Type 1 (공공누리 제1유형: 출처표시)",
       "license_url": "https://www.kogl.or.kr/info/licenseType1.do",

@@ -863,36 +863,58 @@ def frequency_ranks(counts):
 
 
 @functools.cache
+def korean_frequency(member):
+    """Rows (header dropped) of a table of the 2005 survey of the National Institute of Korean Language, None when
+    it was not fetched."""
+    data = order_input("korean-frequency-2005.zip")
+    if data is None:
+        return None
+    f = LOCK["order"]["korean-frequency-2005.zip"]
+    with zipfile.ZipFile(io.BytesIO(data), metadata_encoding=f["name_encoding"]) as z:
+        raw = z.read(member)
+    if sha256(raw) != f["members"][member]["sha256"]:
+        sys.exit(f"{order_path('korean-frequency-2005.zip')}: {member} does not match fonts.lock.json")
+    return [line.split("\t") for line in raw.decode(f["members"][member]["encoding"]).splitlines()[1:]]
+
+
+@functools.cache
 def cjk_order(locale):
     """({scalar: tier}, {scalar: rank}, inputs of the tiers, inputs of the ranks) of a CJK locale for --order hot.
-    The legacy set's tiers; Unihan puts the Korean education Hanja (kKoreanEducationHanja) ahead of the other
-    KS X 1001 Hanja and the Jōyō kanji (kJoyoKanji 2010) into the first ja tier, ahead of the other level 1 kanji.
-    Ranks: ko punctuation and jamo, then Hangul by syllable frequency in the 2005 survey of the National Institute
-    of Korean Language; zh by kHanyuPinlu."""
+    The legacy set's tiers; Unihan moves the Jōyō kanji (kJoyoKanji 2010) into the first ja tier, ahead of the
+    other level 1 kanji, and ranks zh by kHanyuPinlu. ko: punctuation and jamo, then Hangul by syllable frequency in
+    the 2005 survey of the National Institute of Korean Language; the Hanja after the symbols in tiers: Korean
+    education Hanja (kKoreanEducationHanja), the other Jōyō kanji, the other kHanyuPinlu Hanja, the other KS X 1001
+    Hanja; in each tier by the survey's vocabulary (the Hanja of each word, counted by the word's frequency), then
+    by kHanyuPinlu; the vocabulary's other Hanja lead the rest after the ranked Hangul."""
     tiers, ranks = dict(legacy_tiers(locale)), {}
     u = unihan()
-    if u and locale == "ko":
-        edu = u["kKoreanEducationHanja"]
-        tiers.update({cp: 3 for cp, t in tiers.items() if t == 2 and cp not in edu})
-    elif u and locale == "ja":
-        joyo = {cp for cp, v in u["kJoyoKanji"].items() if v == "2010"}
+    joyo = {cp for cp, v in u["kJoyoKanji"].items() if v == "2010"} if u else set()
+    pinlu = frequency_ranks({cp: sum(map(int, re.findall(r"\((\d+)\)", v)))
+                             for cp, v in u["kHanyuPinlu"].items()}) if u else {}
+    if u and locale == "ja":
         tiers.update({cp: 0 if cp in joyo else 2 if t else int(0x4E00 <= cp <= 0x9FFF) for cp, t in tiers.items()})
-    elif u:
-        ranks = frequency_ranks({cp: sum(map(int, re.findall(r"\((\d+)\)", v)))
-                                 for cp, v in u["kHanyuPinlu"].items()})
-        return tiers, ranks, [], ["Unihan.zip"]
-    data = order_input("korean-frequency-2005.zip") if locale == "ko" else None
-    if data:
-        f = LOCK["order"]["korean-frequency-2005.zip"]
-        with zipfile.ZipFile(io.BytesIO(data), metadata_encoding=f["member_encoding"]) as z:
-            raw = z.read(f["member"])
-        if sha256(raw) != f["member_sha256"]:
-            sys.exit(f"{order_path('korean-frequency-2005.zip')}: {f['member']} does not match fonts.lock.json")
-        counts = {ord(s): int(n) for _, n, s in (line.split("\t") for line in
-                                                  raw.decode(f["member_encoding"]).splitlines()[1:])}
+    elif u and locale != "ko":
+        return tiers, pinlu, [], ["Unihan.zip"]
+    if locale != "ko":
+        return tiers, ranks, ["Unihan.zip"] if u else [], []
+    syllables = korean_frequency("음절통계.txt")
+    if syllables:
+        counts = {ord(s): int(n) for _, n, s in syllables}
         top = max(counts.values()) + 1
         ranks = frequency_ranks(counts | {cp: top for cp, t in tiers.items() if t == 0 and not 0xAC00 <= cp <= 0xD7A3})
-    return tiers, ranks, ["Unihan.zip"] if u else [], ["korean-frequency-2005.zip"] if data else []
+    words = collections.Counter()
+    for row in korean_frequency("일반어휘통계.txt") or ():
+        for c in dict.fromkeys(row[3] if len(row) > 3 and row[1].isdigit() else ""):
+            if 0x3400 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF or 0x20000 <= ord(c) <= 0x3FFFF:
+                words[ord(c)] += int(row[1])
+    vocabulary = frequency_ranks(words)
+    edu = set(u["kKoreanEducationHanja"]) if u else set()
+    hanja = {cp for cp, t in tiers.items() if t >= 2} | edu | joyo | set(pinlu)
+    tiers.update({cp: 2 if cp in edu else 3 if cp in joyo else 4 if cp in pinlu else 5 for cp in hanja})
+    order = sorted(hanja | set(vocabulary),
+                   key=lambda cp: (vocabulary.get(cp, len(vocabulary)), pinlu.get(cp, len(pinlu)), cp))
+    ranks |= {cp: len(ranks) + r for r, cp in enumerate(order)}
+    return tiers, ranks, ["Unihan.zip"] if u else [], ["korean-frequency-2005.zip"] if syllables else []
 
 
 def slot_order(pkg, key, ranked):
@@ -1457,8 +1479,9 @@ def write_licenses(out, names, reports):
                + (" Unihan (Unihan.zip) orders CJK glyphs." if "Unihan.zip" in used else ""), ""]
     if "korean-frequency-2005.zip" in used:
         ko = LOCK["order"]["korean-frequency-2005.zip"]
-        notice += ["The Hangul glyphs are ordered by the syllable frequencies of 현대 국어 사용 빈도 조사 2 (National "
-                   f"Institute of Korean Language, 2005), {ko['license']}, {ko['license_url']}:", ko["attribution"], ""]
+        notice += ["The Hangul glyphs are ordered by the syllable frequencies and the Hanja by the vocabulary "
+                   "frequencies of 현대 국어 사용 빈도 조사 2 (National Institute of Korean Language, 2005), "
+                   f"{ko['license']}, {ko['license_url']}:", ko["attribution"], ""]
     (out / "NOTICE").write_text("\n".join(notice) + "\n", encoding="utf-8")
     (out / "inventory.json").write_text(json.dumps(inventory, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
