@@ -97,6 +97,7 @@
 #define CHAIN 64           /* queued copies, and rotations */
 #define SPARES 3           /* PSRAM bands drawn into while an internal band still waits for the hardware */
 #define SLOTS (BANDS + SPARES)
+#define PLANE_BYTES (2u << 20) /* the software driver's planes for translucent images */
 
 #define FONT_SUBTYPE 0x40
 
@@ -156,7 +157,8 @@ static EXT_RAM_BSS_ATTR struct {
     scene_stats stats[REPS][LOADS][MODES];
 } log_ram;
 
-static struct {
+/* In PSRAM as well; app_main sets cur and the log pointers. */
+static EXT_RAM_BSS_ATTR struct {
     esp_lcd_panel_handle_t panel;
     shr_surface fb, bands[BANDS];
     shr_framebuffer_driver drv, sw; /* drv runs ROTATE on the PPA, the rest on sw */
@@ -173,7 +175,7 @@ static struct {
     float (*t)[SCROLL_FRAMES];
     uint32_t (*sums)[LOADS][MODES];
     scene_stats (*stats)[LOADS][MODES];
-} a = {.cur = -1, .t = log_ram.t, .sums = log_ram.sums, .stats = log_ram.stats};
+} a;
 
 static void check(shr_status st, const char *what) {
     if (st == SHR_OK) return;
@@ -217,9 +219,8 @@ typedef struct ppa_op {
 /* A cap on the copy rate in MB/s (bytes per us), leaving PSRAM bandwidth to the app; 0 = none. */
 static uint32_t dma_mbps = TAB5_DMA_MBPS;
 
-enum { MOVE_AUTO, MOVE_ONE, MOVE_TWO, MOVE_COLUMNS };
+enum { MOVE_AUTO, MOVE_ONE, MOVE_COLUMNS };
 static struct {
-    uint16_t *tmp;
     int32_t up_max;
     bool ok;   /* B and C advertise moves */
     int force; /* the self-test's way */
@@ -588,8 +589,9 @@ static const shr_software_copier p4_copier = {.copy = keep_copy, .wait = keep_wa
  * its burst along a row (measured, not documented; a burst or more can pass the self-test yet go wrong while the CPU
  * writes PSRAM): the boot self-test finds how far one copy goes below a burst (up_max pixels).
  * Farther along a row, the window moves in columns as wide as the move, from the far end on, each started once the
- * one before is done; other moves take two copies through `tmp`. A copy runs in TAB5_MOVE_CHUNKS runs of rows, which
- * dma_mbps spaces out. Moves start once the rotations queued before them are done. */
+ * one before is done. A move across rows (none on a screen turned a quarter) is left to the CPU. A copy runs in
+ * TAB5_MOVE_CHUNKS runs of rows, which dma_mbps spaces out. Moves start once the rotations queued before them are
+ * done. */
 
 /* Queues `q` in runs of rows after copy `after`; the ticket of the last. */
 static uint32_t move_queue(async_color_convert_request_t q, uint32_t after) {
@@ -606,7 +608,8 @@ static uint32_t move_queue(async_color_convert_request_t q, uint32_t after) {
 }
 
 static bool is_move(const shr_surface *d, const shr_draw_cmd *c) {
-    return c->kind == SHR_CMD_COPY && c->src.pixels == d->pixels && mv.ok && packed565(d, &c->src);
+    return c->kind == SHR_CMD_COPY && c->src.pixels == d->pixels && c->src_origin.y == c->dst.y0 && mv.ok &&
+           packed565(d, &c->src);
 }
 
 /* Queues `c`, a COPY of `d` onto itself. */
@@ -617,8 +620,8 @@ static void move_start(const shr_surface *d, const shr_draw_cmd *c) {
         .dst_buffer = d->pixels, .dst_stride = (uint32_t)d->width, .dst_height = (uint32_t)d->height,
         .dst_x = (uint32_t)c->dst.x0, .dst_y = (uint32_t)c->dst.y0,
         .copy_width = (uint32_t)(c->dst.x1 - c->dst.x0), .copy_height = (uint32_t)(c->dst.y1 - c->dst.y0)};
-    int32_t up = c->src_origin.y == c->dst.y0 ? c->dst.x0 - c->src_origin.x : INT32_MAX;
-    int way = mv.force ? mv.force : up <= mv.up_max ? MOVE_ONE : up < INT32_MAX ? MOVE_COLUMNS : MOVE_TWO;
+    int32_t up = c->dst.x0 - c->src_origin.x;
+    int way = mv.force ? mv.force : up <= mv.up_max ? MOVE_ONE : MOVE_COLUMNS;
     if (way == MOVE_COLUMNS) {
         for (int32_t x = (int32_t)q.copy_width; x > 0; x -= up) {
             async_color_convert_request_t s = q;
@@ -627,12 +630,6 @@ static void move_start(const shr_surface *d, const shr_draw_cmd *c) {
             mv.last = move_queue(s, mv.last);
         }
         return;
-    }
-    if (way == MOVE_TWO) {
-        async_color_convert_request_t to_tmp = q;
-        to_tmp.dst_buffer = mv.tmp, to_tmp.dst_x = q.src_x, to_tmp.dst_y = q.src_y;
-        mv.last = move_queue(to_tmp, mv.last);
-        q.src_buffer = mv.tmp;
     }
     mv.last = move_queue(q, mv.last);
 }
@@ -663,17 +660,16 @@ static int64_t move_try(int32_t s, int way, int32_t x0) {
 }
 
 /* Moves are advertised once one copy moves a row (CH pixels) both ways, from column 0 and from column CH on (as below
- * a status line), and columns and two copies move any distance. */
+ * a status line), and columns move any distance. */
 static void move_setup(void) {
-    mv.tmp = heap_caps_aligned_alloc(CONFIG_CACHE_L2_CACHE_LINE_SIZE, a.fb.byte_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    printf("move self-test (DMA2D burst %d, %d runs, %lu MB/s cap, temporary frame %s):", DMA_BURST, TAB5_MOVE_CHUNKS,
-           (unsigned long)dma_mbps, mv.tmp ? "ok" : "none");
-    if (!mv.tmp || !TAB5_MOVES) {
+    printf("move self-test (DMA2D burst %d, %d runs, %lu MB/s cap):", DMA_BURST, TAB5_MOVE_CHUNKS,
+           (unsigned long)dma_mbps);
+    if (!TAB5_MOVES) {
         printf(" moves off\n");
         return;
     }
     static const int32_t shifts[] = {CH, 2 * CH, 3 * CH, 4 * CH, 6 * CH, -CH, -5 * CH};
-    bool down = true, gap = false, far = true;
+    bool down = true, gap = false;
     for (size_t i = 0; i < N(shifts); i++) {
         int32_t s = shifts[i];
         bool ok = true;
@@ -685,18 +681,10 @@ static void move_setup(void) {
         gap |= s > 0 && !ok;
         down &= s > 0 || ok;
     }
-    static const struct {
-        int way;
-        int32_t s;
-        const char *name;
-    } fars[] = {{MOVE_COLUMNS, 5 * CH, "columns"}, {MOVE_TWO, 5 * CH, "two copies"}, {MOVE_TWO, -CH, "two copies"}};
-    for (size_t i = 0; i < N(fars); i++) {
-        int64_t t = move_try(fars[i].s, fars[i].way, 0);
-        printf(" %s %+ld %s", fars[i].name, (long)fars[i].s, t >= 0 ? "ok" : "WRONG");
-        if (t >= 0) printf(" %.2f ms", (double)t / 1000);
-        far &= t >= 0;
-    }
-    mv.ok = mv.up_max >= CH && down && far;
+    int64_t t = move_try(5 * CH, MOVE_COLUMNS, 0);
+    printf(" columns %+ld %s", (long)(5 * CH), t >= 0 ? "ok" : "WRONG");
+    if (t >= 0) printf(" %.2f ms", (double)t / 1000);
+    mv.ok = mv.up_max >= CH && down && t >= 0;
     printf(" -> one copy up to +%ld px, moves %s\n", (long)mv.up_max, mv.ok ? "on in B and C" : "off");
 }
 
@@ -1047,11 +1035,12 @@ static void frame(bool submit) {
 }
 
 static void heap_line(const char *when) {
-    printf("  heap %s: free internal %u KiB (largest %u KiB), PSRAM %u KiB, budget %u/%u/%u KiB used/peak/cap, hot in"
-           " PSRAM %u KiB, least free internal since boot %u KiB\n", when,
+    printf("  heap %s: free internal %u KiB (largest %u KiB), PSRAM %u KiB (largest %u KiB), budget %u/%u/%u KiB"
+           " used/peak/cap, hot in PSRAM %u KiB, least free internal since boot %u KiB\n", when,
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >> 10),
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >> 10),
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >> 10), (unsigned)(budget.used >> 10),
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >> 10),
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) >> 10), (unsigned)(budget.used >> 10),
            (unsigned)(budget.peak >> 10), (unsigned)(BUDGET >> 10), (unsigned)(budget.spilled >> 10),
            (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) >> 10));
 }
@@ -1119,6 +1108,8 @@ static void scene_open(int load, int mode, rec_writer *w, rec_profile *p, rec_ca
 static void scene_close(void) {
     t5_scene_close(&a.s);
     check(a.s.st, a.s.what);
+    /* The driver outlives the context: its image planes go now rather than when their ids are registered again. */
+    check(shr_software_driver_image_planes(&a.sw, PLANE_BYTES), "planes");
 }
 
 /* FNV-1a of the frame buffer as the panel shows it. */
@@ -1499,6 +1490,7 @@ static void *headless_fb(void) {
 #endif
 
 void app_main(void) {
+    a.cur = -1, a.t = log_ram.t, a.sums = log_ram.sums, a.stats = log_ram.stats;
     a.task = xTaskGetCurrentTaskHandle();
 #if CONFIG_ESP_TASK_WDT_INIT /* loop frames run back to back on this core: its idle task may not run for seconds */
     (void)esp_task_wdt_reconfigure(&(esp_task_wdt_config_t){
@@ -1531,8 +1523,8 @@ void app_main(void) {
      * PSRAM, as place_alloc puts them. */
     uint32_t keeps = CONFIG_SHIROKO_TAB5_KEEP_SCREENS * (BSP_LCD_H_RES / CH);
     check(shr_software_driver_create(DRIVER_ALLOCATOR, keeps * (BSP_LCD_V_RES * CH * 2ull), keeps, 256, &a.sw), "driver");
-    /* Planes for 1 MiB of translucent images (opaque ones stay RGB565); the rest blend from their buffers. */
-    check(shr_software_driver_image_planes(&a.sw, 2u << 20), "planes");
+    /* Planes for 2 MiB of translucent images (opaque ones stay RGB565); the rest blend from their buffers. */
+    check(shr_software_driver_image_planes(&a.sw, PLANE_BYTES), "planes");
     async_color_convert_config_t cc = {.backlog = DMA_QUEUE, .dma_burst_size = DMA_BURST};
     ESP_ERROR_CHECK(esp_async_color_convert_install_dma2d(&cc, &hw.conv));
     ESP_ERROR_CHECK(esp_timer_create(&(esp_timer_create_args_t){.callback = dma_paced, .name = "dma pace"}, &hw.pace));

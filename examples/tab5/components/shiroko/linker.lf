@@ -1,0 +1,11 @@
+# The software driver's ON_FILL palettes (shr__pals, the only data of raster.c) in PSRAM: internal RAM is the app's.
+[scheme:shiroko_psram_bss]
+entries:
+    bss -> extern_ram
+    common -> extern_ram
+
+[mapping:shiroko]
+archive: libshiroko.a
+entries:
+    if SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        raster (shiroko_psram_bss)

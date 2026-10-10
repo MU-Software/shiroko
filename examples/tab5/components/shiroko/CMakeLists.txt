@@ -1,5 +1,5 @@
 # Shiroko's own CMake build, fed by the host build that `make tab5-build` makes first.
-idf_component_register()
+idf_component_register(LDFRAGMENTS linker.lf)
 set(_root ${CMAKE_CURRENT_LIST_DIR}/../../../..)
 set(SHIROKO_TAB5_HOST ${_root}/build/tab5-host CACHE PATH "Host build with generated/, fonts/ and vcpkg_installed/")
 file(GLOB _utlist ${SHIROKO_TAB5_HOST}/vcpkg_installed/*/include/utlist.h)

@@ -285,6 +285,8 @@ Measured on Tab5 (ST7121 panel, 2026-10-04) with a probe task on core 1, rendere
   copied (restyle4: 600 stores, p50 47.6 ms); 2 frees 3.6 MiB (restyle4 p50 55.7 ms; a new screen every 20 frames
   ~2 ms faster at worst: fewer rows stored that are never drawn again). The desktop
   example's `--keeps N` and the replay bench's `SHR_REPLAY_KEEPS` set the same count.
+- On a screen turned a quarter onto the panel, as in the example, scrolls move pixels only along the panel's rows, so
+  the DMA2D moves them in place and needs no temporary frame (the example keeps none, 1.8 MiB of PSRAM less).
 
 What a change costs the renderer per frame on Tab5 (ILI9881C panel, 2026-10-06, uncapped, two bands), from scenes on
 a 160 x 45 grid of Latin text: the frame as the example measures it (p50 / MAX over 60 frames, with the app's own work
