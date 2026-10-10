@@ -570,7 +570,7 @@ static void op_image_update(void *arg) {
 }
 
 static void bench_image(void) {
-    if (filter && !strstr("image/", filter)) return;
+    if (filter && !strstr("image/create+release-512", filter) && !strstr("image/update-512", filter)) return;
     env e;
     env_open(&e, -1);
     uint8_t *px = malloc(512 * 512 * 4);
