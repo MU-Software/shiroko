@@ -6,7 +6,7 @@
         tools-env fontpack-fetch fontpack fontpack-locales \
         test-asan test-ubsan test-tsan sanitizer-image test-asan-linux test-lsan-linux test-msan-linux \
         test-tsan-linux test-ubsan-linux test-hwasan-linux test-rtsan-linux test-sanitizers \
-        fuzz fuzz-msan vt-run desktop-run tab5-host tab5-build tab5-idf tab5-flash tab5-monitor coverage test-gcc gcc-image clean
+        fuzz fuzz-msan desktop-run tab5-host tab5-build tab5-idf tab5-flash tab5-monitor coverage test-gcc gcc-image clean
 
 COMMA := ,
 NPROC := $(shell getconf _NPROCESSORS_ONLN)
@@ -217,12 +217,6 @@ fuzz: $(FETCHED)
 	$(call fuzz_run,asan,address$(COMMA)undefined)
 fuzz-msan: $(FETCHED)
 	$(call fuzz_run,msan,memory)
-
-vt-run: $(FETCHED)
-	git submodule update --init --depth 1 third_party/ghostty
-	cmake -S examples/vt -B build/vt-example $(CMAKE_HOST) -DCMAKE_BUILD_TYPE=Release
-	cmake --build build/vt-example --target shiroko_vt shiroko_fonts
-	./build/vt-example/shiroko_vt build/vt-example/shiroko-vt build/vt-example/fonts examples/vt/fixture.ans
 
 # SDL3 window with the software and ANGLE drivers; DESKTOP_ARGS adds options (e.g. --load scroll --frames 300 --quit).
 # RGBX8888 unless PIXEL_FORMAT is given: SDL's Metal renderer has no RGB565 texture and converts it every frame.

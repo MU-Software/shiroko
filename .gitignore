@@ -11,7 +11,6 @@ __pycache__/
 *.profraw
 *.profdata
 /shiroko-headless.ppm
-/shiroko-vt-*.ppm
 /golden-*.ppm
 /crash-*
 /timeout-*

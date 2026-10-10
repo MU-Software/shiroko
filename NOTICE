@@ -80,6 +80,3 @@ uthash (vcpkg port uthash, header macros expanded into the library)
 Font packages (<build dir>/fonts, installed to share/shiroko/fonts; not part
 of the library) carry their own NOTICE, LICENSES/ and inventory.json written
 by tools/fontpack/fontpack.py.
-
-The examples/vt consumer links libghostty-vt (MIT, Ghostty authors) built with
-Zig 0.16.0; that app, not the library, must preserve those notices.

@@ -1,2 +1,1 @@
-examples/vt/fixture.ans -text
 tests/fuzz/corpus/** binary

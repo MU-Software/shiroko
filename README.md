@@ -12,7 +12,6 @@ SPDX-License-Identifier: MIT (see `LICENSE`; third-party notices in `NOTICE`).
 - [uv](https://docs.astral.sh/uv/) for the Python tools (`pyproject.toml`, `uv.lock`, `.python-version`)
 - Docker for the Linux sanitizer, fuzz and x86_64 GCC targets (`make sanitizer-image gcc-image`)
 - For `make desktop-run` only: SDL3 and a shared ANGLE, both through vcpkg (preset `desktop`)
-- For `make vt-run` only: Zig 0.16.0 (`brew install zig`) and the `third_party/ghostty` submodule
 - For `make tab5-build` only: Docker with the `espressif/idf:v6.1` image (M5Stack Tab5, ESP32-P4); vcpkg installs
   zstd's decoder sources (overlay port `cmake/ports/zstd-source`, feature `zstd-source`) for ESP-IDF to compile
 
@@ -68,7 +67,6 @@ make fontpack-locales  # all packages, every CJK locale, into build/fonts-locale
 make render-test   # render comparison suite (goldens, reftests)
 make render-export # every scene as PNG into build/render (RENDER_ARGS='--frames 100' times them instead)
 make headless-run  # render examples/headless into a PPM image
-make vt-run        # libghostty-vt consumer example
 make desktop-run   # SDL3 window, software and ANGLE drivers (DESKTOP_ARGS='--load scroll --frames 300 --quit')
 make tab5-build    # M5Stack Tab5 firmware (examples/tab5) into build/tab5; tab5-flash, tab5-monitor (PORT=...)
 make bench         # per-part throughput (BENCH=software|compositor|tilemap|font|image|terminal filters;
