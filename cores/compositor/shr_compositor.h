@@ -14,6 +14,7 @@
 const shr__alloc *shr__ctx_alloc(const shr_context *ctx);
 /* The descriptor given to shr_create() (budgets, retry policy); pointers in it are not kept. */
 const shr_context_desc *shr__ctx_desc(const shr_context *ctx);
+uint32_t shr__ctx_driver_flags(const shr_context *ctx); /* the caps flags shr_create() read */
 uint64_t shr__ctx_now(const shr_context *ctx); /* 0 without a clock */
 uint64_t shr__sat_add(uint64_t a, uint64_t b); /* deadlines: UINT64_MAX on overflow */
 /* Bumped by shr_asset_ready(): read it before a read or open, retry what a source refused once it changed. */
@@ -74,6 +75,7 @@ typedef struct shr__resolved {
     bool provisional;  /* temporary fallback: redrawn after pump() reports a change */
     uint32_t synth;    /* SHR_GLYPH_BOLD / SHR_GLYPH_ITALIC the glyph may be drawn with */
     int32_t slant_axis; /* twice the rect y the italic shear turns about */
+    int32_t scale_w, scale_h; /* IMAGE: `rect` drawn scaled to this size; 0: not scaled */
 } shr__resolved;
 
 typedef struct shr__res_ops {

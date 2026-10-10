@@ -2,6 +2,7 @@
 
 const shr__alloc *shr__ctx_alloc(const shr_context *ctx) { return &ctx->al; }
 const shr_context_desc *shr__ctx_desc(const shr_context *ctx) { return &ctx->desc; }
+uint32_t shr__ctx_driver_flags(const shr_context *ctx) { return ctx->driver.caps.flags; }
 uint64_t shr__ctx_now(const shr_context *ctx) { return ctx->desc.now_ns ? ctx->desc.now_ns(ctx->desc.user) : 0; }
 bool shr__ctx_refused(const shr_context *ctx) { return ctx->shutting_down || ctx->in_callback; }
 

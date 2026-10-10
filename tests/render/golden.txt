@@ -49,6 +49,10 @@ many-commands-rot90cw-ref-8x16-rgb565 1b95d846b21ecc318dd12818f536b323
 image-alpha-8x16-rgb565 baa051cd1f9118ea56bfe34b0d147127
 image-update-8x16-rgb565 c19494d822349ff96ccb964fcda9f507
 image-update-ref-8x16-rgb565 c19494d822349ff96ccb964fcda9f507
+image-scaled-8x16-rgb565 b478779bf7f47fd72861ec06f555acf7
+image-scaled-view-8x16-rgb565 b478779bf7f47fd72861ec06f555acf7
+image-scaled-update-8x16-rgb565 ab2d0dfb4a9bac629974db5c3127d9ab
+image-scaled-update-ref-8x16-rgb565 ab2d0dfb4a9bac629974db5c3127d9ab
 alpha-zero-8x16-rgb565 dedb682ae62e1624d596218a5343f1a4
 alpha-zero-ref-8x16-rgb565 dedb682ae62e1624d596218a5343f1a4
 ramp-fill-8x16-rgb565 8818da097a42d3ca8eec7c14ddfb4d89
@@ -129,6 +133,10 @@ many-commands-rot90cw-ref-8x16-rgbx8888 7a401d1cbf140e4ce19a6440187a9fc3
 image-alpha-8x16-rgbx8888 c18dfded08aaf1472c27d4a2f6d15baf
 image-update-8x16-rgbx8888 b0ce0e67e1ce686058761e28cdfe29fb
 image-update-ref-8x16-rgbx8888 b0ce0e67e1ce686058761e28cdfe29fb
+image-scaled-8x16-rgbx8888 eb6e40be8e39f0aca9d0542ff43540c4
+image-scaled-view-8x16-rgbx8888 eb6e40be8e39f0aca9d0542ff43540c4
+image-scaled-update-8x16-rgbx8888 313dce8e9bc1ea055e709e477ccf4e93
+image-scaled-update-ref-8x16-rgbx8888 313dce8e9bc1ea055e709e477ccf4e93
 alpha-zero-8x16-rgbx8888 7804b398cc957d213ec1a1a5c0441515
 alpha-zero-ref-8x16-rgbx8888 7804b398cc957d213ec1a1a5c0441515
 ramp-fill-8x16-rgbx8888 dff0fe13101fa05d7d30fc3f30176b11

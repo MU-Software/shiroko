@@ -34,10 +34,12 @@ enum { MODE_FILL, MODE_GLYPH, MODE_SYNTH, MODE_IMAGE, MODE_KEEP, MODE_COPY, MODE
 #define CELL_WORDS (SHR_LINE_MAX_PERIOD * SHR_LINE_MAX_BAND / 4) /* a CURLY or DOTTED cell in u_cells */
 _Static_assert(CELL_WORDS == 64, "the shader's u_cells: CURLY in words 0..63, DOTTED in 64..127");
 enum { FLAG_A4 = 8 }; /* beside SHR_GLYPH_DIM, BOLD and ITALIC */
+/* MODE_IMAGE: SCALED, and src_rect reaching the buffer's right or bottom edge (where taps clamp). */
+enum { FLAG_SCALED = 16, FLAG_EDGE_X = 64, FLAG_EDGE_Y = 128 };
 
 /* One quad, in destination coordinates: `clip` limits `dst`; `rect` is the buffer rect outside which coverage is 0;
  * `src` holds the source texel at dst.x0, dst.y0 (rotations: the offset added to the rotated pixel) and the slant
- * axis. */
+ * axis; a SCALED IMAGE's the scaled pixel at dst.x0, dst.y0 and scale_w, scale_h. */
 typedef struct inst {
     int16_t dst[4], clip[4], rect[4], src[4];
     uint8_t unit, layer, mode, flags;
@@ -137,7 +139,7 @@ static const char *const vs_src =
     "    gl_Position = vec4(pos * u_scale - 1.0, 0.0, 1.0);\n"
     "    v_rect = vec4(a_rect);\n"
     "    v_src = vec4(a_info.z >= 6u && a_info.z <= 8u ? a_src.xy : a_src.xy - a_dst.xy, a_src.z, a_info.w);\n"
-    "    v_info = vec4(a_info.xyz, 0.0);\n"
+    "    v_info = vec4(a_info.xyz, a_src.w);\n"
     "    v_color = a_color;\n"
     "}\n";
 
@@ -187,6 +189,17 @@ static const char *const fs_src =
     "    return x >= rect.x && x < rect.z ? c : 0;\n"
     "}\n"
     "int bolden(int l, int m, int r) { return (flags & 2) == 0 || r > m ? m : max(m, l); }\n"
+    /* shiroko_driver.h's SCALED IMAGE in integers, t taken apart so that it fits 32 bits. */
+    "ivec4 at(ivec2 t) { return ivec4(floor(texel(t) * 255.0 + 0.5)); }\n"
+    "vec4 scaled(ivec2 i, ivec2 d) {\n"
+    "    ivec2 n = (2 * i + 1) * (rect.zw - rect.xy) + d, q = n / d;\n"
+    "    ivec2 t = q * 32768 + ((n - q * d) * 32768) / d;\n"
+    "    ivec2 k = rect.xy + (t >> 16) - 1, f = (t >> 8) & 255;\n"
+    "    ivec2 a = max(k, 0), b = min(k + 1, rect.zw - ivec2((flags >> 6) & 1, (flags >> 7) & 1));\n"
+    "    ivec4 top = at(a) * (256 - f.x) + at(ivec2(b.x, a.y)) * f.x;\n"
+    "    ivec4 bot = at(ivec2(a.x, b.y)) * (256 - f.x) + at(b) * f.x;\n"
+    "    return vec4((top * (256 - f.y) + bot * f.y + 32768) >> 16) / 255.0;\n"
+    "}\n"
     "int line_cov(int x, int y) {\n"
     "    int w = rect.z, shape = flags >> 4;\n"
     "    x = x % w;\n"
@@ -226,7 +239,7 @@ static const char *const fs_src =
     "        if ((flags & 1) != 0) c = (c + 1) >> 1;\n"
     "        o = vec4(v_color.rgb, float(c) / 255.0);\n"
     "    } else if (mode == 3) {\n"
-    "        o = texel(s);\n"
+    "        o = (flags & 16) != 0 ? scaled(s, ivec2(s4.z, int(floor(v_info.w + 0.5)))) : texel(s);\n"
     "    } else if (mode == 4) {\n"
     "        o = vec4(texel(s).rgb, 1.0);\n"
     "    } else {\n"
@@ -700,6 +713,12 @@ static void draw(gl_drv *g, const run *x, const shr_draw_cmd *c, shr_rect clip) 
         v.unit = unit_of(g, s->c), v.layer = (uint8_t)s->layer;
         v.mode = c->kind == SHR_CMD_IMAGE ? MODE_IMAGE : c->flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC) ? MODE_SYNTH : MODE_GLYPH;
         v.flags = (uint8_t)((c->flags & 7) | (g->bufs[c->buffer - 1].format == SHR_FORMAT_A4 ? FLAG_A4 : 0));
+        if (c->kind == SHR_CMD_IMAGE && (c->flags & SHR_IMAGE_SCALED)) { /* checked: sizes within int16 */
+            const shr_image *b = &g->bufs[c->buffer - 1];
+            v.src[0] = (int16_t)(c->src_origin.x + m.x), v.src[1] = (int16_t)(c->src_origin.y + m.y);
+            v.src[2] = (int16_t)c->scale_w, v.src[3] = (int16_t)c->scale_h;
+            v.flags = (uint8_t)(FLAG_SCALED | (r.x1 == b->width ? FLAG_EDGE_X : 0) | (r.y1 == b->height ? FLAG_EDGE_Y : 0));
+        }
     } else if (c->kind == SHR_CMD_LINE) {
         line_cell(g, c);
         put_rect(v.rect, c->src_rect);
@@ -968,7 +987,7 @@ shr_status shr_angle_driver_create(const shr_allocator *allocator, uint64_t text
     out->caps.max_keeps = max_keeps;
     out->caps.keep_bytes = keep_bytes;
     out->caps.max_keep_bytes = keep_slot;
-    out->caps.flags = SHR_DRIVER_CHEAP_MOVE;
+    out->caps.flags = SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE;
     out->execute = gl_execute;
     out->reset = gl_reset;
     return SHR_OK;

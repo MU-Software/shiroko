@@ -1,5 +1,6 @@
 /* Software raster with arbitrary command batches, including buffer commands, keep groups, KEEP_DRAW and KEEP_RELEASE,
- * BOLD/ITALIC glyphs drawn from buffer regions, ON_FILL ones also where no FILL lies under them, and LINE patterns.
+ * BOLD/ITALIC glyphs drawn from buffer regions, ON_FILL ones also where no FILL lies under them, LINE patterns
+ * and SCALED images.
  * Invariants:
  *   - the driver accepts a batch exactly when the rules predict it (a ROTATE's own validity comes from the stateless
  *     path); a rejected batch writes nothing; a COPY of the destination onto itself moves its pixels
@@ -286,6 +287,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                     c->slant_axis = a == 127 ? INT32_MAX : a <= -127 ? INT32_MIN : a > 100 || a < -100 ? 40 * a : a;
                     c->bg = 0;
                 }
+                if (c->kind == SHR_CMD_IMAGE && (c->flags & 8)) { /* sizes past the 1..32767 bounds too */
+                    int32_t xw = fr_i8(&r), xh = fr_i8(&r);
+                    c->flags = SHR_IMAGE_SCALED;
+                    c->scale_w = xw == 127 ? 32767 : xw == -128 ? 32768 : xw;
+                    c->scale_h = xh == 127 ? 32767 : xh == -128 ? 32768 : xh;
+                }
                 shr_image b = registered(c->buffer) ? model[c->buffer - 1] : (shr_image){0};
                 shr_rect s = c->src_rect;
                 int32_t rw = s.x1 - s.x0, rh = s.y1 - s.y0;
@@ -301,6 +308,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                     int32_t k0 = italic ? slant(c->slant_axis, 0, &frac) : 0;
                     x0 = italic ? slant(c->slant_axis, rh - 1, &unused) : 0;
                     x1 = rw + (syn & SHR_GLYPH_BOLD ? 1 : 0) + k0 + frac;
+                }
+                if (c->flags & SHR_IMAGE_SCALED && c->kind == SHR_CMD_IMAGE) {
+                    rect_ok &= rw > 0 && rh > 0 && c->scale_w >= 1 && c->scale_w <= 32767 && c->scale_h >= 1 &&
+                               c->scale_h <= 32767;
+                    x1 = c->scale_w, rh = c->scale_h;
                 }
                 expect_ok &= in && b.format && fmt_ok && rect_ok && axis_ok && c->src_origin.x >= x0 &&
                              c->src_origin.y >= 0 && c->src_origin.x + dw <= x1 && c->src_origin.y + dh <= rh;

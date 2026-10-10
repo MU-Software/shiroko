@@ -26,7 +26,8 @@ static shr_status gf_resolve(shr__res *r, uint64_t id, uint64_t frame, const shr
     if (!id) return SHR_E_NOT_FOUND;
     int32_t x = (int32_t)(id % NGLYPHS) * CW;
     gfake *g = (gfake *)r;
-    g->r = (shr__resolved){&g->buf, {x, 0, x + CW, CH}, {0, 0}, false, SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC, CH};
+    g->r = (shr__resolved){.buf = &g->buf, .rect = {x, 0, x + CW, CH}, .synth = SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC,
+                            .slant_axis = CH};
     *out = &g->r;
     return SHR_OK;
 }

@@ -4,6 +4,7 @@
 #include "raster.h"
 #include "shr_glyph.h"
 #include "shr_rect.h"
+#include "shr_scale.h"
 
 /* 1 on cores without SIMD, where the blend loops stay scalar: they skip zero coverage and store full coverage without
  * DIM as the colour itself, the same bytes the blend gives. A build may define it either way. */
@@ -150,6 +151,12 @@ static shr_status region_check(const shr_draw_cmd *c, const shr_image *buffers, 
     if (image ? b->format != SHR_FORMAT_RGBA8888 : !a4 && b->format != SHR_FORMAT_A8) return SHR_E_UNSUPPORTED;
     shr_rect r = c->src_rect;
     if (!rect_inside(r, (shr_rect){0, 0, b->width, b->height}) || (a4 && (r.x0 & 1))) return SHR_E_INVALID_ARG;
+    if (image && (c->flags & SHR_IMAGE_SCALED)) {
+        if (shr__rect_empty(r) || r.x1 - r.x0 > SHR__SCALE_MAX || r.y1 - r.y0 > SHR__SCALE_MAX || c->scale_w <= 0 ||
+            c->scale_h <= 0 || c->scale_w > SHR__SCALE_MAX || c->scale_h > SHR__SCALE_MAX)
+            return SHR_E_INVALID_ARG;
+        return origin_check(c, c->scale_w, c->scale_h, 0);
+    }
     return origin_check(c, r.x1 - r.x0, r.y1 - r.y0, image ? 0 : c->flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC));
 }
 
@@ -779,6 +786,37 @@ static void do_image(const shr_surface *dst, const shr_draw_cmd *c, const shr_im
         image_rows(dst, c, b, r, s, SHR_FORMAT_RGBX8888);
 }
 
+/* A SCALED IMAGE: the scaled pixels a SPAN at a time, blended as image_px() blends. */
+static inline __attribute__((always_inline)) void scaled_rows(const shr_surface *dst, const shr_draw_cmd *c,
+                                                              const shr_image *b, shr_rect r, shr_point s,
+                                                              shr_pixel_format f) {
+    shr__scale sc = {.pixels = b->pixels, .stride = b->stride, .w = b->width, .h = b->height,
+                     .format = SHR_IMAGE_SRC_RGBA8888, .src = c->src_rect, .dw = c->scale_w, .dh = c->scale_h,
+                     .filter = SHR_SCALE_BILINEAR};
+    size_t bpp = shr__px_bytes(f);
+    uint8_t px[SPAN * 4];
+    for (int32_t y = r.y0; y < r.y1; y++) {
+        uint8_t *line = pixel_at(dst, r.x0, y);
+        for (int32_t x = 0; x < r.x1 - r.x0; x += SPAN) {
+            int32_t n = r.x1 - r.x0 - x < SPAN ? r.x1 - r.x0 - x : SPAN;
+            shr__scale_row(&sc, s.y + (y - r.y0), s.x + x, n, px);
+            for (int32_t k = 0; k < n; k++) {
+                uint32_t v;
+                __builtin_memcpy(&v, px + 4 * k, 4);
+                image_px(f, line + (size_t)(x + k) * bpp, v);
+            }
+        }
+    }
+}
+
+static void do_image_scaled(const shr_surface *dst, const shr_draw_cmd *c, const shr_image *b, shr_rect r,
+                            shr_point s) {
+    if (dst->format == SHR_FORMAT_RGB565)
+        scaled_rows(dst, c, b, r, s, SHR_FORMAT_RGB565);
+    else
+        scaled_rows(dst, c, b, r, s, SHR_FORMAT_RGBX8888);
+}
+
 void shr__raster_prep(uint32_t *plane, const shr_image *b, shr_rect r) SHR_NONBLOCKING {
     int32_t *lims = (int32_t *)(plane + (size_t)b->width * (size_t)b->height * 2);
     for (int32_t y = r.y0; y < r.y1; y++) {
@@ -899,7 +937,12 @@ void shr__raster_draw(const shr_surface *dst, const shr_draw_cmd *c, const shr_i
         else
             do_glyph(dst, c, &buffers[c->buffer - 1], r, s);
         break;
-    case SHR_CMD_IMAGE: do_image(dst, c, &buffers[c->buffer - 1], r, s); break;
+    case SHR_CMD_IMAGE:
+        if (c->flags & SHR_IMAGE_SCALED)
+            do_image_scaled(dst, c, &buffers[c->buffer - 1], r, s);
+        else
+            do_image(dst, c, &buffers[c->buffer - 1], r, s);
+        break;
     default: do_copy(dst, &c->src, r, s); break;
     }
 }

@@ -133,6 +133,11 @@ committed regression inputs in `tests/fuzz/corpus/<target>`.
 - IMAGE into RGB565: the software driver blends from a plane of the RGBA8888 buffer (8 bytes per pixel) that the first
   such draw derives, while its planes fit in 8 MiB from its allocator (`shr_software_driver_image_planes()` sets the
   size, 0 makes none); a draw without one blends from the buffer, the same pixels.
+- Scaled images: `shr_pl_res_image_create_scaled()` makes a scaled copy once (bilinear, or box for shrinking) from RGBA,
+  RGB, gray or gray-alpha rows; `shr_pl_res_image_view()` shows part of an image scaled, drawn by drivers with
+  `SHR_DRIVER_SCALE` (the software and ANGLE drivers) at every draw without a copy, otherwise copied once. Both give the
+  same bytes (integer bilinear, `shiroko_driver.h`); a copy costs its pixels in `image_bytes`, a view costs a draw-time
+  bilinear pass and keeps its source image alive.
 - Scrolling: `shr_pl_lyr_tilemap_scroll(layer, top, bottom, n, style)` moves rows [top, bottom) by n rows (terminal
   SU/SD and scroll regions) without copying cells or rebuilding rows. Where the rows are opaque and the driver sets
   `SHR_DRIVER_CHEAP_MOVE` (`caps.flags`; the software and ANGLE drivers do), the frame moves their pixels with a COPY

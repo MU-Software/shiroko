@@ -517,7 +517,9 @@ static shr_status emit_resolved(shr_context *ctx, shr__frame *f, shr_point o, co
     if (slot) *slot = lc->res;
     bool glyph = lc->kind == SHR__LCMD_GLYPH;
     uint32_t syn = glyph ? lc->flags & r->synth & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC) : 0;
-    int32_t w = r->rect.x1 - r->rect.x0, h = r->rect.y1 - r->rect.y0, x0 = 0, x1 = w;
+    int32_t w = r->rect.x1 - r->rect.x0, h = r->rect.y1 - r->rect.y0;
+    if (r->scale_w) w = r->scale_w, h = r->scale_h;
+    int32_t x0 = 0, x1 = w;
     if (syn) shr__glyph_footprint(w, h, syn, r->slant_axis, &x0, &x1);
     int32_t x, y;
     shr_rect full;
@@ -547,6 +549,7 @@ static shr_status emit_resolved(shr_context *ctx, shr__frame *f, shr_point o, co
     c->src_origin = (shr_point){(int32_t)(d.x0 - fx), (int32_t)(d.y0 - fy)};
     c->color = lc->color, c->bg = lc->bg, c->src_rect = r->rect;
     c->slant_axis = syn & SHR_GLYPH_ITALIC ? r->slant_axis : 0;
+    if (r->scale_w) c->flags = SHR_IMAGE_SCALED, c->scale_w = r->scale_w, c->scale_h = r->scale_h;
     return SHR_OK;
 }
 

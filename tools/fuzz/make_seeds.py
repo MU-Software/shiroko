@@ -81,10 +81,10 @@ def src_cmd(kind, rect, fmt, sw, sh, stride, length, origin=(0, 0)):
 
 
 # GLYPH (kind 2) or IMAGE (3) from `src` of buffer `buf`; GLYPH ends with an axis byte: as i8, or 40 times that
-# beyond +-100.
-def region(kind, rect, buf, src, origin=(0, 0), flags=0, axis=0):
+# beyond +-100; an IMAGE with flags 8 (SCALED) with the scaled size: as i8, 127 = 32767, -128 = 32768.
+def region(kind, rect, buf, src, origin=(0, 0), flags=0, axis=0, scale=(0, 0)):
     return (bytes([kind, flags]) + i8(*rect) + bytes([200, 100, 50, buf]) + i8(*src) + i8(*origin)
-            + (i8(axis) if kind == 2 else b""))
+            + (i8(axis) if kind == 2 else b"") + (i8(*scale) if kind == 3 and flags & 8 else b""))
 
 
 # LINE (kind 13) of `shape` over `rect`, its pattern cell w x h, `origin` the pattern position of rect's corner.
@@ -283,6 +283,15 @@ SEEDS = {
         + batch(group(3, (0, 0, 2, 2)), END, kdraw(4, (0, 0, 1, 1)), group(4, (0, 0, 2, 2)), END)
         + batch(fill((0, 0, 1, 1)), krelease(1))
         + batch(group(1, (0, 0, 8, 8)), END) + batch(group(1, (0, 0, 4, 4)), END, kdraw(1, (0, 0, 4, 4))),
+        # SCALED IMAGEs up, down, clipped and from a rect inside the buffer; then a size over the limit, a read past the
+        # scaled size and an empty rect
+        bytes([0, 23, 19, 0, 12]) + batch(register(1, 2, 6, 5, 24, 0, 120), fill((0, 0, 24, 20), (9, 9, 9)),
+                                          region(3, (0, 0, 15, 11), 1, (0, 0, 6, 5), flags=8, scale=(15, 11)),
+                                          region(3, (16, 0, 20, 3), 1, (1, 1, 5, 5), flags=8, scale=(4, 3)),
+                                          region(3, (2, 12, 9, 19), 1, (0, 0, 6, 5), (5, 3), flags=8, scale=(40, 33)))
+        + batch(region(3, (0, 0, 2, 2), 1, (0, 0, 6, 5), flags=8, scale=(-128, 2)))
+        + batch(region(3, (0, 0, 2, 2), 1, (0, 0, 6, 5), (3, 0), flags=8, scale=(4, 2)))
+        + batch(region(3, (0, 0, 2, 2), 1, (2, 2, 2, 5), flags=8, scale=(2, 2))),
         # BOLD, ITALIC and both (with DIM) over their whole footprints, from rects inside larger A8 and A4 buffers
         bytes([0, 23, 19, 0, 8]) + batch(register(1, 1, 9, 6, 9, 0, 54), register(2, 0, 11, 8, 6, 64, 48),
                                          fill((0, 0, 24, 20), (0, 0, 0)),

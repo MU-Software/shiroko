@@ -298,7 +298,7 @@ TEST driver_create_and_destroy(void) {
     ASSERT_EQ_LL(d.caps.max_buffer_height, d.caps.max_height);
     ASSERT_EQ_LL(d.caps.buffer_bytes, 1u << 20);
     ASSERT_EQ_LL(d.caps.buffer_flags, SHR_BUFFER_COPIES);
-    ASSERT_EQ_LL(d.caps.flags, SHR_DRIVER_CHEAP_MOVE);
+    ASSERT_EQ_LL(d.caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE);
     ASSERT_EQ_LL(d.reset(d.user), SHR_OK);
     /* Destroy frees surfaces and buffer textures still alive. */
     shr_surface s;
@@ -821,6 +821,34 @@ TEST lines_match(void) {
     c[n++] = line((shr_rect){5, 5, 5, 8}, SHR_LINE_CURLY, 8, 3, (shr_point){0, 0}, rnd_color());
     c[n++] = line((shr_rect){5, 5, 9, 5}, SHR_LINE_DOTTED, 8, 3, (shr_point){0, 0}, rnd_color());
     EACH_TARGET(f, dev) ASSERT(compare(c, n, f, w, h, dev, K_LINE) <= MAX_BLEND(f));
+    PASS();
+}
+
+/* SCALED IMAGEs: up, down, a yazi piece; whole and clipped; source rects at the buffer's edges and inside it. */
+TEST scaled_images_match(void) {
+    enum { IW = 23, IH = 17 };
+    static uint8_t rgba[IH][IW * 4];
+    noise(rgba, sizeof(rgba));
+    for (int y = 0; y < IH; y++)
+        for (int x = 0; x < IW; x++)
+            if ((x * 3 + y) % 4 == 0) rgba[y][x * 4 + 3] = (uint8_t)(x * 11);
+    uint32_t id = use(mem(rgba, SHR_FORMAT_RGBA8888, IW, IH, IW * 4));
+    static const struct {
+        shr_rect src;
+        int32_t dw, dh;
+        shr_rect dst;
+        shr_point at;
+    } k[] = {
+        {{0, 0, IW, IH}, 41, 30, {0, 0, 41, 30}, {0, 0}},    {{0, 0, IW, IH}, 13, 9, {42, 0, 55, 9}, {42, 0}},
+        {{3, 2, 11, 17}, 8, 16, {42, 10, 50, 26}, {42, 10}}, {{5, 4, 20, 15}, 37, 27, {50, 12, 64, 30}, {40, 5}},
+        {{0, 0, IW, IH}, 17, 40, {0, 31, 9, 40}, {-8, 0}},   {{1, 0, 22, 16}, 9, 5, {56, 0, 64, 5}, {55, 0}},
+    };
+    shr_draw_cmd c[6];
+    for (int i = 0; i < 6; i++) {
+        c[i] = from(SHR_CMD_IMAGE, k[i].dst, id, k[i].src, (shr_point){k[i].dst.x0 - k[i].at.x, k[i].dst.y0 - k[i].at.y}, 0);
+        c[i].flags = SHR_IMAGE_SCALED, c[i].scale_w = k[i].dw, c[i].scale_h = k[i].dh;
+    }
+    EACH_TARGET(f, dev) ASSERT(compare(c, 6, f, 64, 40, dev, K_IMAGE) <= MAX_BLEND(f));
     PASS();
 }
 
@@ -1978,6 +2006,7 @@ SUITE(driver) {
     RUN_TEST(styled_glyphs_at_atlas_edges);
     RUN_TEST(styled_glyphs_match_at_the_axis_bounds);
     RUN_TEST(images_match);
+    RUN_TEST(scaled_images_match);
     RUN_TEST(lines_match);
     RUN_TEST(copies_convert_exactly);
     RUN_TEST(copy_scrolls_within_a_surface);

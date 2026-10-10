@@ -737,6 +737,102 @@ static shr_status image_update_ref(stage *s) {
     return s->st;
 }
 
+/* Scaled images: the alpha chart up, a part of it down, all of it down by box, a gray ramp up, and a crop of the
+ * enlarged chart; as copies, or as views (driver-scaled except box), which must give the same pixels. */
+static shr_pl_res_image *kept(stage *s, shr_status st, shr_pl_res_image *img, const char *what) {
+    if (!stage_ok(s, st, what)) return NULL;
+    if (s->nimages == sizeof(s->images) / sizeof(s->images[0])) {
+        stage_ok(s, SHR_E_LIMIT, "too many images");
+        return NULL;
+    }
+    return s->images[s->nimages++] = img;
+}
+
+static void gray_ramp(uint8_t *g, uint8_t *rgba) {
+    for (int i = 0; i < 16 * 8; i++) {
+        g[i] = (uint8_t)(i % 16 * 16 + i / 16 * 2);
+        memset(rgba + i * 4, g[i], 3), rgba[i * 4 + 3] = 255;
+    }
+}
+
+static const shr_rect scaled_src[4] = {{0, 0, 160, 40}, {32, 8, 128, 32}, {0, 0, 160, 40}, {0, 0, 16, 8}};
+static const int32_t scaled_w[4] = {236, 60, 100, 64}, scaled_h[4] = {59, 15, 25, 32};
+
+static void scaled_layer(stage *s, shr_pl_res_image *const *img) {
+    static const shr_point at[4] = {{10, 4}, {10, 68}, {80, 68}, {190, 68}};
+    shr_lyr *l = stage_layer(s, 0, (shr_rect){0, 0, AW, AH});
+    shr_lyr_cmd_begin(l);
+    for (int i = 0; i < 4; i++)
+        stage_ok(s, shr_lyr_cmd_image(l, img[i], (shr_rect){0, 0, scaled_w[i], scaled_h[i]}, at[i]), "cmd_image");
+    stage_ok(s, shr_lyr_cmd_image(l, img[0], (shr_rect){50, 10, 150, 40}, (shr_point){10, 96}), "cmd_image");
+    stage_ok(s, shr_lyr_cmd_commit(l), "commit");
+}
+
+/* Copies of `chart`, the box one of `box_chart`. */
+static shr_status scaled_copies(stage *s, const uint8_t *chart, const uint8_t *box_chart) {
+    checkerboard(s, AW, AH);
+    uint8_t g[16 * 8], rgba[16 * 8 * 4];
+    gray_ramp(g, rgba);
+    shr_image_source src[4] = {{160, 40, SHR_IMAGE_SRC_RGBA8888, chart, 160 * 4},
+                               {160, 40, SHR_IMAGE_SRC_RGBA8888, chart, 160 * 4},
+                               {160, 40, SHR_IMAGE_SRC_RGBA8888, box_chart, 160 * 4},
+                               {16, 8, SHR_IMAGE_SRC_GRAY8, g, 16}};
+    shr_pl_res_image *img[4] = {NULL};
+    for (int i = 0; i < 4; i++) {
+        uint32_t filter = i == 2 ? SHR_SCALE_BOX : SHR_SCALE_BILINEAR;
+        shr_status st = shr_pl_res_image_create_scaled(s->ctx, &src[i], scaled_src[i], scaled_w[i], scaled_h[i], filter,
+                                                       &img[i]);
+        img[i] = kept(s, st, img[i], "create_scaled");
+    }
+    if (s->st == SHR_OK) scaled_layer(s, img);
+    return s->st;
+}
+
+static shr_status image_scaled(stage *s) {
+    uint8_t chart[160 * 40 * 4];
+    alpha_chart(chart);
+    return scaled_copies(s, chart, chart);
+}
+
+static shr_status image_scaled_view(stage *s) {
+    checkerboard(s, AW, AH);
+    uint8_t chart[160 * 40 * 4], g[16 * 8], rgba[16 * 8 * 4];
+    alpha_chart(chart);
+    gray_ramp(g, rgba);
+    shr_pl_res_image *base = stage_image(s, 160, 40, chart), *ramp = stage_image(s, 16, 8, rgba), *img[4] = {NULL};
+    static const uint32_t flags[4] = {SHR_SCALE_DRIVER, 0, SHR_SCALE_BOX, SHR_SCALE_DRIVER};
+    for (int i = 0; i < 4 && s->st == SHR_OK; i++) {
+        shr_status st = shr_pl_res_image_view(i == 3 ? ramp : base, scaled_src[i], scaled_w[i], scaled_h[i], flags[i],
+                                              &img[i]);
+        img[i] = kept(s, st, img[i], "view");
+    }
+    if (s->st == SHR_OK) scaled_layer(s, img);
+    return s->st;
+}
+
+/* A magenta ramp over 32 x 8 pixels: what the update writes into the chart at (40, 8). */
+static void chart_patch(uint8_t *rgba, size_t stride) {
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 32; x++)
+            memcpy(rgba + (size_t)y * stride + (size_t)x * 4, (uint8_t[4]){255, 0, 255, (uint8_t)(x * 8)}, 4);
+}
+
+/* The views the driver scales show it; the box view, a copy, does not. */
+static shr_status image_scaled_update(stage *s) {
+    uint8_t patch[32 * 8 * 4];
+    chart_patch(patch, 32 * 4);
+    shr_pl_res_image *base = s->nimages ? s->images[0] : NULL;
+    if (base) stage_ok(s, shr_pl_res_image_update(base, (shr_rect){40, 8, 72, 16}, patch, 32 * 4), "image_update");
+    return s->st;
+}
+
+static shr_status image_scaled_update_ref(stage *s) {
+    uint8_t chart[160 * 40 * 4], box[160 * 40 * 4];
+    alpha_chart(chart), alpha_chart(box);
+    chart_patch(chart + (8 * 160 + 40) * 4, 160 * 4);
+    return scaled_copies(s, chart, box);
+}
+
 static shr_status alpha_zero(stage *s) {
     checkerboard(s, 64, 64);
     uint8_t rgba[32 * 32 * 4];
@@ -1174,6 +1270,10 @@ const scene scenes[] = {
     {.name = "image-alpha", .w = AW, .h = AH, .build = image_alpha},
     {.name = "image-update", .w = AW, .h = AH, .build = image_alpha, .update = image_update},
     {.name = "image-update-ref", .w = AW, .h = AH, .build = image_update_ref},
+    {.name = "image-scaled", .w = AW, .h = AH, .build = image_scaled},
+    {.name = "image-scaled-view", .w = AW, .h = AH, .build = image_scaled_view},
+    {.name = "image-scaled-update", .w = AW, .h = AH, .build = image_scaled_view, .update = image_scaled_update},
+    {.name = "image-scaled-update-ref", .w = AW, .h = AH, .build = image_scaled_update_ref},
     {.name = "alpha-zero", .w = 64, .h = 64, .build = alpha_zero},
     {.name = "alpha-zero-ref", .w = 64, .h = 64, .build = alpha_zero_ref},
     {.name = "ramp-fill", .w = 256, .h = 64, .build = ramp_fill},
@@ -1222,6 +1322,8 @@ const reftest reftests[] = {
     {"many-commands", "many-commands-ref"},
     {"many-commands-rot90cw", "many-commands-rot90cw-ref"},
     {"image-update", "image-update-ref"},
+    {"image-scaled-view", "image-scaled"},
+    {"image-scaled-update", "image-scaled-update-ref"},
     {"alpha-zero", "alpha-zero-ref"},
     {"ramp-image", "ramp-fill"},
     {"rotate-90cw", "rotate-90cw-ref"},

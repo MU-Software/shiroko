@@ -991,7 +991,7 @@ static void scene_open(int load, int mode, rec_writer *w, rec_profile *p, rec_ca
     t5_scene_reset(&a.s, load, a.fb.height, a.fb.width);
     a.s.now_ns = clock_ns, a.s.sleep = w ? NULL : sleep_until, a.s.frozen = w ? T5_REC_T0_NS : 0;
     budget.peak = budget.used;
-    a.drv.caps.flags = (a.sw.caps.flags & SHR_DRIVER_CHEAP_STORE) | /* with its DMA2D copier */
+    a.drv.caps.flags = (a.sw.caps.flags & (SHR_DRIVER_CHEAP_STORE | SHR_DRIVER_SCALE)) | /* store: DMA2D copier */
                        (mode != COMPOSE && mv.ok ? SHR_DRIVER_CHEAP_MOVE : 0);
     shr_output output;
     shr_output_init(&output);

@@ -258,6 +258,38 @@ shr_status shr_pl_res_image_update(shr_pl_res_image *image, shr_rect rect, const
 /* Freed once no layer command refers to it and no frame reads it. */
 shr_status shr_pl_res_image_release(shr_pl_res_image *image);
 
+/* Pixel layouts of application rows. */
+typedef enum shr_image_source_format {
+    SHR_IMAGE_SRC_RGBA8888 = 0,    /* bytes R, G, B, A (straight alpha) */
+    SHR_IMAGE_SRC_RGB888 = 1,      /* bytes R, G, B */
+    SHR_IMAGE_SRC_GRAY8 = 2,
+    SHR_IMAGE_SRC_GRAY_ALPHA88 = 3 /* bytes gray, A */
+} shr_image_source_format;
+
+/* `height` rows of `width` pixels, `stride` bytes apart (at least `width` pixels). */
+typedef struct shr_image_source {
+    int32_t width, height;
+    shr_image_source_format format;
+    const void *pixels;
+    size_t stride;
+} shr_image_source;
+
+/* Scaling maps pixel centres: `src` (1..32767 pixels a side) of the source becomes width x height (1..32767). BILINEAR
+ * clamps its taps to the whole source; BOX averages the source pixels each scaled pixel covers on axes that shrink
+ * (bilinear on the others). Integer arithmetic: the same bytes wherever it runs. */
+enum { SHR_SCALE_BILINEAR = 0, SHR_SCALE_BOX = 1 };
+/* A width x height image of `src` of `source`, scaled once; the source is not kept. */
+shr_status shr_pl_res_image_create_scaled(shr_context *ctx, const shr_image_source *source, shr_rect src,
+                                          int32_t width, int32_t height, uint32_t filter, shr_pl_res_image **out);
+/* View flags beside the filter: COPY makes the scaled pixels at once (as create_scaled does); DRIVER leaves scaling
+ * to the driver (SHR_E_UNSUPPORTED without SHR_DRIVER_SCALE or with BOX); neither: the driver when it can. */
+enum { SHR_SCALE_COPY = 1u << 4, SHR_SCALE_DRIVER = 1u << 5 };
+/* A width x height image showing `src` of `image` scaled, drawn and released like an image. A view the driver scales
+ * holds no pixels of its own, keeps `image` until the view is freed and shows its updates; a copy does neither and
+ * takes updates itself. */
+shr_status shr_pl_res_image_view(shr_pl_res_image *image, shr_rect src, int32_t width, int32_t height, uint32_t flags,
+                                 shr_pl_res_image **out);
+
 /* ===== Bitmap font resource =====
  * Packages are baked for SHR_CELL_WIDTH x SHR_CELL_HEIGHT and opened on demand. */
 

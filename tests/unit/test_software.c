@@ -1019,7 +1019,7 @@ TEST buffers_register_replace_and_release(void) {
     ASSERT_EQ_LL(drv.caps.max_buffers, 3);
     ASSERT(!drv.caps.max_buffer_width && !drv.caps.max_buffer_height && !drv.caps.buffer_bytes && !drv.caps.buffer_flags);
     ASSERT(!drv.caps.max_keeps && !drv.caps.keep_bytes);
-    ASSERT_EQ_LL(drv.caps.flags, SHR_DRIVER_CHEAP_MOVE);
+    ASSERT_EQ_LL(drv.caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE);
     shr_draw_cmd img = cmd(SHR_CMD_IMAGE, (shr_rect){0, 0, 1, 1});
     img.buffer = 3, img.src_rect = (shr_rect){0, 0, 1, 1};
     shr_draw_cmd c[3] = {cmd(SHR_CMD_BUFFER_REGISTER, (shr_rect){0, 0, 0, 0}), img};
@@ -1586,8 +1586,8 @@ TEST copier_orders_keep_copies(void) {
             for (int d = 0; d < 2; d++)
                 ASSERT_EQ_LL(shr_software_driver_create(NULL, mode & 2 ? 4 * 256 : 0, 4, NBUF, &drv[d]), SHR_OK);
             ASSERT_EQ_LL(shr_software_driver_set_copier(&drv[1], &lc), SHR_OK);
-            ASSERT(drv[1].caps.flags == (SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_CHEAP_STORE));
-            ASSERT_EQ_LL(drv[0].caps.flags, SHR_DRIVER_CHEAP_MOVE);
+            ASSERT(drv[1].caps.flags == (SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_CHEAP_STORE | SHR_DRIVER_SCALE));
+            ASSERT_EQ_LL(drv[0].caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE);
             uint64_t last[2] = {0, 0};
             shr_draw_cmd lead[96], body[64];
             size_t nl, nb;
@@ -1653,7 +1653,7 @@ TEST copier_orders_keep_copies(void) {
             RUN(0, 5);
             ASSERT_EQ_LL(shr_software_driver_set_copier(&drv[1], NULL), SHR_OK);
             ASSERT_EQ_LL(l.done, l.started);
-            ASSERT_EQ_LL(drv[1].caps.flags, SHR_DRIVER_CHEAP_MOVE);
+            ASSERT_EQ_LL(drv[1].caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE);
             SAME(0);
             SAME(1);
             RUN(1, 6);

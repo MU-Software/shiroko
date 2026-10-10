@@ -93,6 +93,8 @@ static bool enc(rec_writer *w, const shr_draw_cmd *c, uint32_t mem, uint8_t *o) 
     if (c->kind == SHR_CMD_GLYPH && c->flags & SHR_GLYPH_ON_FILL) rec_put32(o + 36, c->bg);
     if (f & F_RECT) rec_put_rect(o + 40, c->src_rect);
     if (c->kind == SHR_CMD_GLYPH && c->flags & SHR_GLYPH_ITALIC) rec_put32(o + 56, (uint32_t)c->slant_axis);
+    if (c->kind == SHR_CMD_IMAGE && c->flags & SHR_IMAGE_SCALED)
+        rec_put32(o + 56, (uint32_t)c->scale_w), rec_put32(o + 60, (uint32_t)c->scale_h);
     if (!(f & F_SRC)) return true;
     uint32_t ref = mem, off = 0;
     if (c->kind != SHR_CMD_BUFFER_REGISTER) {
@@ -371,7 +373,7 @@ static bool dec(const uint8_t *o, shr_draw_cmd *c, const rec_host *h, const rec_
     memset(c, 0, sizeof(*c));
     c->kind = o[0], c->rotation = o[1], c->flags = (uint16_t)(o[2] | o[3] << 8), c->buffer = rec_get32(o + 4);
     c->dst = get_rect(o + 8), c->src_origin = (shr_point){(int32_t)rec_get32(o + 24), (int32_t)rec_get32(o + 28)};
-    c->slant_axis = (int32_t)rec_get32(o + 56);
+    c->slant_axis = (int32_t)rec_get32(o + 56), c->reserved = rec_get32(o + 60);
     if (!c->kind || c->kind >= sizeof(kind_fields) || !(kind_fields[c->kind] & F_SRC)) {
         c->color = rec_get32(o + 32), c->bg = rec_get32(o + 36), c->src_rect = get_rect(o + 40);
         return true;

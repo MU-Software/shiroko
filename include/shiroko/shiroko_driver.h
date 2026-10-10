@@ -170,6 +170,8 @@ typedef enum shr_cmd_kind {
 enum { SHR_GLYPH_DIM = 1u << 0, SHR_GLYPH_BOLD = 1u << 1, SHR_GLYPH_ITALIC = 1u << 2, SHR_GLYPH_ON_FILL = 1u << 3 };
 /* COPY onto its own destination: the pixels of the destination outside `dst` become unspecified (shr_draw_cmd). */
 enum { SHR_COPY_REST_UNDEFINED = 1u << 4 };
+/* IMAGE drawn from `src_rect` scaled bilinearly to scale_w x scale_h (only to SHR_DRIVER_SCALE). */
+enum { SHR_IMAGE_SCALED = 1u << 5 };
 /* LINE shapes, in flags >> SHR_LINE_SHAPE_SHIFT (with SHR_GLYPH_DIM). */
 enum { SHR_LINE_SINGLE = 0, SHR_LINE_DOUBLE, SHR_LINE_CURLY, SHR_LINE_DOTTED, SHR_LINE_DASHED };
 #define SHR_LINE_SHAPE_SHIFT 8
@@ -225,7 +227,12 @@ shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t 
  * UPDATE and draws from its own copy. Buffer memory never overlaps a destination.
  * GLYPH, IMAGE: `src_rect` (W x H) is a rect of the registered buffer `buffer` and `src_origin` is relative to its
  * top-left: `dst` pixel (x, y) takes rect pixel (src_origin.x + x - dst.x0, src_origin.y + y - dst.y0). For A4,
- * src_rect.x0 is even.
+ * src_rect.x0 is even. A SCALED IMAGE takes that pixel of `src_rect` scaled to scale_w x scale_h (1..32767 each, as
+ * is each src_rect side): bilinear taps at pixel centres, ((2x + 1) W + scale_w) 2^15 / scale_w = t in 16.16 one pixel
+ * up, columns k = src_rect.x0 + (t >> 16) - 1 and k + 1 clamped to the buffer, weight f = (t >> 8) & 255 of k + 1
+ * (rows likewise), each channel (top * (256 - fy) + bottom * fy + 32768) >> 16 with top and bottom the rows'
+ * a * (256 - fx) + b * fx. It may read one buffer pixel beyond `src_rect` on each side. A SCALED IMAGE also reads
+ * scale_w and scale_h; one reading outside scale_w x scale_h or sized beyond 1..32767 is invalid (SHR_E_INVALID_ARG).
  * GLYPH coverage of rect pixel (x, y), exactly: in(x, y) is the coverage of buffer pixel
  * (src_rect.x0 + x, src_rect.y0 + y) widened to 8 bits (A4 n -> 17n) for 0 <= x < W and 0 <= y < H, and 0
  * elsewhere, also where the buffer has pixels. BOLD: b(x) = in(x + 1) > in(x) ? in(x) : max(in(x), in(x - 1)),
@@ -282,8 +289,14 @@ typedef struct shr_draw_cmd {
         };
         shr_image_ref src;     /* COPY, ROTATE: source surface; REGISTER: the buffer's memory */
     };
-    int32_t slant_axis;    /* GLYPH with ITALIC: twice the rect y the shear turns about */
-    uint32_t reserved;
+    union {
+        int32_t slant_axis; /* GLYPH with ITALIC: twice the rect y the shear turns about */
+        int32_t scale_w;    /* SCALED IMAGE */
+    };
+    union {
+        uint32_t reserved;
+        int32_t scale_h;
+    };
 } shr_draw_cmd;
 #if defined(__cplusplus) && defined(__GNUC__)
 #pragma GCC diagnostic pop
@@ -307,6 +320,8 @@ enum { SHR_DRIVER_CHEAP_MOVE = 1u << 1 };
  * compositor then also stores groups it draws for the first time, within a credit that keeps drawn again earn back.
  * Like all caps, read by shr_create(). */
 enum { SHR_DRIVER_CHEAP_STORE = 1u << 2 };
+/* flags: the driver draws SCALED IMAGEs. */
+enum { SHR_DRIVER_SCALE = 1u << 3 };
 
 /* Destinations, sources and buffers outside these limits make the submission fail with SHR_E_UNSUPPORTED:
  * a driver implements every command kind (a device driver may run some on the software port). */
