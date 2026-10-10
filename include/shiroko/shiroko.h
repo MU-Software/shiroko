@@ -247,16 +247,9 @@ shr_status shr_lyr_cmd_image(shr_lyr *layer, shr_pl_res_image *image, shr_rect s
 shr_status shr_lyr_cmd_commit(shr_lyr *layer);
 
 /* ===== Image resource =====
- * Pixels are copied into a buffer the driver draws from (RGBA8888, straight alpha) within desc.image_bytes;
- * SHR_E_UNSUPPORTED beyond the driver's buffer limits. */
-
-shr_status shr_pl_res_image_create(shr_context *ctx, int32_t width, int32_t height, const void *rgba,
-                                   size_t stride, shr_pl_res_image **out);
-/* While a frame reads the image, the update goes to a second buffer that later frames draw from;
- * SHR_E_LIMIT when desc.image_bytes has no room for it. */
-shr_status shr_pl_res_image_update(shr_pl_res_image *image, shr_rect rect, const void *rgba, size_t stride);
-/* Freed once no layer command refers to it and no frame reads it. */
-shr_status shr_pl_res_image_release(shr_pl_res_image *image);
+ * Pixels are copied into a buffer the driver draws from within desc.image_bytes: RGBA8888 (straight alpha), or RGB565
+ * when the screen is RGB565, the driver has SHR_DRIVER_IMAGE_565 and every alpha is 255 (the same pixels on screen in
+ * half the bytes). SHR_E_UNSUPPORTED beyond the driver's buffer limits. */
 
 /* Pixel layouts of application rows. */
 typedef enum shr_image_source_format {
@@ -273,6 +266,20 @@ typedef struct shr_image_source {
     const void *pixels;
     size_t stride;
 } shr_image_source;
+
+/* Converted while copied; desc.image_bytes is checked before the pixels are read. */
+shr_status shr_pl_res_image_create_from(shr_context *ctx, const shr_image_source *source, shr_pl_res_image **out);
+/* shr_pl_res_image_create_from() of RGBA8888 rows. */
+shr_status shr_pl_res_image_create(shr_context *ctx, int32_t width, int32_t height, const void *rgba,
+                                   size_t stride, shr_pl_res_image **out);
+/* While a frame reads the image, the update goes to a second buffer that later frames draw from;
+ * SHR_E_LIMIT when desc.image_bytes has no room for it. An image kept as RGB565 stays opaque: rows with an alpha
+ * below 255 give SHR_E_UNSUPPORTED. */
+shr_status shr_pl_res_image_update(shr_pl_res_image *image, shr_rect rect, const void *rgba, size_t stride);
+/* Freed at once when no layer command refers to it and no frame reads it, else once none does. */
+shr_status shr_pl_res_image_release(shr_pl_res_image *image);
+/* The bytes images hold within desc.image_bytes (until freed, see release) and that limit; either may be NULL. */
+shr_status shr_pl_res_image_budget(shr_context *ctx, uint64_t *used, uint64_t *limit);
 
 /* Scaling maps pixel centres: `src` (1..32767 pixels a side) of the source becomes width x height (1..32767). BILINEAR
  * clamps its taps to the whole source; BOX averages the source pixels each scaled pixel covers on axes that shrink

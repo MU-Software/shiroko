@@ -73,12 +73,13 @@ static __attribute__((noinline)) void image(sw *s, const shr_surface *dst, const
         shr__raster_draw(dst, c, s->buffers, origin, clip, NULL);
 }
 
-/* BOLD and ITALIC GLYPHs from the cache, unscaled IMAGEs into RGB565 from planes, LINE cells kept, the rest as they
- * come. */
+/* BOLD and ITALIC GLYPHs from the cache, unscaled RGBA8888 IMAGEs into RGB565 from planes, LINE cells kept, the
+ * rest as they come. */
 static void draw(sw *s, const shr_surface *dst, const shr_draw_cmd *c, shr_point origin, shr_rect clip) {
     if (c->kind == SHR_CMD_GLYPH && (c->flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC)))
         shr__synth_draw(&s->synth, &s->al, dst, c, s->buffers, origin, clip);
-    else if (c->kind == SHR_CMD_IMAGE && dst->format == SHR_FORMAT_RGB565 && !(c->flags & SHR_IMAGE_SCALED))
+    else if (c->kind == SHR_CMD_IMAGE && dst->format == SHR_FORMAT_RGB565 && !(c->flags & SHR_IMAGE_SCALED) &&
+             s->buffers[c->buffer - 1].format == SHR_FORMAT_RGBA8888)
         image(s, dst, c, origin, clip);
     else if (c->kind == SHR_CMD_LINE)
         shr__raster_line(dst, c, origin, clip, &s->lines);
@@ -352,7 +353,7 @@ shr_status shr_software_driver_create(const shr_allocator *allocator, uint64_t k
     out->caps.max_keeps = max_keeps;
     out->caps.keep_bytes = keep_bytes;
     out->caps.max_keep_bytes = slot;
-    out->caps.flags = SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE;
+    out->caps.flags = SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE | SHR_DRIVER_IMAGE_565;
     out->execute = sw_execute;
     out->reset = sw_reset;
     return SHR_OK;

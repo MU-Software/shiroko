@@ -325,7 +325,6 @@ void shr__damage_move(const shr_context *ctx, shr__damage *d, shr__move m);
 void shr__moves_drop(const shr_context *ctx, shr__damage *d);
 void shr__damage_targets(shr_context *ctx, shr_rect r);
 void shr__targets_invalidate(shr_context *ctx);
-void shr__res_collect(shr_context *ctx);
 
 bool shr__io_pump(shr_context *ctx);
 bool shr__io_busy(const shr_context *ctx, const shr__res *res); /* res NULL: any */

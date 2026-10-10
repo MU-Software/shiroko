@@ -8,15 +8,35 @@
 
 #define SHR__SCALE_MAX 32767 /* largest scaled or source side: drivers may pass them as int16 */
 
+/* Beside the SHR_IMAGE_SRC_* formats: an opaque image kept as RGB565 (the driver's buffer format), read as RGBA with each
+ * field widened to 8 bits by repeating its top bits. */
+#define SHR__SRC_RGB565 4u
+
 static inline size_t shr__src_bytes(uint32_t format) {
-    return format == SHR_IMAGE_SRC_RGBA8888 ? 4 : format == SHR_IMAGE_SRC_RGB888 ? 3 : (size_t)format - 1;
+    return format == SHR_IMAGE_SRC_RGBA8888 ? 4 : format == SHR_IMAGE_SRC_RGB888 ? 3 : format == SHR__SRC_RGB565 ? 2 : (size_t)format - 1;
+}
+
+/* RGB565 pixel v as an RGBA8888 word (R in the low byte), alpha 255. */
+static inline uint32_t shr__565_rgba(uint32_t v) {
+    uint32_t r = v >> 11, g = v >> 5 & 63, b = v & 31;
+    return (r << 3 | r >> 2) | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2) << 16 | 0xFF000000u;
 }
 
 /* One pixel of `format` as straight RGBA: gray g -> (g, g, g), no alpha -> 255. */
 static inline void shr__src_rgba(uint32_t format, const uint8_t *p, uint8_t out[4]) {
+    if (format == SHR__SRC_RGB565) {
+        uint32_t v = shr__565_rgba((uint32_t)p[0] | (uint32_t)p[1] << 8);
+        out[0] = (uint8_t)v, out[1] = (uint8_t)(v >> 8), out[2] = (uint8_t)(v >> 16), out[3] = 255;
+        return;
+    }
     bool rgb = format <= SHR_IMAGE_SRC_RGB888;
     out[0] = p[0], out[1] = rgb ? p[1] : p[0], out[2] = rgb ? p[2] : p[0];
     out[3] = format == SHR_IMAGE_SRC_RGBA8888 ? p[3] : format == SHR_IMAGE_SRC_GRAY_ALPHA88 ? p[1] : 255;
+}
+
+/* The source format of a driver buffer: RGBA8888 or RGB565. */
+static inline uint32_t shr__src_of(shr_pixel_format f) {
+    return f == SHR_FORMAT_RGB565 ? SHR__SRC_RGB565 : SHR_IMAGE_SRC_RGBA8888;
 }
 
 /* `src` of a w x h source of `format` scaled to dw x dh; scaled pixel (x, y) depends on x, y and these alone.

@@ -49,10 +49,10 @@ many-commands-rot90cw-ref-8x16-rgb565 1b95d846b21ecc318dd12818f536b323
 image-alpha-8x16-rgb565 baa051cd1f9118ea56bfe34b0d147127
 image-update-8x16-rgb565 c19494d822349ff96ccb964fcda9f507
 image-update-ref-8x16-rgb565 c19494d822349ff96ccb964fcda9f507
-image-scaled-8x16-rgb565 b478779bf7f47fd72861ec06f555acf7
-image-scaled-view-8x16-rgb565 b478779bf7f47fd72861ec06f555acf7
-image-scaled-update-8x16-rgb565 ab2d0dfb4a9bac629974db5c3127d9ab
-image-scaled-update-ref-8x16-rgb565 ab2d0dfb4a9bac629974db5c3127d9ab
+image-scaled-8x16-rgb565 64755548d72050da37c608246b3c6bea
+image-scaled-view-8x16-rgb565 64755548d72050da37c608246b3c6bea
+image-scaled-update-8x16-rgb565 047d4d0d91f6d731c0d48dfdd48612bc
+image-scaled-update-ref-8x16-rgb565 047d4d0d91f6d731c0d48dfdd48612bc
 alpha-zero-8x16-rgb565 dedb682ae62e1624d596218a5343f1a4
 alpha-zero-ref-8x16-rgb565 dedb682ae62e1624d596218a5343f1a4
 ramp-fill-8x16-rgb565 8818da097a42d3ca8eec7c14ddfb4d89

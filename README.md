@@ -130,9 +130,13 @@ committed regression inputs in `tests/fuzz/corpus/<target>`.
   until a REGISTER, UPDATE or RELEASE of the glyph's buffer, in up to 256 KiB taken from its allocator as needed
   (`shr_software_driver_synth_cache()` sets the size, 0 synthesizes at every draw); the ANGLE driver synthesizes in
   its shader.
-- IMAGE into RGB565: the software driver blends from a plane of the RGBA8888 buffer (8 bytes per pixel) that the first
-  such draw derives, while its planes fit in 8 MiB from its allocator (`shr_software_driver_image_planes()` sets the
-  size, 0 makes none); a draw without one blends from the buffer, the same pixels.
+- Images: `shr_pl_res_image_create_from()` takes RGBA, RGB, gray or gray + alpha rows and converts them while copying,
+  after checking `image_bytes`; on an RGB565 screen whose driver sets `SHR_DRIVER_IMAGE_565` (the software driver does),
+  an image whose alpha is all 255 is kept as RGB565 (2 bytes per pixel) and drawn by copying rows, the same pixels.
+  A released image no frame reads is freed at once; `shr_pl_res_image_budget()` gives the bytes in use and the limit.
+- Translucent IMAGE into RGB565: the software driver blends from a plane of the RGBA8888 buffer (8 bytes per pixel) that
+  the first such draw derives, while its planes fit in 8 MiB from its allocator (`shr_software_driver_image_planes()`
+  sets the size, 0 makes none); a draw without one blends from the buffer, the same pixels.
 - Scaled images: `shr_pl_res_image_create_scaled()` makes a scaled copy once (bilinear, or box for shrinking) from RGBA,
   RGB, gray or gray-alpha rows; `shr_pl_res_image_view()` shows part of an image scaled, drawn by drivers with
   `SHR_DRIVER_SCALE` (the software and ANGLE drivers) at every draw without a copy, otherwise copied once. Both give the

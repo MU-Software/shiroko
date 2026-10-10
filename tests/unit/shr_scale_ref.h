@@ -74,6 +74,18 @@ static inline void shr_scale_px(const shr_scale_src *m, int filter, int32_t i, i
     for (int c = 0; c < 4; c++) out[c] = (uint8_t)((acc[c] + den / 2) / den);
 }
 
+/* An opaque RGB565 source: each pixel widened to 8 bits per field (x << 3 | x >> 2, g << 2 | g >> 4, alpha 255) into
+ * `rgba`, then scaled by shr_scale_px() as any RGBA source. */
+static inline void shr_rgb565_widen(const uint16_t *px, size_t stride, int32_t w, int32_t h, uint8_t *rgba) {
+    for (int32_t y = 0; y < h; y++)
+        for (int32_t x = 0; x < w; x++) {
+            uint32_t v = *(const uint16_t *)((const uint8_t *)px + (size_t)y * stride + (size_t)x * 2);
+            uint32_t r = v >> 11, g = v >> 5 & 63, b = v & 31;
+            uint8_t *o = rgba + ((size_t)y * (size_t)w + (size_t)x) * 4;
+            o[0] = (uint8_t)(r << 3 | r >> 2), o[1] = (uint8_t)(g << 2 | g >> 4), o[2] = (uint8_t)(b << 3 | b >> 2), o[3] = 255;
+        }
+}
+
 /* The software driver's IMAGE blend of straight RGBA (r, g, b, a) onto a target pixel, every a in 0..255 (0 leaves
  * it, 255 stores it): ports/software/raster.c image_px, blend_px, blend565, shr__raster_image give these bytes. */
 static inline uint16_t shr_blend565(uint16_t d, const uint8_t px[4]) {

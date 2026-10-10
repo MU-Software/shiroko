@@ -33,11 +33,69 @@ static bool over_budget(shr_context *ctx, uint64_t used, uint64_t bytes) {
     return bytes > cap || used > cap - bytes;
 }
 
-/* Copies `rect` of `src` rows into `b`; the caller validated both. */
-static void img_copy(shr__buf *b, shr_rect rect, const uint8_t *src, size_t stride) {
-    size_t row = (size_t)(rect.x1 - rect.x0) * 4;
-    uint8_t *dst = (uint8_t *)b->mem.pixels + (size_t)rect.y0 * b->mem.stride + (size_t)rect.x0 * 4;
-    for (int32_t y = rect.y0; y < rect.y1; y++, dst += b->mem.stride, src += stride) memcpy(dst, src, row);
+static bool source_valid(const shr_image_source *s) {
+    return s && s->pixels && s->width > 0 && s->height > 0 && (uint32_t)s->format <= SHR_IMAGE_SRC_GRAY_ALPHA88 &&
+           s->stride >= (uint64_t)s->width * shr__src_bytes(s->format);
+}
+
+/* Every alpha of the `w` x `h` rows is 255. */
+static bool rows_opaque(uint32_t f, const uint8_t *row, size_t stride, int32_t w, int32_t h) {
+    if (f == SHR_IMAGE_SRC_RGB888 || f == SHR_IMAGE_SRC_GRAY8 || f == SHR__SRC_RGB565) return true;
+    size_t bpp = shr__src_bytes(f), n = (size_t)w * bpp;
+    for (int32_t y = 0; y < h; y++, row += stride) {
+        if (f == SHR_IMAGE_SRC_RGBA8888) { /* the alpha bytes of the words ANDed */
+            uint32_t all = ~0u, v;
+            size_t x = 0;
+            for (; x + 16 <= n; x += 16) {
+                uint32_t v1, v2, v3;
+                memcpy(&v, row + x, 4), memcpy(&v1, row + x + 4, 4), memcpy(&v2, row + x + 8, 4);
+                memcpy(&v3, row + x + 12, 4);
+                all &= v & v1 & v2 & v3;
+            }
+            for (; x < n; x += 4) memcpy(&v, row + x, 4), all &= v;
+            if (((const uint8_t *)&all)[3] != 255) return false;
+            continue;
+        }
+        for (size_t x = 1; x < n; x += 2)
+            if (row[x] != 255) return false;
+    }
+    return true;
+}
+
+static uint32_t q(uint32_t c, uint32_t m) { return (c * m + 127) / 255; } /* as drivers quantize */
+
+/* Copies `rect` of source rows `src` of format `f` into `b`, converted; the caller validated both. */
+static void img_put(shr__buf *b, shr_rect rect, shr_image_source_format f, const uint8_t *src, size_t stride) {
+    bool to565 = b->mem.format == SHR_FORMAT_RGB565;
+    size_t sb = shr__src_bytes(f), db = to565 ? 2 : 4, w = (size_t)(rect.x1 - rect.x0);
+    uint8_t *dst = (uint8_t *)b->mem.pixels + (size_t)rect.y0 * b->mem.stride + (size_t)rect.x0 * db;
+    for (int32_t y = rect.y0; y < rect.y1; y++, dst += b->mem.stride, src += stride) {
+        if (!to565 && f == SHR_IMAGE_SRC_RGBA8888) {
+            memcpy(dst, src, w * 4);
+            continue;
+        }
+        const uint8_t *p = src;
+        uint8_t *o = dst;
+        for (size_t x = 0; x < w; x++, p += sb, o += db) {
+            uint32_t r = p[0], g = sb >= 3 ? p[1] : r, bl = sb >= 3 ? p[2] : r;
+            if (to565) {
+                uint16_t v = (uint16_t)(q(r, 31) << 11 | q(g, 63) << 5 | q(bl, 31));
+                memcpy(o, &v, 2);
+            } else {
+                o[0] = (uint8_t)r, o[1] = (uint8_t)g, o[2] = (uint8_t)bl;
+                o[3] = sb == 2 ? p[1] : 255;
+            }
+        }
+    }
+}
+
+/* Copies `rect` of `from` into `to`, buffers of one format. */
+static void img_copy(shr__buf *to, const shr__buf *from, shr_rect rect) {
+    size_t bpp = to->mem.format == SHR_FORMAT_RGB565 ? 2 : 4, row = (size_t)(rect.x1 - rect.x0) * bpp;
+    size_t at = (size_t)rect.x0 * bpp;
+    const uint8_t *src = (const uint8_t *)from->mem.pixels + (size_t)rect.y0 * from->mem.stride + at;
+    uint8_t *dst = (uint8_t *)to->mem.pixels + (size_t)rect.y0 * to->mem.stride + at;
+    for (int32_t y = rect.y0; y < rect.y1; y++, dst += to->mem.stride, src += from->mem.stride) memcpy(dst, src, row);
 }
 
 static shr_status img_resolve(shr__res *res, uint64_t id, uint64_t frame, const shr__resolved **out) {
@@ -72,20 +130,19 @@ static void img_free(shr__res *res) {
 
 static const shr__res_ops img_ops = {.resolve = img_resolve, .frame_end = img_frame_end, .free = img_free};
 
-/* A width x height image within the budget, its pixels for the caller to write. */
-static shr_status img_new(shr_context *ctx, int32_t width, int32_t height, shr_pl_res_image **out) {
-    uint64_t row = (uint64_t)width * 4; /* below 2^64 with the height */
+/* A width x height image of `f` within the budget, its pixels for the caller to write. */
+static shr_status img_new(shr_context *ctx, shr_pixel_format f, int32_t width, int32_t height, shr_pl_res_image **out) {
     void **slot = shr__ctx_plugin_slot(ctx, &budget_kind);
     if (!slot) return SHR_E_LIMIT;
     budget *b = *slot;
     uint64_t used = b ? b->used : 0;
-    if (over_budget(ctx, used, row * (uint64_t)height)) return SHR_E_LIMIT;
+    if (over_budget(ctx, used, (uint64_t)width * (uint64_t)height * (f == SHR_FORMAT_RGB565 ? 2 : 4))) return SHR_E_LIMIT;
 
     const shr__alloc *al = shr__ctx_alloc(ctx);
     bool new_budget = !b;
     if (new_budget && !(b = SHR_NEW(al, budget))) return SHR_E_NO_MEMORY;
     shr_pl_res_image *img = SHR_NEW(al, shr_pl_res_image);
-    shr_status st = img ? shr__buf_alloc(ctx, SHR_FORMAT_RGBA8888, width, height, &img->buf[0]) : SHR_E_NO_MEMORY;
+    shr_status st = img ? shr__buf_alloc(ctx, f, width, height, &img->buf[0]) : SHR_E_NO_MEMORY;
     if (st == SHR_OK && over_budget(ctx, used, img->buf[0].mem.byte_length)) { /* padded rows */
         shr__buf_free(ctx, &img->buf[0]);
         st = SHR_E_LIMIT;
@@ -103,14 +160,48 @@ static shr_status img_new(shr_context *ctx, int32_t width, int32_t height, shr_p
     return SHR_OK;
 }
 
+/* RGB565 for `px` opaque pixels where the screen and driver take it, the budget checked before `opaque` reads any. */
+static shr_status img_format(shr_context *ctx, uint64_t px, bool (*opaque)(const void *), const void *arg,
+                             shr_pixel_format *f) {
+    void **slot = shr__ctx_plugin_slot(ctx, &budget_kind);
+    budget *b = slot ? *slot : NULL;
+    bool may565 = SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565 && (shr__ctx_driver_flags(ctx) & SHR_DRIVER_IMAGE_565);
+    if (over_budget(ctx, b ? b->used : 0, px * (may565 ? 2 : 4))) return SHR_E_LIMIT;
+    *f = may565 && opaque(arg) ? SHR_FORMAT_RGB565 : SHR_FORMAT_RGBA8888;
+    return SHR_OK;
+}
+
+static bool source_opaque(const void *arg) {
+    const shr_image_source *s = arg;
+    return rows_opaque(s->format, s->pixels, s->stride, s->width, s->height);
+}
+
+shr_status shr_pl_res_image_create_from(shr_context *ctx, const shr_image_source *source, shr_pl_res_image **out) {
+    if (out) *out = NULL;
+    if (!ctx || !out || !source_valid(source)) return SHR_E_INVALID_ARG;
+    if (shr__ctx_refused(ctx)) return SHR_E_STATE;
+    shr_pixel_format f;
+    shr_status st = img_format(ctx, (uint64_t)source->width * (uint64_t)source->height, source_opaque, source, &f);
+    if (st == SHR_OK) st = img_new(ctx, f, source->width, source->height, out);
+    if (st == SHR_OK)
+        img_put(&(*out)->buf[0], (shr_rect){0, 0, source->width, source->height}, source->format, source->pixels,
+                source->stride);
+    return st;
+}
+
 shr_status shr_pl_res_image_create(shr_context *ctx, int32_t width, int32_t height, const void *rgba, size_t stride,
                                    shr_pl_res_image **out) {
-    if (out) *out = NULL;
-    if (!ctx || !out || !rgba || width <= 0 || height <= 0 || stride < (uint64_t)width * 4) return SHR_E_INVALID_ARG;
-    if (shr__ctx_refused(ctx)) return SHR_E_STATE;
-    shr_status st = img_new(ctx, width, height, out);
-    if (st == SHR_OK) img_copy(&(*out)->buf[0], (shr_rect){0, 0, width, height}, rgba, stride);
-    return st;
+    const shr_image_source s = {width, height, SHR_IMAGE_SRC_RGBA8888, rgba, stride};
+    return shr_pl_res_image_create_from(ctx, &s, out);
+}
+
+shr_status shr_pl_res_image_budget(shr_context *ctx, uint64_t *used, uint64_t *limit) {
+    if (!ctx) return SHR_E_INVALID_ARG;
+    void **slot = shr__ctx_plugin_slot(ctx, &budget_kind);
+    budget *b = slot ? *slot : NULL;
+    if (used) *used = b ? b->used : 0;
+    if (limit) *limit = shr__ctx_desc(ctx)->image_bytes;
+    return SHR_OK;
 }
 
 static void view_changed(shr_pl_res_image *v, shr_rect area);
@@ -122,14 +213,13 @@ static shr_status img_swap(shr_pl_res_image *img) {
     if (!to->mem.pixels) {
         budget *b = img_budget(ctx);
         if (over_budget(ctx, b->used, from->mem.byte_length)) return SHR_E_LIMIT;
-        shr_status st = shr__buf_alloc(ctx, SHR_FORMAT_RGBA8888, from->mem.width, from->mem.height, to);
+        shr_status st = shr__buf_alloc(ctx, from->mem.format, from->mem.width, from->mem.height, to);
         if (st != SHR_OK) return st;
         b->used += to->mem.byte_length, img->bytes += to->mem.byte_length;
         img->behind = (shr_rect){0, 0, from->mem.width, from->mem.height};
     }
     shr_rect r = img->behind;
-    img_copy(to, r, (const uint8_t *)from->mem.pixels + (size_t)r.y0 * from->mem.stride + (size_t)r.x0 * 4,
-             from->mem.stride);
+    img_copy(to, from, r);
     shr__buf_changed(to, r);
     img->behind = (shr_rect){0, 0, 0, 0};
     img->cur = !img->cur;
@@ -144,10 +234,13 @@ shr_status shr_pl_res_image_update(shr_pl_res_image *img, shr_rect rect, const v
     if (shr__ctx_refused(img->res.ctx)) return SHR_E_STATE;
     if (shr__rect_empty(rect)) return SHR_OK;
     if (!rgba || stride < (size_t)(rect.x1 - rect.x0) * 4) return SHR_E_INVALID_ARG;
+    if (b->mem.format == SHR_FORMAT_RGB565 &&
+        !rows_opaque(SHR_IMAGE_SRC_RGBA8888, rgba, stride, rect.x1 - rect.x0, rect.y1 - rect.y0))
+        return SHR_E_UNSUPPORTED;
     shr_status st = img->pinned == b ? img_swap(img) : SHR_OK;
     if (st != SHR_OK) return st;
     b = &img->buf[img->cur];
-    img_copy(b, rect, rgba, stride);
+    img_put(b, rect, SHR_IMAGE_SRC_RGBA8888, rgba, stride);
     img->behind = shr__rect_union(img->behind, rect);
     shr__buf_changed(b, rect);
     shr__res_changed(&img->res, rect);
@@ -159,7 +252,8 @@ shr_status shr_pl_res_image_release(shr_pl_res_image *img) {
     if (!img || img->res.dead) return SHR_E_INVALID_ARG;
     /* Allowed during shutdown, which waits for the resource to go. */
     if (shr__ctx_in_callback(img->res.ctx)) return SHR_E_STATE;
-    img->res.dead = true; /* the compositor frees it once no command or frame uses it */
+    img->res.dead = true;
+    if (!img->res.users) shr__res_collect(img->res.ctx); /* at once, unless a frame still reads it */
     return SHR_OK;
 }
 
@@ -229,18 +323,38 @@ static bool scale_args(int32_t w, int32_t h, shr_rect src, int32_t width, int32_
            width <= SHR__SCALE_MAX && height <= SHR__SCALE_MAX;
 }
 
-/* A new image of the scaled pixels of `s`. */
-static shr_status scaled_new(shr_context *ctx, const shr__scale *s, shr_pl_res_image **out) {
-    shr_status st = img_new(ctx, s->dw, s->dh, out);
-    if (st != SHR_OK) return st;
-    const shr_image *m = &(*out)->buf[0].mem;
-    shr__scale_rows(s, (uint8_t *)m->pixels, m->stride);
-    return SHR_OK;
+/* The source pixels any filter reads for `s` (its `src` grown by a pixel, within the source) are opaque. */
+static bool scale_opaque(const void *arg) {
+    const shr__scale *s = arg;
+    int32_t x0 = s->src.x0 > 0 ? s->src.x0 - 1 : 0, y0 = s->src.y0 > 0 ? s->src.y0 - 1 : 0;
+    int32_t x1 = s->src.x1 < s->w ? s->src.x1 + 1 : s->w, y1 = s->src.y1 < s->h ? s->src.y1 + 1 : s->h;
+    return rows_opaque(s->format, s->pixels + (size_t)y0 * s->stride + (size_t)x0 * shr__src_bytes(s->format),
+                       s->stride, x1 - x0, y1 - y0);
 }
 
-static bool source_valid(const shr_image_source *s) {
-    return s && s->pixels && s->width > 0 && s->height > 0 && (uint32_t)s->format <= SHR_IMAGE_SRC_GRAY_ALPHA88 &&
-           s->stride >= (uint64_t)s->width * shr__src_bytes(s->format);
+/* A new image of the scaled pixels of `s`; opaque ones go into RGB565 a span of columns at a time. */
+static shr_status scaled_new(shr_context *ctx, const shr__scale *s, shr_pl_res_image **out) {
+    shr_pixel_format f;
+    shr_status st = img_format(ctx, (uint64_t)s->dw * (uint64_t)s->dh, scale_opaque, s, &f);
+    if (st == SHR_OK) st = img_new(ctx, f, s->dw, s->dh, out);
+    if (st != SHR_OK) return st;
+    shr__buf *b = &(*out)->buf[0];
+    if (f == SHR_FORMAT_RGBA8888) {
+        shr__scale_rows(s, (uint8_t *)b->mem.pixels, b->mem.stride);
+        return SHR_OK;
+    }
+    uint32_t px[SHR__SCALE_SPAN];
+    shr__bilin bl;
+    for (int32_t x0 = 0; x0 < s->dw; x0 += SHR__SCALE_SPAN) {
+        int32_t n = s->dw - x0 < SHR__SCALE_SPAN ? s->dw - x0 : SHR__SCALE_SPAN;
+        if (s->filter == SHR_SCALE_BILINEAR) shr__bilin_start(&bl, s, x0, n, 0);
+        for (int32_t y = 0; y < s->dh; y++) {
+            if (s->filter == SHR_SCALE_BILINEAR) shr__bilin_next(&bl, px);
+            else shr__scale_row(s, y, x0, n, (uint8_t *)px);
+            img_put(b, (shr_rect){x0, y, x0 + n, y + 1}, SHR_IMAGE_SRC_RGBA8888, (const uint8_t *)px, 0);
+        }
+    }
+    return SHR_OK;
 }
 
 shr_status shr_pl_res_image_create_scaled(shr_context *ctx, const shr_image_source *source, shr_rect src,
@@ -270,7 +384,7 @@ shr_status shr_pl_res_image_view(shr_pl_res_image *image, shr_rect src, int32_t 
     if ((flags & SHR_SCALE_DRIVER) && !driver) return SHR_E_UNSUPPORTED;
     if ((flags & SHR_SCALE_COPY) || !driver) {
         shr__scale s = {.pixels = m->pixels, .stride = m->stride, .w = m->width, .h = m->height,
-                        .format = SHR_IMAGE_SRC_RGBA8888, .src = src, .dw = width, .dh = height, .filter = filter};
+                        .format = shr__src_of(m->format), .src = src, .dw = width, .dh = height, .filter = filter};
         return scaled_new(ctx, &s, out);
     }
     shr_pl_res_image *v = SHR_NEW(shr__ctx_alloc(ctx), shr_pl_res_image);

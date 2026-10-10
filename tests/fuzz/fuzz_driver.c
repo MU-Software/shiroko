@@ -99,7 +99,7 @@ static bool in_span(const shr_image *m, const uint8_t *p) {
 static void touch(uint32_t id, shr_rect rect, const shr_image *start) {
     const shr_image *m = &model[id - 1];
     bool a4 = m->format == SHR_FORMAT_A4;
-    int32_t px = m->format == SHR_FORMAT_RGBA8888 ? 4 : 1, b0 = a4 ? (rect.x0 + 1) / 2 : rect.x0 * px,
+    int32_t px = m->format == SHR_FORMAT_RGBA8888 ? 4 : m->format == SHR_FORMAT_RGB565 ? 2 : 1, b0 = a4 ? (rect.x0 + 1) / 2 : rect.x0 * px,
             b1 = a4 ? rect.x1 / 2 : rect.x1 * px;
     for (int32_t y = rect.y0; y < rect.y1; y++)
         for (int32_t bx = b0; bx < b1; bx++) {
@@ -144,7 +144,8 @@ static bool apply(const shr_draw_cmd *c) {
         return registered(id) && inside(c->src_rect, model[id - 1].width, model[id - 1].height);
     shr_image m;
     bool ok = in_range && shr_image_ref_get(&c->src, &m) == SHR_OK && m.domain != SHR_MEMORY_DEVICE &&
-              (m.format == SHR_FORMAT_A4 || m.format == SHR_FORMAT_A8 || m.format == SHR_FORMAT_RGBA8888);
+              (m.format == SHR_FORMAT_A4 || m.format == SHR_FORMAT_A8 || m.format == SHR_FORMAT_RGBA8888 ||
+               m.format == SHR_FORMAT_RGB565);
     if (ok) model[id - 1] = m;
     return ok;
 }
@@ -296,7 +297,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 shr_image b = registered(c->buffer) ? model[c->buffer - 1] : (shr_image){0};
                 shr_rect s = c->src_rect;
                 int32_t rw = s.x1 - s.x0, rh = s.y1 - s.y0;
-                bool fmt_ok = c->kind == SHR_CMD_IMAGE ? b.format == SHR_FORMAT_RGBA8888
+                bool fmt_ok = c->kind == SHR_CMD_IMAGE ? b.format == SHR_FORMAT_RGBA8888 || b.format == SHR_FORMAT_RGB565
                                                        : b.format == SHR_FORMAT_A4 || b.format == SHR_FORMAT_A8;
                 bool rect_ok = inside(s, b.width, b.height) && (b.format != SHR_FORMAT_A4 || s.x0 % 2 == 0);
                 /* Columns a BOLD or ITALIC GLYPH may take (rect sizes, at most 127, never exceed SHR_GLYPH_SYNTH_MAX). */

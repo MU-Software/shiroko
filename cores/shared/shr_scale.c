@@ -33,6 +33,10 @@ INLINE uint32_t texel_word(uint32_t f, const uint8_t *p) {
     uint32_t v;
     if (f == SHR_IMAGE_SRC_RGBA8888) {
         memcpy(&v, p, 4);
+    } else if (f == SHR__SRC_RGB565) {
+        uint16_t u;
+        memcpy(&u, p, 2);
+        v = shr__565_rgba(u);
     } else {
         uint8_t c[4];
         shr__src_rgba(f, p, c);
@@ -52,11 +56,13 @@ INLINE void fill_as(const shr__bilin *b, const uint8_t *row, uint32_t *restrict 
     }
 }
 
-/* The horizontal blend of source row y into h; RGBA sources (every driver buffer) with the format a constant. */
+/* The horizontal blend of source row y into h; driver buffer formats with the format a constant. */
 static void bilin_fill(const shr__bilin *b, int32_t y, uint32_t *restrict h) {
     const uint8_t *row = b->s->pixels + (size_t)y * b->s->stride;
     if (b->s->format == SHR_IMAGE_SRC_RGBA8888)
         fill_as(b, row, h, SHR_IMAGE_SRC_RGBA8888);
+    else if (b->s->format == SHR__SRC_RGB565)
+        fill_as(b, row, h, SHR__SRC_RGB565);
     else
         fill_as(b, row, h, b->s->format);
 }

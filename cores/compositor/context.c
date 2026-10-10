@@ -605,6 +605,10 @@ static bool buf_format(shr_pixel_format f) {
     return f == SHR_FORMAT_A4 || f == SHR_FORMAT_A8 || f == SHR_FORMAT_RGBA8888;
 }
 
+static bool alloc_format(const shr_driver_caps *k, shr_pixel_format f) {
+    return buf_format(f) || (f == SHR_FORMAT_RGB565 && (k->flags & SHR_DRIVER_IMAGE_565));
+}
+
 static bool buf_fits(const shr_driver_caps *k, int32_t w, int32_t h) {
     return !(k->max_buffer_width && w > k->max_buffer_width) && !(k->max_buffer_height && h > k->max_buffer_height);
 }
@@ -613,7 +617,7 @@ static size_t buf_align(const shr_driver_caps *k) { return k->address_align > 64
 
 shr_status shr__buf_alloc(shr_context *ctx, shr_pixel_format f, int32_t w, int32_t h, shr__buf *out) {
     const shr_driver_caps *k = &ctx->driver.caps;
-    if (!buf_format(f) || w <= 0 || h <= 0) return SHR_E_INVALID_ARG;
+    if (!alloc_format(k, f) || w <= 0 || h <= 0) return SHR_E_INVALID_ARG;
     if (!buf_fits(k, w, h)) return SHR_E_UNSUPPORTED;
     uint64_t a = k->stride_align ? k->stride_align : 1, stride = (row_bytes(f, w) + a - 1) / a * a, len;
     if (__builtin_mul_overflow(stride, (uint64_t)h, &len)) return SHR_E_NO_MEMORY;

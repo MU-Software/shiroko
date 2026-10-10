@@ -54,7 +54,8 @@ typedef struct shr__buf {
     shr__lru_node lru;
 } shr__buf;
 
-/* Memory the driver reaches (caps.domains, alignments); SHR_E_UNSUPPORTED beyond caps.max_buffer_width/height. */
+/* Memory the driver reaches (caps.domains, alignments); SHR_E_UNSUPPORTED beyond caps.max_buffer_width/height.
+ * A4, A8, RGBA8888, and RGB565 with SHR_DRIVER_IMAGE_565. */
 shr_status shr__buf_alloc(shr_context *ctx, shr_pixel_format format, int32_t width, int32_t height, shr__buf *out);
 /* Memory the caller keeps (a mapped or builtin page); SHR_E_UNSUPPORTED when the driver cannot reach it. */
 shr_status shr__buf_wrap(shr_context *ctx, const shr_image *mem, shr__buf *out);
@@ -108,6 +109,8 @@ shr_status shr__res_attach(shr_context *ctx, shr__res *res, const shr__res_ops *
  * Every such command counts as changed inside (anchor + area) clipped to its dst: recorded as damage
  * for every output buffer, drawn with the next frame. */
 void shr__res_changed(shr__res *res, shr_rect area);
+/* Frees the dead resources no command, frame or read uses. */
+void shr__res_collect(shr_context *ctx);
 
 /* Asset reads, at most desc.max_reads outstanding per context. Completion (also synchronous ones)
  * reaches res->ops->io_done() from shr_pump(). SHR_E_LIMIT: no free slot; SHR_E_WOULD_BLOCK: the

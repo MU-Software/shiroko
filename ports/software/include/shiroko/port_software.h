@@ -12,10 +12,10 @@ extern "C" {
  * bytes rounded down to a multiple of 128 (caps.max_keep_bytes; SHR_E_INVALID_ARG when that is 0 with max_keeps),
  * all in one block taken at create (else SHR_E_NO_MEMORY) and freed at destroy; a keep needs W * H * bytes per
  * pixel to fit, so keep_bytes = max_keeps * (row bytes rounded up to 128) holds max_keeps rows. With keep_bytes 0 each
- * keep takes memory of its own size, freed by KEEP_RELEASE. Buffer ids are 1..max_buffers; the driver draws from
- * registered memory in place (no SHR_BUFFER_COPIES), except IMAGE into RGB565 where shr_software_driver_image_planes()
- * lets it draw from a plane. It moves pixels with memmove and says so (SHR_DRIVER_CHEAP_MOVE); a port wrapping it where
- * memory is slow clears that flag. The driver keeps its state until shr_software_driver_destroy(). */
+ * keep takes memory of its own size, freed by KEEP_RELEASE. Buffer ids are 1..max_buffers, RGB565 image buffers
+ * included (SHR_DRIVER_IMAGE_565); the driver draws from registered memory in place (no SHR_BUFFER_COPIES), except
+ * RGBA8888 IMAGE into RGB565 where shr_software_driver_image_planes() lets it draw from a plane. It moves pixels with
+ * memmove and says so (SHR_DRIVER_CHEAP_MOVE); a port wrapping it where memory is slow clears that flag. The driver keeps its state until shr_software_driver_destroy(). */
 shr_status shr_software_driver_create(const shr_allocator *allocator, uint64_t keep_bytes, uint32_t max_keeps,
                                       uint32_t max_buffers, shr_framebuffer_driver *out);
 /* BOLD and ITALIC GLYPHs draw from coverage the driver synthesizes once per buffer region and keeps until a REGISTER,
@@ -24,7 +24,7 @@ shr_status shr_software_driver_create(const shr_allocator *allocator, uint64_t k
  * refuses to grow it, it stays at the size reached until this is called again); ON_FILL ones go through colour tables
  * taken at the first of them kept (about 33 KiB more). Frees what it keeps; not while execute() runs. */
 shr_status shr_software_driver_synth_cache(shr_framebuffer_driver *driver, size_t bytes);
-/* IMAGE into RGB565 draws from a plane the first such draw derives from the RGBA8888 buffer, 8 bytes per pixel and per
+/* RGBA8888 IMAGE into RGB565 draws from a plane the first such draw derives from the buffer, 8 bytes per pixel and per
  * row from the allocator as SHR_ALLOC_PAYLOAD, while all planes fit in `bytes` (default 8 MiB, about twice the
  * compositor's default image_bytes; 0 = no planes), derived anew where an UPDATE says and freed by a REGISTER or
  * RELEASE of the id. Without one (no room, memory refused) it blends from the buffer, the same pixels. Frees every

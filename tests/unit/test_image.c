@@ -22,10 +22,12 @@ static void rec_trace(void *user, const shr_trace_event *ev) {
 
 static uint64_t budget_bytes;
 static shr_driver_caps caps; /* applied when max_buffers is set */
+static uint32_t caps_flags;  /* added to the driver's */
 static fail_alloc oom;
 static shr_allocator oom_allocator;
 static void tweak(shr_context_desc *d, shr_framebuffer_driver *drv) {
     if (caps.max_buffers) drv->caps = caps;
+    drv->caps.flags |= caps_flags;
     memset(&rec, 0, sizeof(rec));
     d->trace = rec_trace;
     d->image_bytes = budget_bytes ? budget_bytes : d->image_bytes;
@@ -72,7 +74,6 @@ TEST test_image_create_arguments(void) {
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &img), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_release(NULL), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
-    ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_begin_shutdown(ctx), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &img), SHR_E_STATE);
     harness_close(&h);
@@ -91,15 +92,20 @@ TEST test_image_budget(void) {
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 4, px, 8, &a), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 4, px, 8, &b), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 1, 1, px, 4, &c), SHR_E_LIMIT); /* the budget is used up */
-    ASSERT_EQ_LL(shr_pl_res_image_release(a), SHR_OK);
-    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 1, 1, px, 4, &c), SHR_E_LIMIT); /* freed by the next pump */
-    shr_pump(ctx);
+    uint64_t used = 0, limit = 0;
+    ASSERT_EQ_LL(shr_pl_res_image_budget(NULL, &used, &limit), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &used, &limit), SHR_OK);
+    ASSERT(used == 64 && limit == 64);
+    ASSERT_EQ_LL(shr_pl_res_image_release(a), SHR_OK); /* nothing used it: freed at once */
+    ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &used, NULL), SHR_OK);
+    ASSERT_EQ_LL(used, 32);
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 4, px, 8, &c), SHR_OK);
-    ASSERT_EQ_LL(shr_pl_res_image_release(b), SHR_OK);
-    ASSERT_EQ_LL(shr_pl_res_image_release(c), SHR_OK);
     long live = oom.live;
-    shr_pump(ctx); /* the last image also frees the budget */
+    ASSERT_EQ_LL(shr_pl_res_image_release(b), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(c), SHR_OK); /* the last image also frees the budget */
     ASSERT(oom.live < live - 4);
+    ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &used, &limit), SHR_OK);
+    ASSERT(used == 0 && limit == 64);
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 4, 4, px, 16, &a), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_release(a), SHR_OK);
     harness_close(&h);
@@ -200,7 +206,9 @@ TEST test_cmd_image_validation(void) {
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &img), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &gone), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_create(octx, 2, 2, quad, 8, &foreign), SHR_OK);
+    shr_lyr *hold = image_layer(ctx, 1, gone, (shr_rect){0, 0, 2, 2}, (shr_point){0, 0}); /* released, still used */
     ASSERT_EQ_LL(shr_pl_res_image_release(gone), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(gone), SHR_E_INVALID_ARG);
     shr_lyr *l;
     ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
     const shr_rect all = {0, 0, 2, 2};
@@ -222,6 +230,7 @@ TEST test_cmd_image_validation(void) {
     ASSERT_EQ_LL(shr_lyr_cmd_image(l, img, (shr_rect){1, 1, 1, 2}, o), SHR_E_STATE); /* outside begin/commit */
     frame(ctx);
     ASSERT_EQ_LL(h.out.presents, 1);
+    ASSERT_EQ_LL(shr_lyr_destroy(hold), SHR_OK);
     ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_release(foreign), SHR_OK);
@@ -237,6 +246,7 @@ TEST test_image_update_arguments(void) {
     shr_pl_res_image *img, *gone;
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &img), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &gone), SHR_OK);
+    shr_lyr *hold = image_layer(ctx, 1, gone, (shr_rect){0, 0, 2, 2}, (shr_point){0, 0}); /* released, still used */
     ASSERT_EQ_LL(shr_pl_res_image_release(gone), SHR_OK);
     const shr_rect all = {0, 0, 2, 2};
     ASSERT_EQ_LL(shr_pl_res_image_update(NULL, all, quad, 8), SHR_E_INVALID_ARG);
@@ -247,6 +257,7 @@ TEST test_image_update_arguments(void) {
     ASSERT_EQ_LL(shr_pl_res_image_update(img, all, NULL, 8), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_pl_res_image_update(img, all, quad, 7), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){1, 0, 2, 2}, quad, 4), SHR_OK);
+    ASSERT_EQ_LL(shr_lyr_destroy(hold), SHR_OK);
     ASSERT_EQ_LL(shr_begin_shutdown(ctx), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_update(img, all, quad, 8), SHR_E_STATE);
     ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){1, 1, 1, 2}, NULL, 0), SHR_E_STATE);
@@ -279,6 +290,147 @@ TEST test_image_update_damages_every_buffer(void) {
     ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
     harness_close(&h);
+    PASS();
+}
+
+#define KEPT_565 (SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565)
+
+TEST test_image_create_from_arguments(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, 0, tweak);
+    shr_pl_res_image *img = (shr_pl_res_image *)&h;
+    const shr_image_source ok = {2, 2, SHR_IMAGE_SRC_RGB888, quad, 6};
+    shr_image_source bad[6] = {ok, ok, ok, ok, ok, ok};
+    bad[0].pixels = NULL, bad[1].width = 0, bad[2].height = -1, bad[3].format = (shr_image_source_format)4;
+    bad[4].stride = 5, bad[5].format = SHR_IMAGE_SRC_RGBA8888;
+    ASSERT_EQ_LL(shr_pl_res_image_create_from(NULL, &ok, &img), SHR_E_INVALID_ARG);
+    ASSERT(img == NULL);
+    ASSERT_EQ_LL(shr_pl_res_image_create_from(ctx, NULL, &img), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_image_create_from(ctx, &ok, NULL), SHR_E_INVALID_ARG);
+    for (int i = 0; i < 6; i++) ASSERT_EQ_LL(shr_pl_res_image_create_from(ctx, &bad[i], &img), SHR_E_INVALID_ARG);
+    const shr_image_source gray = {1, 4, SHR_IMAGE_SRC_GRAY8, quad, 1};
+    ASSERT_EQ_LL(shr_pl_res_image_create_from(ctx, &gray, &img), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
+    ASSERT_EQ_LL(shr_begin_shutdown(ctx), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_create_from(ctx, &ok, &img), SHR_E_STATE);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
+/* Too large for what is left: refused before a pixel is read (the rows here are one byte long). */
+TEST test_image_budget_before_reading(void) {
+    harness h;
+    budget_bytes = 4096;
+    caps_flags = SHR_DRIVER_IMAGE_565;
+    shr_context *ctx = harness_open(&h, 0, tweak);
+    budget_bytes = 0, caps_flags = 0;
+    static const uint8_t one[1] = {255};
+    const shr_image_source big = {64, 33, SHR_IMAGE_SRC_GRAY8, one, 0}, wide = {1 << 20, 1, SHR_IMAGE_SRC_RGB888, one, 0};
+    shr_image_source s[2] = {big, wide};
+    s[0].stride = 64, s[1].stride = 3u << 20;
+    shr_pl_res_image *img;
+    for (int i = 0; i < 2; i++) ASSERT_EQ_LL(shr_pl_res_image_create_from(ctx, &s[i], &img), SHR_E_LIMIT);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
+/* 3 x 2 rows of each layout with padded rows, drawn over white: the same screen as the RGBA8888 rows the layout means,
+ * kept as RGB565 (half the bytes) exactly when the screen is RGB565, the driver can and every alpha is 255. */
+TEST test_image_sources_and_storage(void) {
+    static const uint8_t g[2][8] = {{0, 77, 128, 0}, {200, 255, 9, 0}};
+    static const uint8_t ga[2][8] = {{0, 255, 77, 255, 128, 40}, {200, 255, 255, 0, 9, 255}};
+    static const uint8_t rgb[2][12] = {{255, 0, 0, 1, 2, 3, 40, 80, 120}, {9, 99, 199, 0, 255, 0, 250, 251, 252}};
+    uint8_t opaque[2][16], alpha[2][16];
+    for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 3; x++) {
+            memcpy(opaque[y] + 4 * x, rgb[y] + 3 * x, 3), opaque[y][4 * x + 3] = 255;
+            memcpy(alpha[y] + 4 * x, rgb[y] + 3 * x, 3), alpha[y][4 * x + 3] = (uint8_t)(255 - 60 * x * y);
+        }
+    const struct {
+        shr_image_source src;
+        int opaque;
+    } cases[] = {
+        {{3, 2, SHR_IMAGE_SRC_RGBA8888, opaque, 16}, 1}, {{3, 2, SHR_IMAGE_SRC_RGBA8888, alpha, 16}, 0},
+        {{3, 2, SHR_IMAGE_SRC_RGB888, rgb, 12}, 1},      {{3, 2, SHR_IMAGE_SRC_GRAY8, g, 8}, 1},
+        {{3, 2, SHR_IMAGE_SRC_GRAY_ALPHA88, ga, 8}, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        for (int able = 0; able < 2; able++) {
+            const shr_image_source *src = &cases[i].src;
+            uint8_t want[2][12];
+            for (int y = 0; y < 2; y++)
+                for (int x = 0; x < 3; x++) {
+                    const uint8_t *p = (const uint8_t *)src->pixels + (size_t)y * src->stride;
+                    uint8_t *o = want[y] + 4 * x;
+                    switch (src->format) {
+                    case SHR_IMAGE_SRC_RGBA8888: memcpy(o, p + 4 * x, 4); break;
+                    case SHR_IMAGE_SRC_RGB888: memcpy(o, p + 3 * x, 3), o[3] = 255; break;
+                    case SHR_IMAGE_SRC_GRAY8: o[0] = o[1] = o[2] = p[x], o[3] = 255; break;
+                    default: o[0] = o[1] = o[2] = p[2 * x], o[3] = p[2 * x + 1]; break;
+                    }
+                }
+            uint8_t screen[2][HW * HH * 4];
+            for (int k = 0; k < 2; k++) {
+                harness h;
+                caps_flags = able && !k ? SHR_DRIVER_IMAGE_565 : 0;
+                shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak);
+                caps_flags = 0;
+                shr_lyr *below;
+                ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &below), SHR_OK);
+                ASSERT_EQ_LL(shr_lyr_cmd_begin(below), SHR_OK);
+                ASSERT_EQ_LL(shr_lyr_cmd_fill(below, FULL, SHR_RGB(255, 255, 255)), SHR_OK);
+                ASSERT_EQ_LL(shr_lyr_cmd_commit(below), SHR_OK);
+                shr_pl_res_image *img;
+                if (k) ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 3, 2, want, 12, &img), SHR_OK);
+                else ASSERT_EQ_LL(shr_pl_res_image_create_from(ctx, src, &img), SHR_OK);
+                uint64_t used;
+                ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &used, NULL), SHR_OK);
+                ASSERT_EQ_LL(used, !k && able && KEPT_565 && cases[i].opaque ? 12 : 24);
+                shr_lyr *l = image_layer(ctx, 1, img, (shr_rect){0, 0, 3, 2}, (shr_point){5, 7});
+                frame(ctx);
+                memcpy(screen[k], h.out.shown, sizeof(screen[k]));
+                ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
+                ASSERT_EQ_LL(shr_lyr_destroy(below), SHR_OK);
+                ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
+                harness_close(&h);
+            }
+            ASSERT_MEM_EQ(screen[1], screen[0], sizeof(screen[0]));
+        }
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
+/* An image kept as RGB565 takes opaque updates, also into a second buffer while a frame reads it, and refuses others. */
+TEST test_image_565_updates(void) {
+    harness h;
+    caps_flags = SHR_DRIVER_IMAGE_565;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak);
+    caps_flags = 0;
+    static const uint8_t red[16] = {255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255};
+    const uint8_t green[4] = {0, 255, 0, 255}, clear[4] = {0, 255, 0, 254};
+    shr_pl_res_image *img;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, red, 8, &img), SHR_OK);
+    shr_lyr *l = image_layer(ctx, 0, img, (shr_rect){0, 0, 2, 2}, (shr_point){0, 0});
+    h.drv.async = true;
+    frame(ctx);
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){1, 1, 2, 2}, clear, 4),
+                 KEPT_565 ? SHR_E_UNSUPPORTED : SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_update(img, (shr_rect){1, 1, 2, 2}, green, 4), SHR_OK); /* the second buffer */
+    md_complete(&h.drv);
+    shr_pump(ctx);
+    h.drv.async = false;
+    frame(ctx);
+    ASSERT(px(h.out.shown, 0, 0) == RED && px(h.out.shown, 1, 0) == RED && px(h.out.shown, 1, 1) == GREEN);
+    uint64_t used;
+    ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &used, NULL), SHR_OK);
+    ASSERT_EQ_LL(used, KEPT_565 ? 16 : 32);
+    ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
+    shr_output_released(ctx, 2);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
     PASS();
 }
 
@@ -513,6 +665,10 @@ int main(int argc, char **argv) {
     RUN_TEST(test_image_create_arguments);
     RUN_TEST(test_image_budget);
     RUN_TEST(test_image_create_out_of_memory);
+    RUN_TEST(test_image_create_from_arguments);
+    RUN_TEST(test_image_budget_before_reading);
+    RUN_TEST(test_image_sources_and_storage);
+    RUN_TEST(test_image_565_updates);
     RUN_TEST(test_image_needs_plugin_slot);
     RUN_TEST(test_image_blends_over_layers_below);
     RUN_TEST(test_cmd_image_validation);

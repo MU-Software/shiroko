@@ -1019,7 +1019,7 @@ TEST buffers_register_replace_and_release(void) {
     ASSERT_EQ_LL(drv.caps.max_buffers, 3);
     ASSERT(!drv.caps.max_buffer_width && !drv.caps.max_buffer_height && !drv.caps.buffer_bytes && !drv.caps.buffer_flags);
     ASSERT(!drv.caps.max_keeps && !drv.caps.keep_bytes);
-    ASSERT_EQ_LL(drv.caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE);
+    ASSERT_EQ_LL(drv.caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE | SHR_DRIVER_IMAGE_565);
     shr_draw_cmd img = cmd(SHR_CMD_IMAGE, (shr_rect){0, 0, 1, 1});
     img.buffer = 3, img.src_rect = (shr_rect){0, 0, 1, 1};
     shr_draw_cmd c[3] = {cmd(SHR_CMD_BUFFER_REGISTER, (shr_rect){0, 0, 0, 0}), img};
@@ -1079,7 +1079,7 @@ TEST buffer_commands_are_validated(void) {
         {3, ok, SHR_E_INVALID_ARG},
         {1, {a8, 4, 2, 3, 8, SHR_FORMAT_A8, 0}, SHR_E_INVALID_ARG},  /* stride */
         {1, {a8, 4, 2, 4, 8, (shr_pixel_format)0, 0}, SHR_E_INVALID_ARG},
-        {1, {a8, 2, 1, 4, 8, SHR_FORMAT_RGB565, 0}, SHR_E_UNSUPPORTED},
+        {1, {a8, 2, 1, 4, 8, SHR_FORMAT_RGB565, 0}, SHR_OK}, /* an opaque image */
         {1, {a8, 1, 1, 4, 8, SHR_FORMAT_RGBX8888, 0}, SHR_E_UNSUPPORTED},
         {1, {a8, 4, 2, 4, 8, SHR_FORMAT_A8, SHR_MEMORY_DEVICE}, SHR_E_UNSUPPORTED},
     };
@@ -1208,6 +1208,8 @@ TEST execute_rejects_bad_batches_without_drawing(void) {
         shr_status want;
     } srcs[] = {
         {SHR_CMD_GLYPH, {a8, 1, 1, 4, 4, SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
+        {SHR_CMD_GLYPH, {a8, 2, 1, 4, 4, SHR_FORMAT_RGB565, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
+        {SHR_CMD_IMAGE, {a8, 2, 1, 4, 4, SHR_FORMAT_RGB565, SHR_MEMORY_CPU}, {2, 0}, SHR_E_INVALID_ARG},
         {SHR_CMD_IMAGE, {a8, 2, 2, 2, 4, SHR_FORMAT_A8, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
         {SHR_CMD_IMAGE, {a8, 4, 1, 2, 2, SHR_FORMAT_A4, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
         {SHR_CMD_COPY, {a8, 2, 2, 2, 4, SHR_FORMAT_A8, SHR_MEMORY_CPU}, {0, 0}, SHR_E_UNSUPPORTED},
@@ -1586,8 +1588,8 @@ TEST copier_orders_keep_copies(void) {
             for (int d = 0; d < 2; d++)
                 ASSERT_EQ_LL(shr_software_driver_create(NULL, mode & 2 ? 4 * 256 : 0, 4, NBUF, &drv[d]), SHR_OK);
             ASSERT_EQ_LL(shr_software_driver_set_copier(&drv[1], &lc), SHR_OK);
-            ASSERT(drv[1].caps.flags == (SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_CHEAP_STORE | SHR_DRIVER_SCALE));
-            ASSERT_EQ_LL(drv[0].caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE);
+            ASSERT(drv[1].caps.flags == (SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_CHEAP_STORE | SHR_DRIVER_SCALE | SHR_DRIVER_IMAGE_565));
+            ASSERT_EQ_LL(drv[0].caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE | SHR_DRIVER_IMAGE_565);
             uint64_t last[2] = {0, 0};
             shr_draw_cmd lead[96], body[64];
             size_t nl, nb;
@@ -1653,7 +1655,7 @@ TEST copier_orders_keep_copies(void) {
             RUN(0, 5);
             ASSERT_EQ_LL(shr_software_driver_set_copier(&drv[1], NULL), SHR_OK);
             ASSERT_EQ_LL(l.done, l.started);
-            ASSERT_EQ_LL(drv[1].caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE);
+            ASSERT_EQ_LL(drv[1].caps.flags, SHR_DRIVER_CHEAP_MOVE | SHR_DRIVER_SCALE | SHR_DRIVER_IMAGE_565);
             SAME(0);
             SAME(1);
             RUN(1, 6);
@@ -2351,6 +2353,58 @@ TEST image_planes_blend_exactly(void) {
     PASS();
 }
 
+/* Opaque pixels kept as RGB565 draw as their RGBA8888 originals onto RGB565, plane or not; onto RGBX8888 they are
+ * the 565 levels widened, as COPY converts. */
+TEST image_565_copies_opaque_pixels(void) {
+    enum { W = 37, H = 23 };
+    static uint8_t rgba[W * H * 4], p565[W * H * 2], buf[3][64 * 32 * 4];
+    for (uint32_t i = 0; i < W * H; i++) {
+        uint8_t *o = rgba + 4 * i;
+        o[0] = (uint8_t)(i * 37 & 255), o[1] = (uint8_t)((i * 101 + 7) & 255), o[2] = (uint8_t)((i * 53 + i / 7) & 255);
+        o[3] = 255;
+        uint16_t v = (uint16_t)enc(SHR_FORMAT_RGB565, (uint32_t)o[0] << 16 | (uint32_t)o[1] << 8 | o[2]);
+        memcpy(p565 + 2 * i, &v, 2);
+    }
+    shr_image m32 = {rgba, W, H, 4 * W, sizeof(rgba), SHR_FORMAT_RGBA8888, SHR_MEMORY_CPU};
+    shr_image m16 = {p565, W, H, 2 * W, sizeof(p565), SHR_FORMAT_RGB565, SHR_MEMORY_CPU};
+    const shr_rect rects[3] = {{0, 0, W, H}, {3, 2, 30, 21}, {1, 5, 2, 6}};
+    for (int fi = 0; fi < 2; fi++)
+        for (int planes = 0; planes < 2; planes++)
+            for (int k = 0; k < 3; k++) {
+                shr_pixel_format f = FMTS[fi];
+                shr_framebuffer_driver drv;
+                ASSERT_EQ_LL(shr_software_driver_create(NULL, 0, 0, 2, &drv), SHR_OK);
+                if (!planes) ASSERT_EQ_LL(shr_software_driver_image_planes(&drv, 0), SHR_OK);
+                shr_surface s[3];
+                for (int j = 0; j < 3; j++) {
+                    memset(buf[j], 0x5A, sizeof(buf[j]));
+                    s[j] = packed(buf[j], f, 64, 32);
+                }
+                shr_rect r = rects[k], dst = {5, 4, 5 + r.x1 - r.x0, 4 + r.y1 - r.y0};
+                shr_draw_cmd c[3] = {reg(use(m32)), reg(use(m16)),
+                                     region(SHR_CMD_IMAGE, dst, m32, r, (shr_point){0, 0})};
+                c[0].buffer = 1, c[1].buffer = 2, c[2].buffer = 1;
+                ASSERT_EQ_LL(drv.execute(drv.user, &s[0], c, 3, 1), SHR_OK);
+                c[2].buffer = 2;
+                ASSERT_EQ_LL(drv.execute(drv.user, &s[1], c + 2, 1, 1), SHR_OK);
+                ASSERT_EQ_LL(shr_software_execute(&s[2], c + 2, 1, (const shr_image[]){m32, m16}, 2), SHR_OK);
+                ASSERT_MEM_EQ(buf[1], buf[2], sizeof(buf[1]));
+                for (int32_t y = 0; y < 32; y++)
+                    for (int32_t x = 0; x < 64; x++) {
+                        bool in = x >= dst.x0 && x < dst.x1 && y >= dst.y0 && y < dst.y1;
+                        uint32_t want = raw(&s[0], x, y);
+                        if (in && f != SHR_FORMAT_RGB565) {
+                            uint16_t v;
+                            memcpy(&v, p565 + 2 * ((r.y0 + y - dst.y0) * W + r.x0 + x - dst.x0), 2);
+                            want = enc(f, dec(SHR_FORMAT_RGB565, v));
+                        }
+                        ASSERT_EQ_LL(raw(&s[1], x, y), want);
+                    }
+                ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
+            }
+    PASS();
+}
+
 /* The plane: taken by the first IMAGE into RGB565 (not RGBX8888), kept across batches until a REGISTER or RELEASE of
  * its buffer, an UPDATE preparing its rect anew; pixels changed without one (which the rules forbid) show what is
  * kept. Without memory the IMAGE blends from the buffer. Rows without alpha, clipped and offset draws, keep groups. */
@@ -2797,6 +2851,7 @@ int main(int argc, char **argv) {
     RUN_TEST(synth_cache_keys_and_luts);
     RUN_TEST(synth_cache_indexes_live_entries);
     RUN_TEST(image_planes_blend_exactly);
+    RUN_TEST(image_565_copies_opaque_pixels);
     RUN_TEST(image_planes_follow_buffers_and_memory);
     RUN_TEST(image_planes_keep_within_the_cap);
     RUN_TEST(driver_create_and_destroy);

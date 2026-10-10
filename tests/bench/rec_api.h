@@ -25,6 +25,7 @@ shr_status rec_shr_lyr_cmd_image(shr_lyr *layer, shr_pl_res_image *image, shr_re
 shr_status rec_shr_lyr_cmd_commit(shr_lyr *layer);
 shr_status rec_shr_pl_res_image_create(shr_context *ctx, int32_t width, int32_t height, const void *rgba, size_t stride,
                                        shr_pl_res_image **out);
+shr_status rec_shr_pl_res_image_create_from(shr_context *ctx, const shr_image_source *source, shr_pl_res_image **out);
 shr_status rec_shr_pl_res_image_update(shr_pl_res_image *image, shr_rect rect, const void *rgba, size_t stride);
 shr_status rec_shr_pl_res_image_release(shr_pl_res_image *image);
 shr_status rec_shr_pl_res_image_create_scaled(shr_context *ctx, const shr_image_source *source, shr_rect src,
@@ -67,6 +68,7 @@ shr_status rec_shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t c
 #define shr_lyr_cmd_image rec_shr_lyr_cmd_image
 #define shr_lyr_cmd_commit rec_shr_lyr_cmd_commit
 #define shr_pl_res_image_create rec_shr_pl_res_image_create
+#define shr_pl_res_image_create_from rec_shr_pl_res_image_create_from
 #define shr_pl_res_image_update rec_shr_pl_res_image_update
 #define shr_pl_res_image_release rec_shr_pl_res_image_release
 #define shr_pl_res_image_create_scaled rec_shr_pl_res_image_create_scaled

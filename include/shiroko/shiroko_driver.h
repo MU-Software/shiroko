@@ -120,7 +120,7 @@ typedef struct shr_surface {
 
 shr_status shr_surface_validate(const shr_surface *surface) SHR_NONBLOCKING;
 
-/* Read-only pixels: the memory of a buffer (A4, A8, RGBA8888) or a COPY/ROTATE source surface. */
+/* Read-only pixels: the memory of a buffer (A4, A8, RGBA8888, RGB565) or a COPY/ROTATE source surface. */
 typedef struct shr_image {
     const void *pixels;
     int32_t width;
@@ -152,7 +152,7 @@ shr_status shr_image_ref_get(const shr_image_ref *ref, shr_image *out) SHR_NONBL
 typedef enum shr_cmd_kind {
     SHR_CMD_FILL = 1,        /* dst <- color */
     SHR_CMD_GLYPH,           /* dst <- color through the A4/A8 coverage of `src_rect` of `buffer` */
-    SHR_CMD_IMAGE,           /* dst <- RGBA8888 `src_rect` of `buffer`, source-over */
+    SHR_CMD_IMAGE,           /* dst <- RGBA8888 `src_rect` of `buffer`, source-over; RGB565: copied */
     SHR_CMD_COPY,            /* dst <- src surface, format converted */
     SHR_CMD_ROTATE,          /* dst <- rotated src image */
     SHR_CMD_KEEP_BEGIN,      /* commands up to KEEP_END draw `dst` into keep `buffer` instead of the destination */
@@ -233,6 +233,8 @@ shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t 
  * (rows likewise), each channel (top * (256 - fy) + bottom * fy + 32768) >> 16 with top and bottom the rows'
  * a * (256 - fx) + b * fx. It may read one buffer pixel beyond `src_rect` on each side. A SCALED IMAGE also reads
  * scale_w and scale_h; one reading outside scale_w x scale_h or sized beyond 1..32767 is invalid (SHR_E_INVALID_ARG).
+ * IMAGE from an RGB565 buffer (SHR_DRIVER_IMAGE_565): the pixels are opaque, copied as COPY converts formats; a
+ * SCALED one widens each pixel to 8 bits a channel (c << 3 | c >> 2, g << 2 | g >> 4, alpha 255) first.
  * GLYPH coverage of rect pixel (x, y), exactly: in(x, y) is the coverage of buffer pixel
  * (src_rect.x0 + x, src_rect.y0 + y) widened to 8 bits (A4 n -> 17n) for 0 <= x < W and 0 <= y < H, and 0
  * elsewhere, also where the buffer has pixels. BOLD: b(x) = in(x + 1) > in(x) ? in(x) : max(in(x), in(x - 1)),
@@ -266,9 +268,9 @@ shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t 
  * KEEP_BEGIN or KEEP_DRAW of id 0 or above caps.max_keeps, a second KEEP_BEGIN of an id in the batch, a KEEP_DRAW of an
  * id that holds nothing or is stored later in the batch, reading outside its keep or into a destination of another
  * format, a keep group taking more than caps.max_keep_bytes, stores leaving more than caps.keep_bytes held.
- * SHR_E_UNSUPPORTED: REGISTER of a format other than A4, A8 and RGBA8888 or of memory outside the caps, a buffer or
- * source format the kind does not take, a COPY whose source overlaps `dst` with another format or stride, a ROTATE
- * whose source overlaps `dst`.
+ * SHR_E_UNSUPPORTED: REGISTER of a format other than A4, A8, RGBA8888 and (SHR_DRIVER_IMAGE_565) RGB565 or of
+ * memory outside the caps, a buffer or source format the kind does not take, a COPY whose source overlaps `dst` with
+ * another format or stride, a ROTATE whose source overlaps `dst`.
  * SHR_E_NO_MEMORY: no memory for a keep the batch stores. */
 #if defined(__cplusplus) && defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -322,6 +324,8 @@ enum { SHR_DRIVER_CHEAP_MOVE = 1u << 1 };
 enum { SHR_DRIVER_CHEAP_STORE = 1u << 2 };
 /* flags: the driver draws SCALED IMAGEs. */
 enum { SHR_DRIVER_SCALE = 1u << 3 };
+/* flags: IMAGE also draws from RGB565 buffers; on an RGB565 screen the image resource keeps opaque images so. */
+enum { SHR_DRIVER_IMAGE_565 = 1u << 4 };
 
 /* Destinations, sources and buffers outside these limits make the submission fail with SHR_E_UNSUPPORTED:
  * a driver implements every command kind (a device driver may run some on the software port). */

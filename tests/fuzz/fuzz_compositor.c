@@ -202,9 +202,10 @@ static void apply(shr_image *t, const shr_draw_cmd *c, bool copy) {
     }
     FUZZ_CHECK(t[k].format && c->src_rect.x0 >= 0 && c->src_rect.y0 >= 0 && c->src_rect.x1 <= t[k].width &&
                c->src_rect.y1 <= t[k].height && c->src_rect.x0 < c->src_rect.x1 && c->src_rect.y0 < c->src_rect.y1);
+    size_t bpp = t[k].format == SHR_FORMAT_RGB565 ? 2 : 4;
     for (int32_t y = c->src_rect.y0; copy && y < c->src_rect.y1; y++) {
-        size_t at = (size_t)y * t[k].stride + (size_t)c->src_rect.x0 * 4;
-        memcpy(h.copies[k] + at, h.origin[k] + at, (size_t)(c->src_rect.x1 - c->src_rect.x0) * 4);
+        size_t at = (size_t)y * t[k].stride + (size_t)c->src_rect.x0 * bpp;
+        memcpy(h.copies[k] + at, h.origin[k] + at, (size_t)(c->src_rect.x1 - c->src_rect.x0) * bpp);
     }
 }
 
@@ -469,6 +470,7 @@ static int run_input(const uint8_t *data, size_t size, uint64_t cap) {
     drv.caps.buffer_bytes = (setup & 128) ? NIMAGES * IMAGE_BYTES : 0;
     drv.caps.max_keeps = (setup & 64) ? 2 : 0;
     drv.caps.flags = SHR_DRIVER_CHEAP_MOVE | ((setup & 65) == 65 ? SHR_DRIVER_CHEAP_STORE : 0); /* keeps, half the time */
+    if ((setup & 33) == 33) drv.caps.flags |= SHR_DRIVER_IMAGE_565; /* opaque images as RGB565, with the model check */
     h.caps = drv.caps;
     shr_output out;
     shr_output_init(&out);

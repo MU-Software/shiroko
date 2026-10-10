@@ -22,7 +22,7 @@
 enum { C_CLOCK = REC_CALL0, C_CREATE, C_SCREEN, C_SUBMIT, C_PUMP, C_POLL, C_REDRAW, C_LYR_CREATE, C_LYR_RECT, C_LYR_Z,
        C_LYR_VISIBLE, C_LYR_DESTROY, C_CMD_BEGIN, C_CMD_FILL, C_CMD_IMAGE, C_CMD_COMMIT, C_IMG_CREATE, C_IMG_UPDATE,
        C_IMG_RELEASE, C_FONT_CREATE, C_FONT_DESTROY, C_FONT_PRELOAD, C_RESIZE, C_STYLE, C_CELLS, C_TEXT, C_CLEAR,
-       C_SCROLL, C_LINES, C_ROW, C_IMG_SCALED, C_IMG_VIEW, C_END };
+       C_SCROLL, C_LINES, C_ROW, C_IMG_SCALED, C_IMG_VIEW, C_IMG_CREATE_FROM, C_END };
 enum { K_FRAME, K_API, K_SUBMIT, K_BUILD };
 enum { A_ALL, A_CELLS, A_SCROLL, A_LAYER, A_IMAGE, A_OTHER };
 /* The api column of each call decoded ahead (the rest: A_ALL). */
@@ -36,6 +36,7 @@ static const int8_t kinds[C_END - C_CLOCK] = {
     [C_RESIZE - C_CLOCK] = A_OTHER,      [C_CELLS - C_CLOCK] = A_CELLS,       [C_TEXT - C_CLOCK] = A_CELLS,
     [C_CLEAR - C_CLOCK] = A_CELLS,       [C_SCROLL - C_CLOCK] = A_SCROLL,     [C_LINES - C_CLOCK] = A_CELLS,
     [C_ROW - C_CLOCK] = A_CELLS,         [C_IMG_SCALED - C_CLOCK] = A_IMAGE,  [C_IMG_VIEW - C_CLOCK] = A_IMAGE,
+    [C_IMG_CREATE_FROM - C_CLOCK] = A_IMAGE,
 };
 
 const char *const rec_compositor_cols[REC_COLS] = {"frame", "api", "submit", "build"};
@@ -293,6 +294,19 @@ shr_status rec_shr_pl_res_image_create(shr_context *ctx, int32_t width, int32_t 
         size_t row = (size_t)width * 4;
         rows_put(call(c, C_IMG_CREATE, (const uint32_t[]){id, (uint32_t)width, (uint32_t)height}, 3, row * (size_t)height),
                  rgba, stride, row, height);
+    }
+    return st;
+}
+
+shr_status rec_shr_pl_res_image_create_from(shr_context *ctx, const shr_image_source *source, shr_pl_res_image **out) {
+    rec_calls *c = recorder();
+    shr_status st = shr_pl_res_image_create_from(ctx, source, out);
+    if (c && st == SHR_OK) {
+        uint32_t id = obj_add(c, *out);
+        size_t row = (size_t)source->width * src_bytes(source->format);
+        const uint32_t v[] = {id, (uint32_t)source->width, (uint32_t)source->height, (uint32_t)source->format};
+        rows_put(call(c, C_IMG_CREATE_FROM, v, 4, row * (size_t)source->height), source->pixels, source->stride, row,
+                 source->height);
     }
     return st;
 }
@@ -603,6 +617,12 @@ static void exec(player *p, const pcall *c) {
         shr_pl_res_image_create(p->ctx, c->i[0], c->i[1], c->data, (size_t)c->i[0] * 4,
                                 (shr_pl_res_image **)&p->objs[c->a - 1]);
         break;
+    case C_IMG_CREATE_FROM: {
+        shr_image_source_format f = (shr_image_source_format)c->i[2];
+        const shr_image_source s = {c->i[0], c->i[1], f, c->data, (size_t)c->i[0] * src_bytes(f)};
+        shr_pl_res_image_create_from(p->ctx, &s, (shr_pl_res_image **)&p->objs[c->a - 1]);
+        break;
+    }
     case C_IMG_UPDATE:
         shr_pl_res_image_update(obj(p, c->a), (shr_rect){c->i[0], c->i[1], c->i[2], c->i[3]}, c->data,
                                 (size_t)(c->i[2] - c->i[0]) * 4);
@@ -699,12 +719,14 @@ static bool decode(player *p, unsigned type, const uint8_t *r, size_t n, rec_tim
         [C_FONT_PRELOAD - C_CLOCK] = 10, [C_RESIZE - C_CLOCK] = 6,   [C_TEXT - C_CLOCK] = 7,
         [C_CLEAR - C_CLOCK] = 6,       [C_SCROLL - C_CLOCK] = 5,     [C_LINES - C_CLOCK] = 3,
         [C_ROW - C_CLOCK] = 7,         [C_IMG_SCALED - C_CLOCK] = 11, [C_IMG_VIEW - C_CLOCK] = 9,
+        [C_IMG_CREATE_FROM - C_CLOCK] = 4,
     };
     uint32_t v[11] = {0}, w = words[type - C_CLOCK];
     if (n < 4 * (size_t)w) return false;
     for (uint32_t i = 0; i < w; i++) v[i] = rec_get32(r + 4 * i);
     bool makes = type == C_LYR_CREATE || type == C_IMG_CREATE || type == C_FONT_CREATE || type == C_LYR_DESTROY ||
-                 type == C_IMG_RELEASE || type == C_FONT_DESTROY || type == C_IMG_SCALED || type == C_IMG_VIEW;
+                 type == C_IMG_RELEASE || type == C_FONT_DESTROY || type == C_IMG_SCALED || type == C_IMG_VIEW ||
+                 type == C_IMG_CREATE_FROM;
     if (makes && (!v[0] || v[0] > p->nobjs)) return false;
     pcall *c = slot(p, kinds[type - C_CLOCK], comp, api);
     c->type = type, c->a = v[0];
@@ -722,6 +744,12 @@ static bool decode(player *p, unsigned type, const uint8_t *r, size_t n, rec_tim
     case C_IMG_CREATE:
         if ((uint64_t)v[1] * 4 * v[2] > (uint64_t)(n - 12)) return false;
         c->data = r + 12;
+        break;
+    case C_IMG_CREATE_FROM:
+        if (v[3] > SHR_IMAGE_SRC_GRAY_ALPHA88 ||
+            (uint64_t)v[1] * src_bytes((shr_image_source_format)v[3]) * v[2] > (uint64_t)(n - 16))
+            return false;
+        c->data = r + 16;
         break;
     case C_IMG_UPDATE:
         if ((uint64_t)(uint32_t)(c->i[2] - c->i[0]) * 4 * (uint32_t)(c->i[3] - c->i[1]) > (uint64_t)(n - 20)) return false;
@@ -858,7 +886,7 @@ shr_status rec_calls_play(const uint8_t *rec, size_t len, const rec_calls_host *
                                    h->targets[t].stride != rec_get32(r + 12) || h->targets[t].format != rec_get32(r + 20)))
             st = SHR_E_PROFILE_MISMATCH;
         if ((type == C_LYR_CREATE || type == C_IMG_CREATE || type == C_FONT_CREATE || type == C_IMG_SCALED ||
-             type == C_IMG_VIEW) && n >= 4 && rec_get32(r) - 1 < p.nobjs)
+             type == C_IMG_VIEW || type == C_IMG_CREATE_FROM) && n >= 4 && rec_get32(r) - 1 < p.nobjs)
             p.types[rec_get32(r) - 1] = (uint8_t)(type == C_LYR_CREATE || type == C_FONT_CREATE ? type : C_IMG_CREATE);
     }
     if (st == SHR_OK && verify) {

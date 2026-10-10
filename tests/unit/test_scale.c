@@ -239,6 +239,83 @@ TEST draws_match_reference_in_parts(void) {
 }
 
 /* Sizes and reads the driver checks. */
+/* An opaque image kept as RGB565: rows, whole copies and scaled draws (in two parts, both screen formats, stateless
+ * and through a driver) equal the reference on its widened pixels. */
+TEST rgb565_scales_widened(void) {
+    enum { W = 100, H = 100 };
+    static uint8_t bg[W * H * 4], out[2][W * H * 4];
+    for (int k = 0; k < NCASE; k++) {
+        kase c = case_at(k);
+        uint16_t *p = malloc((size_t)c.w * (size_t)c.h * 2);
+        for (size_t i = 0; i < (size_t)c.w * (size_t)c.h; i++) p[i] = (uint16_t)rnd();
+        uint8_t *wide = malloc((size_t)c.w * (size_t)c.h * 4), *copy = malloc((size_t)c.dw * (size_t)c.dh * 4);
+        uint8_t *row = malloc((size_t)c.dw * 4);
+        shr_rgb565_widen(p, (size_t)c.w * 2, c.w, c.h, wide);
+        shr_scale_src m = {wide, (size_t)c.w * 4, c.w, c.h, c.sx, c.sy, c.sw, c.sh, c.dw, c.dh};
+        for (uint32_t f = SHR_SCALE_BILINEAR; f <= SHR_SCALE_BOX; f++) {
+            shr__scale s = scale_of(&c, (const uint8_t *)p, (size_t)c.w * 2, SHR__SRC_RGB565, f);
+            shr__scale_rows(&s, copy, (size_t)c.dw * 4);
+            for (int32_t y = 0; y < c.dh; y++) {
+                shr__scale_row(&s, y, 0, c.dw, row);
+                for (int32_t x = 0; x < c.dw; x++) {
+                    uint8_t want[4];
+                    shr_scale_px(&m, f == SHR_SCALE_BOX ? SHR_FILTER_BOX : SHR_FILTER_BILINEAR, x, y, want);
+                    if (memcmp(want, copy + ((size_t)y * (size_t)c.dw + (size_t)x) * 4, 4) || memcmp(want, row + 4 * x, 4)) {
+                        fprintf(stderr, "case %d filter %u (%d, %d)\n", k, f, x, y);
+                        FAIL();
+                    }
+                }
+            }
+        }
+        shr_point at = {(int32_t)(rnd() % 20) - 10, (int32_t)(rnd() % 20) - 10};
+        shr_rect whole = shr__rect_intersect((shr_rect){at.x, at.y, at.x + c.dw, at.y + c.dh}, (shr_rect){0, 0, W, H});
+        shr_image b = {p, c.w, c.h, (size_t)c.w * 2, (size_t)c.w * (size_t)c.h * 2, SHR_FORMAT_RGB565, SHR_MEMORY_CPU};
+        for (int fi = 0; fi < 2 && !shr__rect_empty(whole); fi++) {
+            shr_pixel_format fmt = fi ? SHR_FORMAT_RGBX8888 : SHR_FORMAT_RGB565;
+            size_t bpp = fi ? 4 : 2;
+            for (size_t i = 0; i < sizeof(bg); i++) bg[i] = (uint8_t)rnd();
+            int32_t mid = whole.y0 + (whole.y1 - whole.y0) / 2;
+            shr_draw_cmd all[3] = {{0}};
+            all[0].kind = SHR_CMD_BUFFER_REGISTER, all[0].buffer = 1, all[0].src = img_ref(b);
+            all[1] = scaled_cmd(&c, 1, (shr_rect){whole.x0, whole.y0, whole.x1, mid}, at);
+            all[2] = scaled_cmd(&c, 1, (shr_rect){whole.x0, mid, whole.x1, whole.y1}, at);
+            memcpy(out[0], bg, sizeof(bg)), memcpy(out[1], bg, sizeof(bg));
+            shr_surface s0 = {out[0], W, H, W * bpp, sizeof(out[0]), fmt, 1, SHR_MEMORY_CPU, 0}, s1 = s0;
+            s1.pixels = out[1];
+            shr_image bufs[1] = {b};
+            ASSERT_EQ_LL(shr_software_execute(&s0, all + 1, 2, bufs, 1), SHR_OK);
+            shr_framebuffer_driver drv;
+            ASSERT_EQ_LL(shr_software_driver_create(NULL, 0, 0, 1, &drv), SHR_OK);
+            ASSERT_EQ_LL(drv.execute(drv.user, &s1, all, 3, 1), SHR_OK);
+            ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
+            for (int32_t y = 0; y < H; y++)
+                for (int32_t x = 0; x < W; x++) {
+                    size_t o = ((size_t)y * W + (size_t)x) * bpp;
+                    uint8_t d[4];
+                    memcpy(d, bg + o, 4);
+                    if (x >= whole.x0 && x < whole.x1 && y >= whole.y0 && y < whole.y1) {
+                        uint8_t f4[4];
+                        shr_scale_px(&m, SHR_FILTER_BILINEAR, x - at.x, y - at.y, f4);
+                        if (fi) {
+                            shr_blend8888(d, f4);
+                        } else {
+                            uint16_t v;
+                            memcpy(&v, bg + o, 2);
+                            v = shr_blend565(v, f4);
+                            memcpy(d, &v, 2);
+                        }
+                    }
+                    if (memcmp(d, out[0] + o, bpp) || memcmp(d, out[1] + o, bpp)) {
+                        fprintf(stderr, "case %d fmt %d draw (%d, %d)\n", k, fi, x, y);
+                        FAIL();
+                    }
+                }
+        }
+        free(row), free(copy), free(wide), free(p);
+    }
+    PASS();
+}
+
 TEST scaled_draws_checked(void) {
     enum { W = 8, H = 8 };
     static uint8_t px[4 * 4 * 4], out[W * H * 4];
@@ -266,7 +343,7 @@ static bool scale_driver;
 static uint64_t budget;
 static void tweak(shr_context_desc *d, shr_framebuffer_driver *drv) {
     if (budget) d->image_bytes = budget;
-    if (scale_driver) drv->caps.flags |= SHR_DRIVER_SCALE;
+    if (scale_driver) drv->caps.flags |= SHR_DRIVER_SCALE | SHR_DRIVER_IMAGE_565;
 }
 
 static void frame(shr_context *ctx) {
@@ -388,6 +465,59 @@ TEST views_follow_updates(void) {
     PASS();
 }
 
+/* An opaque image kept as RGB565 (half the budget bytes) is scaled by the driver, and copied, from its widened
+ * pixels: the frame equals the reference on them, onto RGB565 or RGBX8888 screens. */
+TEST opaque_images_scale_widened(void) {
+    static const kase c = {37, 23, 3, 2, 30, 19, 50, 41};
+    static const uint32_t modes[2] = {SHR_SCALE_DRIVER, SHR_SCALE_COPY};
+    bool kept = SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565;
+    uint8_t *p = image(&c, true), *wide = malloc((size_t)c.w * (size_t)c.h * 4);
+    uint16_t *q = malloc((size_t)c.w * (size_t)c.h * 2);
+    for (size_t i = 0; i < (size_t)c.w * (size_t)c.h; i++) {
+        const uint8_t *o = p + 4 * i;
+        q[i] = (uint16_t)((o[0] * 31 + 127) / 255 << 11 | (o[1] * 63 + 127) / 255 << 5 | (o[2] * 31 + 127) / 255);
+    }
+    if (kept) shr_rgb565_widen(q, (size_t)c.w * 2, c.w, c.h, wide);
+    else memcpy(wide, p, (size_t)c.w * (size_t)c.h * 4);
+    shr_scale_src m = {wide, (size_t)c.w * 4, c.w, c.h, c.sx, c.sy, c.sw, c.sh, c.dw, c.dh};
+    for (int k = 0; k < 2; k++) {
+        harness h;
+        scale_driver = true, budget = 0;
+        shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak);
+        shr_pl_res_image *base, *v;
+        ASSERT_EQ_LL(shr_pl_res_image_create(ctx, c.w, c.h, p, (size_t)c.w * 4, &base), SHR_OK);
+        uint64_t used;
+        ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &used, NULL), SHR_OK);
+        ASSERT_EQ_LL(used, (uint64_t)c.w * (uint64_t)c.h * (kept ? 2 : 4));
+        ASSERT_EQ_LL(shr_pl_res_image_view(base, src_of(&c), c.dw, c.dh, modes[k], &v), SHR_OK);
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, (shr_rect){0, 0, HW, HH}, &l), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_cmd_image(l, v, (shr_rect){0, 0, c.dw, c.dh}, (shr_point){5, 3}), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_cmd_commit(l), SHR_OK);
+        frame(ctx);
+        for (int32_t y = 0; y < c.dh; y++)
+            for (int32_t x = 0; x < c.dw; x++) {
+                uint8_t want[4];
+                shr_scale_px(&m, SHR_FILTER_BILINEAR, x, y, want);
+                const uint8_t *got = h.out.shown + ((size_t)(y + 3) * HW + (size_t)(x + 5)) * SCREEN_BPP;
+                uint16_t g16;
+                memcpy(&g16, got, 2);
+                bool ok = SCREEN_BPP == 2 ? g16 == shr_blend565(0, want) : !memcmp(got, want, 3);
+                if (!ok) {
+                    fprintf(stderr, "mode %d (%d, %d)\n", k, x, y);
+                    FAIL();
+                }
+            }
+        ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
+        ASSERT_EQ_LL(shr_pl_res_image_release(v), SHR_OK);
+        ASSERT_EQ_LL(shr_pl_res_image_release(base), SHR_OK);
+        harness_close(&h);
+    }
+    free(p), free(wide), free(q);
+    PASS();
+}
+
 /* A driver view holds no budget bytes and keeps its released base (and the base's bytes) until it goes. */
 TEST views_keep_their_base(void) {
     harness h;
@@ -493,9 +623,11 @@ int main(int argc, char **argv) {
     RUN_TEST(sources_scale_as_rgba);
     RUN_TEST(copies_match_reference);
     RUN_TEST(draws_match_reference_in_parts);
+    RUN_TEST(rgb565_scales_widened);
     RUN_TEST(scaled_draws_checked);
     RUN_TEST(copies_equal_driver_views);
     RUN_TEST(views_follow_updates);
+    RUN_TEST(opaque_images_scale_widened);
     RUN_TEST(views_keep_their_base);
     RUN_TEST(scale_arguments);
     RUN_TEST(driver_view_arguments);

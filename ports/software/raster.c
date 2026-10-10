@@ -148,7 +148,8 @@ static shr_status region_check(const shr_draw_cmd *c, const shr_image *buffers, 
     if (!c->buffer || c->buffer > n || !buffers[c->buffer - 1].format) return SHR_E_INVALID_ARG;
     const shr_image *b = &buffers[c->buffer - 1];
     bool a4 = b->format == SHR_FORMAT_A4;
-    if (image ? b->format != SHR_FORMAT_RGBA8888 : !a4 && b->format != SHR_FORMAT_A8) return SHR_E_UNSUPPORTED;
+    if (image ? b->format != SHR_FORMAT_RGBA8888 && b->format != SHR_FORMAT_RGB565 : !a4 && b->format != SHR_FORMAT_A8)
+        return SHR_E_UNSUPPORTED;
     shr_rect r = c->src_rect;
     if (!rect_inside(r, (shr_rect){0, 0, b->width, b->height}) || (a4 && (r.x0 & 1))) return SHR_E_INVALID_ARG;
     if (image && (c->flags & SHR_IMAGE_SCALED)) {
@@ -189,7 +190,8 @@ shr_status shr__raster_buffer_check(const shr_draw_cmd *c, const shr_image *buff
     }
     shr_status st = shr_image_ref_get(&c->src, mem);
     if (st != SHR_OK) return st;
-    if (mem->format != SHR_FORMAT_A4 && mem->format != SHR_FORMAT_A8 && mem->format != SHR_FORMAT_RGBA8888)
+    if (mem->format != SHR_FORMAT_A4 && mem->format != SHR_FORMAT_A8 && mem->format != SHR_FORMAT_RGBA8888 &&
+        mem->format != SHR_FORMAT_RGB565)
         return SHR_E_UNSUPPORTED;
     return reach(fn, user, mem->pixels, mem->width, mem->height, mem->format, mem->domain);
 }
@@ -779,8 +781,23 @@ static inline __attribute__((always_inline)) void image_rows(const shr_surface *
     }
 }
 
+/* Opaque RGB565 pixels, copied as COPY converts them. */
+static void image565_rows(const shr_surface *dst, const shr_draw_cmd *c, const shr_image *b, shr_rect r, shr_point s) {
+    size_t n = (size_t)(r.x1 - r.x0), bpp = shr__px_bytes(dst->format);
+    const uint8_t *row = region_row(b, c->src_rect, s.y) + (size_t)(c->src_rect.x0 + s.x) * 2;
+    uint8_t *line = pixel_at(dst, r.x0, r.y0);
+    for (int32_t y = r.y0; y < r.y1; y++, row += b->stride, line += dst->stride) {
+        if (dst->format == SHR_FORMAT_RGB565)
+            memcpy(line, row, n * 2);
+        else
+            for (size_t x = 0; x < n; x++) write_px(dst->format, line + x * bpp, read_px(SHR_FORMAT_RGB565, row + 2 * x));
+    }
+}
+
 static void do_image(const shr_surface *dst, const shr_draw_cmd *c, const shr_image *b, shr_rect r, shr_point s) {
-    if (dst->format == SHR_FORMAT_RGB565)
+    if (b->format == SHR_FORMAT_RGB565)
+        image565_rows(dst, c, b, r, s);
+    else if (dst->format == SHR_FORMAT_RGB565)
         image_rows(dst, c, b, r, s, SHR_FORMAT_RGB565);
     else
         image_rows(dst, c, b, r, s, SHR_FORMAT_RGBX8888);
@@ -793,7 +810,7 @@ static inline __attribute__((always_inline)) void scaled_rows(const shr_surface 
                                                               const shr_image *b, shr_rect r, shr_point s,
                                                               shr_pixel_format f) {
     shr__scale sc = {.pixels = b->pixels, .stride = b->stride, .w = b->width, .h = b->height,
-                     .format = SHR_IMAGE_SRC_RGBA8888, .src = c->src_rect, .dw = c->scale_w, .dh = c->scale_h,
+                     .format = shr__src_of(b->format), .src = c->src_rect, .dw = c->scale_w, .dh = c->scale_h,
                      .filter = SHR_SCALE_BILINEAR};
     size_t bpp = shr__px_bytes(f);
     shr__bilin bl;
