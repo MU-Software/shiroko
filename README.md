@@ -138,7 +138,12 @@ committed regression inputs in `tests/fuzz/corpus/<target>`.
   draws them together (scrolls included, as one move), so the final state always reaches the screen.
   `shr_next_deadline()` reports that start, and a blink phase that changed while waiting is drawn as it is at the
   frame's start.
-- `shr_pl_lyr_tilemap_resize()` takes an optional background colour for cells without `SHR_STYLE_BG`;
+- Text styles carry meaning in the colour alpha: fg 255 normal, 128 dim, 0 concealed; bg 255 painted, 0 none (other
+  values are refused for now, so build colours with `SHR_RGB`). Underlines, strikes and overlines are not cell styles
+  but lines of a row: `shr_pl_lyr_tilemap_set_lines(layer, row, lines, count, err)` sets a row's `shr_text_line` list
+  (columns, kind, shape single/double/curly/dotted/dashed, blink, colour), which scrolls with the row and is cut by
+  clears; drivers draw each as one `SHR_CMD_LINE` over the glyphs.
+- `shr_pl_lyr_tilemap_resize()` takes an optional background colour for cells without a bg of their own;
   `shr_pl_lyr_tilemap_measure()` lays text out into a caller array of `shr_text_cluster`.
 
 ## OpenGL ES driver (ANGLE)

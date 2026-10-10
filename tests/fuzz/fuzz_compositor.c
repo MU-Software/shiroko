@@ -173,7 +173,7 @@ static bool copies(void) { return h.caps.buffer_flags & SHR_BUFFER_COPIES; }
 
 static size_t prologue_len(const shr_draw_cmd *cmds, size_t n) {
     size_t i = 0;
-    while (i < n && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER) i++;
+    while (i < n && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER && cmds[i].kind <= SHR_CMD_KEEP_RELEASE) i++;
     return i;
 }
 

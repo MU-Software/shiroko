@@ -723,7 +723,7 @@ static shr_status p4_execute(void *user, const shr_surface *d, const shr_draw_cm
     int k = band_of(d->pixels);
     if (k != 1) held_flush();
     size_t p = 0;
-    while (p < n && c[p].kind >= SHR_CMD_BUFFER_REGISTER) p++;
+    while (p < n && c[p].kind >= SHR_CMD_BUFFER_REGISTER && c[p].kind <= SHR_CMD_KEEP_RELEASE) p++;
     if (p < n && is_move(d, &c[p])) { /* the leading buffer commands, the moves, then the rest as a batch of its own */
         shr_status st = p ? a.sw.execute(a.sw.user, d, c, p, f) : SHR_OK;
         while (st == SHR_OK && p < n && is_move(d, &c[p])) move_start(d, &c[p++]);
@@ -734,7 +734,7 @@ static shr_status p4_execute(void *user, const shr_surface *d, const shr_draw_cm
     shr_surface ds = *d;
     if (k >= 0) {
         bool cpu = false;
-        for (size_t i = 0; i < n; i++) cpu |= c[i].kind < SHR_CMD_KEEP_DRAW;
+        for (size_t i = 0; i < n; i++) cpu |= c[i].kind < SHR_CMD_KEEP_DRAW || c[i].kind == SHR_CMD_LINE;
         hw.cpu[k] = cpu;
         int s = cpu ? slot_for(k) : k;
         if (cpu) slot_wait(s);
@@ -749,7 +749,7 @@ static shr_status p4_execute(void *user, const shr_surface *d, const shr_draw_cm
     if (d->pixels != a.shown) a.shown = NULL;
     for (size_t i = 0; a.shown && i < n; i++) {
         shr_rect r = c[i].dst, *u = &a.dirty;
-        if (c[i].kind > SHR_CMD_COPY && c[i].kind != SHR_CMD_KEEP_DRAW) continue;
+        if (c[i].kind > SHR_CMD_COPY && c[i].kind != SHR_CMD_KEEP_DRAW && c[i].kind != SHR_CMD_LINE) continue;
         *u = u->x0 >= u->x1 ? r
                             : (shr_rect){r.x0 < u->x0 ? r.x0 : u->x0, r.y0 < u->y0 ? r.y0 : u->y0,
                                          r.x1 > u->x1 ? r.x1 : u->x1, r.y1 > u->y1 ? r.y1 : u->y1};

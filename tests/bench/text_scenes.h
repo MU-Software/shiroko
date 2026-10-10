@@ -582,7 +582,7 @@ static void ts_word(ts_prose *p) {
     }
     p->left = n;
     uint32_t c = (r >> 26) % 32;
-    p->style = (shr_text_style){ts_fg[c < 20 ? 0 : c % 6], ts_bg[1 + c % 2], c == 31 ? SHR_STYLE_BG : c == 30 ? SHR_STYLE_BOLD : 0};
+    p->style = (shr_text_style){ts_fg[c < 20 ? 0 : c % 6], c == 31 ? ts_bg[1 + c % 2] : 0, c == 30 ? SHR_STYLE_BOLD : 0};
 }
 
 /* The next cell of the stream into `text`; true for the space ending a word. Characters from U+3000 on are wide:
@@ -592,7 +592,7 @@ static int ts_prose_next(ts_prose *p, char *text, uint32_t *span, shr_text_style
     *st = p->style, *span = 1;
     if (p->left == 0) {
         if (p->punct) return ts_utf8(text, (uint8_t)p->punct), p->punct = 0, 0;
-        p->left = -1, st->flags &= ~(uint32_t)SHR_STYLE_BG;
+        p->left = -1, st->bg = 0;
         return ts_utf8(text, ' '), 1;
     }
     p->left--;
@@ -706,8 +706,8 @@ static void ts_code(ts_line *w, uint32_t line, int32_t end, int hl) {
         memcpy(s + n, v, k), n += k;
     }
     s[n] = 0;
-    uint32_t flags = hl ? SHR_STYLE_BG : 0;
-    shr_color bg = ts_bg[1];
+    uint32_t flags = 0;
+    shr_color bg = hl ? ts_bg[1] : 0;
     for (size_t i = 0; s[i];) {
         size_t j = i + 1;
         shr_text_style st = {ts_fg[0], bg, flags};
@@ -745,16 +745,16 @@ static const char *const ts_dirs[] = {"cores", "ports", "tests", "tools", "docs"
 /* The file tree's row `row` up to column `end`. */
 static void ts_tree(ts_line *w, int32_t row, int32_t end) {
     uint32_t h = ts_mix((uint32_t)row * 0x85EBCA6Bu + 3), depth = h % 3;
-    shr_text_style plain = {ts_fg[0], ts_bg[5], SHR_STYLE_BG}, guide = {ts_fg[6], ts_bg[5], SHR_STYLE_BG};
+    shr_text_style plain = {ts_fg[0], ts_bg[5], 0}, guide = {ts_fg[6], ts_bg[5], 0};
     ts_put(w, " ", end, plain);
     for (uint32_t d = 0; d < depth; d++) ts_put(w, "\xE2\x94\x82 ", end, guide);
     ts_put(w, (h >> 4) % 4 ? "\xE2\x94\x9C\xE2\x94\x80" : "\xE2\x94\x94\xE2\x94\x80", end, guide);
     if ((h >> 8) % 4 == 0) {
-        ts_put(w, (h >> 10) & 1 ? "\xEF\x81\xBC " : "\xEF\x81\xBB ", end, (shr_text_style){ts_fg[4], ts_bg[5], SHR_STYLE_BG});
-        ts_put(w, ts_dirs[(h >> 12) % TS_N(ts_dirs)], end, (shr_text_style){ts_fg[4], ts_bg[5], SHR_STYLE_BG | SHR_STYLE_BOLD});
+        ts_put(w, (h >> 10) & 1 ? "\xEF\x81\xBC " : "\xEF\x81\xBB ", end, (shr_text_style){ts_fg[4], ts_bg[5], 0});
+        ts_put(w, ts_dirs[(h >> 12) % TS_N(ts_dirs)], end, (shr_text_style){ts_fg[4], ts_bg[5], SHR_STYLE_BOLD});
     } else {
         const char *const *f = ts_files[(h >> 12) % TS_N(ts_files)];
-        ts_put(w, f[0], end, (shr_text_style){ts_fg[1 + (h >> 16) % 5], ts_bg[5], SHR_STYLE_BG});
+        ts_put(w, f[0], end, (shr_text_style){ts_fg[1 + (h >> 16) % 5], ts_bg[5], 0});
         ts_put(w, " ", end, plain);
         ts_put(w, f[1], end, plain);
     }
@@ -764,15 +764,15 @@ static void ts_tree(ts_line *w, int32_t row, int32_t end) {
 /* The editor screen with source line `top` at the top of the code pane. */
 static void ts_code_screen(uint32_t top, int32_t rows, int32_t cols, ts_set_fn set, void *u) {
     int32_t tree = cols / 6 < 16 ? 16 : cols / 6 > 32 ? 32 : cols / 6, cursor = rows / 2;
-    shr_text_style bar = {ts_fg[0], ts_bg[1], SHR_STYLE_BG}, dim = {ts_fg[6], ts_bg[0], SHR_STYLE_BG};
+    shr_text_style bar = {ts_fg[0], ts_bg[1], 0}, dim = {ts_fg[6], ts_bg[0], 0};
     char t[96];
     ts_line w = {set, u, 0, 0};
     for (int k = 0; k < 5; k++) {
         const char *const *f = ts_files[(size_t)(k * 5 + 1) % TS_N(ts_files)];
-        shr_text_style tab = k == 1 ? (shr_text_style){ts_fg[7], ts_bg[4], SHR_STYLE_BG | SHR_STYLE_BOLD} : bar;
+        shr_text_style tab = k == 1 ? (shr_text_style){ts_fg[7], ts_bg[4], SHR_STYLE_BOLD} : bar;
         snprintf(t, sizeof(t), " %s %s ", f[0], f[1]);
         ts_put(&w, t, cols, tab);
-        ts_put(&w, "\xEE\x82\xB0", cols, (shr_text_style){tab.bg, ts_bg[1], SHR_STYLE_BG});
+        ts_put(&w, "\xEE\x82\xB0", cols, (shr_text_style){tab.bg, ts_bg[1], 0});
     }
     ts_pad(&w, cols, bar);
     for (int32_t r = 1; r + 1 < rows; r++) {
@@ -781,18 +781,18 @@ static void ts_code_screen(uint32_t top, int32_t rows, int32_t cols, ts_set_fn s
         ts_tree(&w, r, tree);
         ts_put(&w, "\xE2\x94\x82", cols, dim);
         snprintf(t, sizeof(t), "%5u", (unsigned)line % 100000);
-        ts_put(&w, t, cols, r == cursor ? (shr_text_style){ts_fg[3], ts_bg[0], SHR_STYLE_BG} : dim);
+        ts_put(&w, t, cols, r == cursor ? (shr_text_style){ts_fg[3], ts_bg[0], 0} : dim);
         uint32_t sign = ts_mix(line) % 9;
-        ts_put(&w, sign < 2 ? "\xE2\x96\x8E" : " ", cols, (shr_text_style){ts_fg[sign ? 3 : 2], ts_bg[0], SHR_STYLE_BG});
+        ts_put(&w, sign < 2 ? "\xE2\x96\x8E" : " ", cols, (shr_text_style){ts_fg[sign ? 3 : 2], ts_bg[0], 0});
         ts_put(&w, " ", cols, dim);
         ts_code(&w, line, cols, r == cursor);
     }
     w = (ts_line){set, u, rows - 1, 0};
-    shr_text_style mode = {ts_fg[7], ts_bg[3], SHR_STYLE_BG | SHR_STYLE_BOLD}, git = {ts_fg[0], ts_bg[2], SHR_STYLE_BG};
+    shr_text_style mode = {ts_fg[7], ts_bg[3], SHR_STYLE_BOLD}, git = {ts_fg[0], ts_bg[2], 0};
     ts_put(&w, " NORMAL ", cols, mode);
-    ts_put(&w, "\xEE\x82\xB0", cols, (shr_text_style){mode.bg, git.bg, SHR_STYLE_BG});
+    ts_put(&w, "\xEE\x82\xB0", cols, (shr_text_style){mode.bg, git.bg, 0});
     ts_put(&w, " \xEE\x82\xA0 main \xEF\x80\x8C ", cols, git);
-    ts_put(&w, "\xEE\x82\xB0", cols, (shr_text_style){git.bg, bar.bg, SHR_STYLE_BG});
+    ts_put(&w, "\xEE\x82\xB0", cols, (shr_text_style){git.bg, bar.bg, 0});
     snprintf(t, sizeof(t), " \xEE\x98\x9E raster.c  \xEE\xAA\x87 %u \xEE\xA9\xAC %u ", (unsigned)(top % 7), (unsigned)(top % 13));
     ts_put(&w, t, cols, bar);
     snprintf(t, sizeof(t), "\xEE\x82\xB2 utf-8 \xEF\x8C\x9A  ln %u, col %u ", (unsigned)(top + (uint32_t)cursor),

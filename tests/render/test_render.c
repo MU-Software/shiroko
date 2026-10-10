@@ -570,8 +570,8 @@ static shr_status bands_build(stage *s) {
     shr_lyr *g = stage_grid(s, 0, (shr_rect){3, 5, 3 + 30 * CW, 5 + 9 * CH}, &bg);
     for (int32_t r = 0; r < 9; r++)
         stage_text(s, g, r, 0, "band rows \xEA\xB0\x80 \xE2\x94\x80 \xF0\x9F\x98\x80 abc",
-                   (shr_text_style){SHR_RGB(0xF8, 0xF8, 0xF2), SHR_RGB(0x44, 0x47, 0x5A),
-                                    r % 3 ? SHR_STYLE_BG : SHR_STYLE_BOLD | SHR_STYLE_ITALIC},
+                   (shr_text_style){SHR_RGB(0xF8, 0xF8, 0xF2), r % 3 ? SHR_RGB(0x44, 0x47, 0x5A) : 0,
+                                    r % 3 ? 0 : SHR_STYLE_BOLD | SHR_STYLE_ITALIC},
                    0);
     uint8_t px[40 * 50 * 4];
     for (int i = 0; i < 40 * 50; i++)
@@ -589,7 +589,7 @@ static shr_status bands_build(stage *s) {
 static shr_status bands_update(stage *s) {
     shr_lyr *g = s->nlayers > 1 ? s->layers[0] : NULL;
     stage_cell(s, g, 2, 4, "X", 1, (shr_text_style){SHR_RGB(0xFF, 0x79, 0xC6), 0, SHR_STYLE_BOLD});
-    stage_cell(s, g, 6, 20, "\xED\x95\x9C", 2, (shr_text_style){SHR_RGB(0x50, 0xFA, 0x7B), BAND_BG, SHR_STYLE_BG});
+    stage_cell(s, g, 6, 20, "\xED\x95\x9C", 2, (shr_text_style){SHR_RGB(0x50, 0xFA, 0x7B), BAND_BG, 0});
     if (s->nlayers > 1) stage_ok(s, shr_lyr_set_rect(s->layers[1], (shr_rect){90, 47, 130, 97}), "set_rect");
     return s->st;
 }

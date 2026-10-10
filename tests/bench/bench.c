@@ -370,7 +370,7 @@ static void fill_screen(term *t, int shift) {
             const char *s = t->sample[(unsigned)(r + shift + c * 7) % (unsigned)t->nsample];
             uint32_t span = (unsigned char)s[0] >= 0xEA ? 2 : 1;
             if (c + (int)span > COLS) span = 1, s = " ";
-            shr_text_style st = {SHR_RGB(220, 220, 220), SHR_RGB(20, 20, (r + shift) * 3 % 64), SHR_STYLE_BG};
+            shr_text_style st = {SHR_RGB(220, 220, 220), SHR_RGB(20, 20, (r + shift) * 3 % 64), 0};
             check("set_cell", shr_pl_lyr_tilemap_set_cell(t->l, r, c, s, strlen(s), span, st));
             c += (int)span;
         }
@@ -403,7 +403,7 @@ static void op_scroll_api(void *arg) {
         const char *s = t->sample[(unsigned)(ROWS - 1 + t->shift + c * 7) % (unsigned)t->nsample];
         uint32_t span = (unsigned char)s[0] >= 0xEA ? 2 : 1;
         if (c + (int)span > COLS) span = 1, s = " ";
-        shr_text_style st = {SHR_RGB(220, 220, 220), SHR_RGB(20, 20, (ROWS - 1 + t->shift) * 3 % 64), SHR_STYLE_BG};
+        shr_text_style st = {SHR_RGB(220, 220, 220), SHR_RGB(20, 20, (ROWS - 1 + t->shift) * 3 % 64), 0};
         check("set_cell", shr_pl_lyr_tilemap_set_cell(t->l, ROWS - 1, c, s, strlen(s), span, st));
         c += (int)span;
     }

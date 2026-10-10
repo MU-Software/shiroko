@@ -1,4 +1,5 @@
-/* Tilemap under random set_cell / set_text / clear / scroll / resize / measure sequences with the built-in font.
+/* Tilemap under random set_cell / set_text / set_lines / clear / scroll / resize / measure sequences with the built-in
+ * font.
  * Invariants:
  *   - measure layouts partition the text, advance cell by cell and are deterministic
  *   - set_text accepts exactly the texts measure accepts (same columns, no runs); only measure's unbounded
@@ -16,11 +17,34 @@ static uint64_t clock_fn(void *user) {
     return now;
 }
 
+static shr_color with_alpha(shr_color c, uint32_t a) { return (c & 0xFFFFFFu) | a << 24; }
+
+/* Style byte: bits 0-1 bold, italic; 2 dim; 5 blink; 6 conceal; 7 bg; bits 3-4 = 2 or 3 an alpha the tilemap refuses
+ * (fg 0x40, bg 0x80); 0xFF an unknown flag. */
 static shr_text_style fr_style(fuzz_reader *r) {
-    uint8_t f = fr_u8(r), c = fr_u8(r);
-    uint32_t flags = f == 0xFF ? 1u << 9 : f; /* sometimes unknown */
+    uint8_t f = fr_u8(r), c = fr_u8(r), bad = f >> 3 & 3;
+    uint32_t flags = f == 0xFF ? 1u << 9 : (f & 3u) | (f >> 5 & 1u) << 2;
+    uint32_t fa = bad == 2 ? 0x40 : f & 0x40 ? 0 : f & 4 ? 128 : 255, ba = bad == 3 ? 0x80 : f & 0x80 ? 255 : 0;
     /* The low nibble picks fg, the high one bg, so either can change alone. */
-    return (shr_text_style){SHR_RGB(c << 4, 255 - (c << 4), 128), SHR_RGB(0, c & 0xF0, 40), flags};
+    return (shr_text_style){with_alpha(SHR_RGB(c << 4, 255 - (c << 4), 128), fa), with_alpha(SHR_RGB(0, c & 0xF0, 40), ba),
+                            flags};
+}
+
+static bool style_known(shr_text_style st) {
+    uint32_t a = st.fg >> 24, b = st.bg >> 24;
+    return !(st.flags & ~SHR_STYLE_KNOWN_FLAGS) && (a == 255 || a == 128 || a == 0) && (b == 255 || b == 0);
+}
+
+/* Lines over a row, some outside it, of unknown kinds, shapes or flags, or of a refused alpha. */
+static size_t fr_lines(fuzz_reader *r, shr_text_line *out, size_t cap) {
+    static const uint32_t alpha[4] = {255, 128, 0, 0x40};
+    size_t n = fr_u8(r) % (cap + 1);
+    for (size_t i = 0; i < n; i++) {
+        uint8_t a = fr_u8(r), b = fr_u8(r), k = fr_u8(r), c = fr_u8(r);
+        out[i] = (shr_text_line){(uint16_t)(a % 24), (uint16_t)(b % 24), (uint8_t)(k & 3), (uint8_t)(k >> 2 & 7),
+                                 (uint16_t)(k >> 5 == 7 ? 2 : k >> 5 & 1), with_alpha(SHR_RGB(c, 255 - c, 9), alpha[c & 3])};
+    }
+    return n;
 }
 
 #define MAX_PIECES (4 * 4096) /* each byte a cluster, a TAB at most tab_stop pieces */
@@ -90,7 +114,7 @@ static shr_status checked_execute(void *user, const shr_surface *dst, const shr_
     memcpy(direct, dst->pixels, dst->byte_length);
     shr_surface copy = *dst;
     copy.pixels = direct;
-    for (size_t i = 0; i < count && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER; i++) {
+    for (size_t i = 0; i < count && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER && cmds[i].kind <= SHR_CMD_KEEP_RELEASE; i++) {
         uint32_t id = cmds[i].buffer;
         if (cmds[i].kind == SHR_CMD_KEEP_RELEASE) {
             FUZZ_CHECK(id >= 1 && id <= NKEEPS);
@@ -165,7 +189,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         uint8_t op = fr_u8(&r);
         shr_status st = SHR_OK;
         bool mutates = true;
-        switch (op % 8) {
+        switch (op < 0xC0 ? op % 8 : op < 0xD0 ? 8 : 15) { /* 0xD0 and up: room for more operations */
         case 0: {
             int32_t row = fr_i8(&r), col = fr_i8(&r);
             uint8_t sp = fr_u8(&r);
@@ -193,7 +217,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                                              &err);
             FUZZ_CHECK(err.status == st);
             if (st != SHR_OK) FUZZ_CHECK(err.reason != NULL);
-            if (!with_run && !(flags & ~(uint32_t)SHR_TEXT_WRAP) && !(style.flags & ~SHR_STYLE_KNOWN_FLAGS) && row >= 0 &&
+            if (!with_run && !(flags & ~(uint32_t)SHR_TEXT_WRAP) && style_known(style) && row >= 0 &&
                 row < rows && col >= 0 && col < cols) {
                 shr_status measured;
                 check_layout(s, len, cols - col, flags, &measured);
@@ -240,6 +264,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             clean = false;
             mutates = false;
             break;
+        case 8: {
+            int32_t row = fr_i8(&r);
+            shr_text_line lines[40];
+            size_t n = fr_lines(&r, lines, 40);
+            shr_error_info err;
+            st = shr_pl_lyr_tilemap_set_lines(layer, row, lines, n, &err);
+            FUZZ_CHECK(err.status == st);
+            if (st != SHR_OK) break;
+            FUZZ_CHECK(row >= 0 && row < rows && n <= 4 * (size_t)cols);
+            for (size_t i = 0; i < n; i++)
+                FUZZ_CHECK(lines[i].cols && lines[i].col + lines[i].cols <= cols && lines[i].kind <= SHR_LINE_OVER &&
+                           lines[i].shape <= SHR_LINE_DASHED && lines[i].flags <= SHR_TEXT_LINE_BLINK &&
+                           lines[i].color >> 24 != 0x40);
+            break;
+        }
+        case 15: mutates = false; break;
         case 7: {
             int32_t x = fr_i8(&r) % 24, y = fr_i8(&r) % 24;
             st = shr_lyr_set_rect(layer, (shr_rect){x, y, x + cols * SHR_CELL_WIDTH, y + rows * SHR_CELL_HEIGHT});

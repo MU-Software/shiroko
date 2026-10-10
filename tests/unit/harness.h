@@ -112,7 +112,7 @@ static inline uint64_t md_held(const mock_driver *d) {
 /* Runs the prologue, then (draw) the draws against the table. */
 static inline shr_status md_batch(mock_driver *d, const shr_surface *dst, const shr_draw_cmd *cmds, size_t n, bool draw) {
     size_t i = 0;
-    for (; i < n && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER; i++) {
+    for (; i < n && cmds[i].kind >= SHR_CMD_BUFFER_REGISTER && cmds[i].kind <= SHR_CMD_KEEP_RELEASE; i++) {
         const shr_draw_cmd *c = &cmds[i];
         shr_image m = {0};
         if (c->kind != SHR_CMD_BUFFER_RELEASE && (!c->buffer || c->buffer > HBUFS)) return SHR_E_INVALID_ARG;

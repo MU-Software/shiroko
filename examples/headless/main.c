@@ -116,20 +116,24 @@ int main(int argc, char **argv) {
     const char *body = "A\xEA\xB0\x80\xF0\x9F\x98\x80" "B\tTAB \xED\x95\x9C\xEA\xB8\x80 \xE2\x9D\xA4\xEF\xB8\x8F "
                        "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x92\xBB\n"
                        "wrap: the quick brown fox jumps over the lazy dog \xE6\xBC\xA2\xE5\xAD\x97";
-    shr_style_run run = {0, 1, {SHR_RGB(0xFF, 0x79, 0xC6), 0, SHR_STYLE_UNDERLINE}};
+    shr_style_run run = {0, 1, {SHR_RGB(0xFF, 0x79, 0xC6), 0, 0}};
     shr_lyr *text = tilemap(ctx, font, 1, (shr_rect){cw, 2 * ch, 39 * cw, H - 2 * ch});
     check("body", shr_pl_lyr_tilemap_set_text(text, 0, 0, body, strlen(body), (shr_text_style){fg, 0, 0}, &run, 1,
                                               SHR_TEXT_WRAP, &err),
           &err);
+    const shr_text_line under = {0, 1, SHR_LINE_UNDER, SHR_LINE_SINGLE, 0, run.style.fg};
+    check("body", shr_pl_lyr_tilemap_set_lines(text, 0, &under, 1, &err), &err);
     shr_lyr *labels = tilemap(ctx, font, 1, (shr_rect){box.x0 + cw, box.y0 + ch, box.x1 - cw, box.y1 - ch});
     check("label", shr_pl_lyr_tilemap_set_text(labels, 0, 0, "[ OK ]", 6,
-                                               (shr_text_style){SHR_RGB(0x28, 0x2A, 0x36), SHR_RGB(0x50, 0xFA, 0x7B),
-                                                                SHR_STYLE_BG},
+                                               (shr_text_style){SHR_RGB(0x28, 0x2A, 0x36), SHR_RGB(0x50, 0xFA, 0x7B), 0},
                                                NULL, 0, 0, &err),
           &err);
-    check("label", shr_pl_lyr_tilemap_set_text(labels, 1, 0, "dim + strike", 12,
-                                               (shr_text_style){fg, 0, SHR_STYLE_DIM | SHR_STYLE_STRIKE}, NULL, 0, 0, &err),
+    shr_color dim = (fg & 0xFFFFFFu) | 0x80000000u; /* alpha 128: half strength */
+    check("label", shr_pl_lyr_tilemap_set_text(labels, 1, 0, "dim + strike", 12, (shr_text_style){dim, 0, 0}, NULL, 0, 0,
+                                               &err),
           &err);
+    const shr_text_line strike = {0, 12, SHR_LINE_STRIKE, SHR_LINE_SINGLE, 0, dim};
+    check("label", shr_pl_lyr_tilemap_set_lines(labels, 1, &strike, 1, &err), &err);
 
     /* A row as an external engine hands it over: one cell per display unit,
      * spans decided by the engine, colours already resolved. */
@@ -144,10 +148,10 @@ int main(int argc, char **argv) {
     shr_lyr *prompt = tilemap(ctx, font, 1, (shr_rect){cw, H - 2 * ch, W, H});
     for (int32_t i = 0; i < (int32_t)(sizeof(cells) / sizeof(cells[0])); i++)
         check("cell", shr_pl_lyr_tilemap_set_cell(prompt, 0, i, cells[i].text, strlen(cells[i].text), 1,
-                                                  (shr_text_style){cells[i].fg, cells[i].bg, SHR_STYLE_BG}),
+                                                  (shr_text_style){cells[i].fg, cells[i].bg, 0}),
               NULL);
     check("cell", shr_pl_lyr_tilemap_set_cell(prompt, 1, 0, "$", 1, 1, (shr_text_style){fg, 0, 0}), NULL);
-    check("cell", shr_pl_lyr_tilemap_set_cell(prompt, 1, 2, "", 0, 1, (shr_text_style){0, fg, SHR_STYLE_BG}), NULL);
+    check("cell", shr_pl_lyr_tilemap_set_cell(prompt, 1, 2, "", 0, 1, (shr_text_style){0, fg, 0}), NULL);
     check("cell", shr_pl_lyr_tilemap_set_cell(prompt, 1, 4, "\xEA\xB0\x80", 3, 2, (shr_text_style){fg, 0, 0}), NULL);
 
     uint8_t rgba[32 * 32 * 4];

@@ -1,5 +1,5 @@
 /* Software raster with arbitrary command batches, including buffer commands, keep groups, KEEP_DRAW and KEEP_RELEASE,
- * and BOLD/ITALIC glyphs drawn from buffer regions, ON_FILL ones also where no FILL lies under them.
+ * BOLD/ITALIC glyphs drawn from buffer regions, ON_FILL ones also where no FILL lies under them, and LINE patterns.
  * Invariants:
  *   - the driver accepts a batch exactly when the rules predict it (a ROTATE's own validity comes from the stateless
  *     path); a rejected batch writes nothing; a COPY of the destination onto itself moves its pixels
@@ -187,7 +187,26 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         for (uint8_t count = 1 + fr_u8(&r) % MAX_CMDS; n < count && r.n > 0;) {
             shr_draw_cmd *c = &cmds[n];
             fuzz_blank(c, seed);
-            uint8_t kind = fr_u8(&r) % 13;
+            uint8_t kind = fr_u8(&r) % 14;
+            if (kind == 13) { /* LINE: shapes 0..7, cells up to 40 x 10 and origins across their bounds */
+                drawn = true;
+                c->kind = SHR_CMD_LINE;
+                uint8_t f = fr_u8(&r);
+                c->flags = (uint16_t)((f & 1) | (f >> 1 & 7) << SHR_LINE_SHAPE_SHIFT | (f == 0xFF ? 2 : 0));
+                c->dst = fr_rect(&r);
+                c->color = SHR_RGB(fr_u8(&r), fr_u8(&r), fr_u8(&r));
+                int32_t lw = fr_u8(&r) % 41, lh = fr_u8(&r) % 11;
+                c->src_rect = (shr_rect){fr_u8(&r) == 0xFF, 0, lw, lh};
+                c->src_origin = (shr_point){fr_i8(&r) % 48, fr_i8(&r) % 12};
+                shr_rect lim = group != SIZE_MAX ? cmds[group].dst : (shr_rect){0, 0, w, h};
+                bool in = (group != SIZE_MAX || inside(c->dst, w, h)) && c->dst.x0 <= c->dst.x1 && c->dst.y0 <= c->dst.y1 &&
+                          c->dst.x0 >= lim.x0 && c->dst.y0 >= lim.y0 && c->dst.x1 <= lim.x1 && c->dst.y1 <= lim.y1;
+                expect_ok &= in && f != 0xFF && (f >> 1 & 7) <= SHR_LINE_DASHED && !c->src_rect.x0 && lw >= 1 &&
+                             lw <= SHR_LINE_MAX_PERIOD && lh >= 1 && lh <= SHR_LINE_MAX_BAND && c->src_origin.x >= 0 &&
+                             c->src_origin.x < lw && c->src_origin.y >= 0 && c->src_origin.y + (c->dst.y1 - c->dst.y0) <= lh;
+                n++;
+                continue;
+            }
             if (kind >= 9) { /* REGISTER, UPDATE, RELEASE of ids 0..MAX_BUFFERS + 1, KEEP_RELEASE of 0..MAX_KEEPS + 1 */
                 c->kind = kind == 12 ? SHR_CMD_KEEP_RELEASE : (uint8_t)(SHR_CMD_BUFFER_REGISTER + kind - 9);
                 c->flags = 0;
@@ -339,7 +358,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             bool hit = false;
             for (size_t i = 0, in_group = 0; i < n && !hit; i++) {
                 if (cmds[i].kind == SHR_CMD_KEEP_BEGIN || cmds[i].kind == SHR_CMD_KEEP_END) in_group = cmds[i].kind == SHR_CMD_KEEP_BEGIN;
-                else if (!in_group && cmds[i].kind < SHR_CMD_BUFFER_REGISTER)
+                else if (!in_group && (cmds[i].kind < SHR_CMD_BUFFER_REGISTER || cmds[i].kind == SHR_CMD_LINE))
                     hit = x >= cmds[i].dst.x0 && x < cmds[i].dst.x1 && y >= cmds[i].dst.y0 && y < cmds[i].dst.y1;
             }
             FUZZ_CHECK(hit);

@@ -25,8 +25,15 @@ static inline void shr__classify_cluster(const uint32_t *cps, size_t n, shr__clu
     if (over && out->cells) *out = (shr__cluster_class){out->cells, SHR_CLUSTER_REPLACEMENT, SHR_GLYPH_REPLACEMENT, 0};
 }
 
+/* Colour alpha the tilemap draws: 255 full, 0 nothing, 128 half where `half`. */
+static inline bool shr__alpha_known(shr_color c, bool half) {
+    uint32_t a = c >> 24;
+    return (a == 255) | (a == 0) | (half & (a == 128));
+}
+
 static inline shr_status shr__style_check(const shr_text_style *s, shr_error_info *err, size_t item) {
-    if (s->flags & ~SHR_STYLE_KNOWN_FLAGS) return shr__fail(err, SHR_E_UNKNOWN_STYLE, 0, item, "unknown style flag");
+    if ((s->flags & ~SHR_STYLE_KNOWN_FLAGS) || !shr__alpha_known(s->fg, true) || !shr__alpha_known(s->bg, false))
+        return shr__fail(err, SHR_E_UNKNOWN_STYLE, 0, item, "unknown style flag or colour alpha");
     return SHR_OK;
 }
 

@@ -113,10 +113,10 @@ static void vt_step(t5_scene *s, bool long_cluster) {
     }
     t5_try(s, shr_pl_lyr_tilemap_set_text(s->grid, s->rows - 2, 0, line, len, (shr_text_style){0}, runs, n, 0, NULL),
            "set_text");
-    const shr_text_style bar = {SHR_RGB(0xF8, 0xF8, 0xF2), SHR_RGB(0x44, 0x47, 0x5A), SHR_STYLE_BG};
+    const shr_text_style bar = {SHR_RGB(0xF8, 0xF8, 0xF2), SHR_RGB(0x44, 0x47, 0x5A), 0};
     len = (size_t)snprintf(line, sizeof(line), " frame %4d \xE2\x94\x82 \xED\x95\x9C\xEA\xB8\x80 \xF0\x9F\x98\x80\t%s",
                            (int)s->tick, s->tick & 1 ? "ok" : "--");
-    const shr_style_run hl = {1, 11, {SHR_RGB(0x50, 0xFA, 0x7B), bar.bg, SHR_STYLE_BG | SHR_STYLE_BOLD}};
+    const shr_style_run hl = {1, 11, {SHR_RGB(0x50, 0xFA, 0x7B), bar.bg, SHR_STYLE_BOLD}};
     t5_try(s, shr_pl_lyr_tilemap_set_text(s->grid, s->rows - 1, 0, line, len, bar, &hl, 1, 0, NULL), "set_text");
     if (s->tick % 8 == 0) {
         len = 0;

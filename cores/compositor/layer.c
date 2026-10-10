@@ -50,7 +50,7 @@ static shr_rect span(const shr__group *g, size_t lo, size_t hi) {
         } else {
             shr_rect d;
             uint32_t kind = cmd_at(g, i, &d);
-            u = grow(u, d, (kind <= SHR__LCMD_IMAGE) | (kind == SHR__LCMD_CACHE_BEGIN));
+            u = grow(u, d, (kind <= SHR__LCMD_LINE) | (kind == SHR__LCMD_CACHE_BEGIN));
         }
     }
     return u;
@@ -266,7 +266,7 @@ static inline __attribute__((always_inline)) bool cmd_bad(uint32_t kind, uint32_
     bool bad = !shr__rect_valid(dst) ||
                (flags & ~(uint32_t)(SHR__LCMD_DIM | SHR__LCMD_BOLD | SHR__LCMD_ITALIC | SHR__LCMD_ON_FILL |
                                     SHR__LCMD_BLINK)) ||
-               ((begin || end) ? *open != end : !kind || kind > SHR__LCMD_IMAGE) || no_res;
+               ((begin || end) ? *open != end : !kind || kind > SHR__LCMD_LINE) || no_res;
     *open = *open != (begin || end);
     return bad;
 }
@@ -314,9 +314,9 @@ static shr_status group_set(shr_lyr *l, uint32_t id, int32_t oy, shr__group in) 
         uint32_t kind = r ? r->kind : c->kind, flags = r ? r->flags : c->flags;
         shr_rect dst = r ? shr__rcmd_dst(r) : c->dst;
         bool begin = kind == SHR__LCMD_CACHE_BEGIN, finish = kind == SHR__LCMD_CACHE_END;
-        bool draw = kind <= SHR__LCMD_IMAGE, res_cmd = kind == SHR__LCMD_GLYPH || kind == SHR__LCMD_IMAGE;
+        bool draw = kind <= SHR__LCMD_LINE, res_cmd = kind == SHR__LCMD_GLYPH || kind == SHR__LCMD_IMAGE;
         shr__res *res = !res_cmd ? NULL : r ? in.res : c->res;
-        bad |= cmd_bad(kind, flags, dst, res_cmd && !res, &open);
+        bad |= cmd_bad(kind, flags, dst, res_cmd && !res, &open) | ((kind == SHR__LCMD_LINE) & !in.compact);
         bad |= in.compact & ((begin & (i != 0)) | (finish & (i != n - 1))); /* a row's pair encloses it */
         if (begin)
             begin_at = i;
@@ -358,8 +358,8 @@ static shr_status group_set(shr_lyr *l, uint32_t id, int32_t oy, shr__group in) 
             break;
         }
         shr_rect parts[2];
-        if (cmd_at(g, i, &parts[0]) > SHR__LCMD_IMAGE) parts[0] = none;
-        if (cmd_at(&in, i, &parts[1]) > SHR__LCMD_IMAGE) parts[1] = none;
+        if (cmd_at(g, i, &parts[0]) > SHR__LCMD_LINE) parts[0] = none;
+        if (cmd_at(&in, i, &parts[1]) > SHR__LCMD_LINE) parts[1] = none;
         for (int k = 0; k < 2; k++) {
             shr_rect u = shr__rect_union(run, parts[k]);
             if (shr__rect_area(u) > shr__rect_area(run) + shr__rect_area(parts[k]))

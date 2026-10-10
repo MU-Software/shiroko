@@ -81,7 +81,7 @@ typedef struct shr_point {
     int32_t x, y;
 } shr_point;
 
-/* 0xAARRGGBB; the alpha byte is ignored for now: colours draw opaque. */
+/* 0xAARRGGBB; drivers ignore the alpha byte: colours draw opaque. */
 typedef uint32_t shr_color;
 
 #define SHR_RGB(r, g, b) \
@@ -161,7 +161,8 @@ typedef enum shr_cmd_kind {
     SHR_CMD_BUFFER_REGISTER, /* id `buffer` names memory `src` from now on, replacing what it named */
     SHR_CMD_BUFFER_UPDATE,   /* the pixels of `buffer` inside `src_rect` changed */
     SHR_CMD_BUFFER_RELEASE,  /* id `buffer` names nothing; no effect when it named nothing */
-    SHR_CMD_KEEP_RELEASE     /* keep `buffer` holds nothing; no effect when it held nothing */
+    SHR_CMD_KEEP_RELEASE,    /* keep `buffer` holds nothing; no effect when it held nothing */
+    SHR_CMD_LINE             /* dst <- color through the coverage of a line pattern repeated along x */
 } shr_cmd_kind;
 
 /* DIM: GLYPH coverage, or a FILL, at half strength. BOLD, ITALIC: GLYPH style synthesized from the coverage.
@@ -169,6 +170,11 @@ typedef enum shr_cmd_kind {
 enum { SHR_GLYPH_DIM = 1u << 0, SHR_GLYPH_BOLD = 1u << 1, SHR_GLYPH_ITALIC = 1u << 2, SHR_GLYPH_ON_FILL = 1u << 3 };
 /* COPY onto its own destination: the pixels of the destination outside `dst` become unspecified (shr_draw_cmd). */
 enum { SHR_COPY_REST_UNDEFINED = 1u << 4 };
+/* LINE shapes, in flags >> SHR_LINE_SHAPE_SHIFT (with SHR_GLYPH_DIM). */
+enum { SHR_LINE_SINGLE = 0, SHR_LINE_DOUBLE, SHR_LINE_CURLY, SHR_LINE_DOTTED, SHR_LINE_DASHED };
+#define SHR_LINE_SHAPE_SHIFT 8
+#define SHR_LINE_MAX_PERIOD 32 /* largest LINE src_rect width */
+#define SHR_LINE_MAX_BAND 8    /* largest LINE src_rect height */
 #define SHR_GLYPH_SLANT 54       /* italic slope in 1/256 (about 12 degrees) */
 #define SHR_GLYPH_SYNTH_MAX 1024 /* largest src_rect width or height of a BOLD or ITALIC GLYPH */
 
@@ -186,11 +192,11 @@ shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t 
 
 /* A command (64 bytes) sets `kind`, `flags` (0 when the kind takes none) and the fields its kind reads: FILL dst,
  * color; GLYPH buffer, dst, src_origin, color, src_rect, with ON_FILL bg, with ITALIC slant_axis; IMAGE buffer, dst,
- * src_origin, src_rect; COPY dst, src_origin, src; ROTATE rotation, dst, src; KEEP_BEGIN buffer, dst; KEEP_END
- * nothing more; KEEP_DRAW buffer, dst, src_origin; BUFFER_REGISTER buffer, src; BUFFER_UPDATE buffer, src_rect;
- * BUFFER_RELEASE and KEEP_RELEASE buffer. Its other fields are unspecified, and a driver reads none of them.
- * Destination rectangles are already clipped by the compositor: each lies inside the destination, except in keep
- * groups.
+ * src_origin, src_rect; COPY dst, src_origin, src; ROTATE rotation, dst, src; LINE dst, src_origin, color, src_rect;
+ * KEEP_BEGIN buffer, dst; KEEP_END nothing more; KEEP_DRAW buffer, dst, src_origin; BUFFER_REGISTER buffer, src;
+ * BUFFER_UPDATE buffer, src_rect; BUFFER_RELEASE and KEEP_RELEASE buffer. Its other fields are unspecified, and a
+ * driver reads none of them. Destination rectangles are already clipped by the compositor: each lies inside the
+ * destination, except in keep groups.
  * Keeps: pixels the driver holds under an id in 1..caps.max_keeps (none when 0), from KEEP_BEGIN until KEEP_RELEASE or
  * the next KEEP_BEGIN of the id. The commands from KEEP_BEGIN to KEEP_END lie inside its `dst` (W x H, which may reach
  * outside the destination, within 2^24 pixels of its origin) and draw exactly `dst` into keep `buffer` instead of the
@@ -228,6 +234,16 @@ shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t 
  * A BOLD or ITALIC GLYPH may take rect columns outside the rect, and outside the buffer, within its footprint
  * [x0, x1): x0 = ITALIC ? k(H - 1) : 0, x1 = W + BOLD + (ITALIC ? k(0) + (f(0) != 0) : 0); its rows stay inside
  * the rect.
+ * LINE: `src_rect` is the pattern cell (0, 0, W, H), 1 <= W <= SHR_LINE_MAX_PERIOD, 1 <= H <= SHR_LINE_MAX_BAND,
+ * repeated along x: `dst` pixel (x, y) takes cell pixel ((src_origin.x + x - dst.x0) mod W, src_origin.y + y - dst.y0),
+ * with 0 <= src_origin.x < W and the rows inside the cell. Coverage of cell pixel (x, y) by shape: SINGLE 255; DOUBLE
+ * 255 in rows 0 and H - 1, else 0; DASHED 255 where x / (W / 3 + 1) is even, else 0; DOTTED and CURLY sampled: n of the
+ * 16 x 16 points (x + (i + 0.5) / 16, y + (j + 0.5) / 16) lie in the shape, a = (255 n + 128) >> 8, coverage
+ * 17 ((15 a + 127) / 255). DOTTED: discs of radius r = sqrt(1/2) centred at ((k + 0.5) W / m, H / 2), k < m,
+ * m = max(1, min(ceil(W / 4r), floor(W / 3r), floor(W / (2r + 1)))). CURLY: points within 1/2 of the polyline through
+ * the cubic Beziers (0, b) (0.4c, b) (c - 0.4c, 0.5) (c, 0.5) and (c, 0.5) (c + 0.4c, 0.5) (W - 0.4c, b) (W, b),
+ * c = W / 2, b = H - 0.5, each at t = k / 32, k <= 32, and their copies moved by -W and W. Computed in single
+ * precision as shr__raster_line_coverage() of the software port computes it. DIM: (c + 1) >> 1. Blended as GLYPH.
  * ON_FILL GLYPH: for each `dst` pixel, the last earlier command of the batch whose `dst` holds it is a FILL without
  * DIM of colour `bg`, in the same keep group as the GLYPH or, like it, outside any. Blending onto the pixel that FILL
  * writes (RGB565: `bg` quantized to 5/6/5 bits; RGBX8888: its bytes, X included) then equals blending onto `dst`, so a
@@ -236,8 +252,9 @@ shr_status shr_rotation_map_point(shr_rotation rotation, int32_t width, int32_t 
  * destination or its group, a nested or unbalanced group, a COPY in a group reading the destination, ROTATE or a keep
  * command in a group, a buffer command or KEEP_RELEASE after another command, REGISTER of id 0, of an id above
  * caps.max_buffers or of invalid memory, UPDATE or a draw naming an id that is not registered, an UPDATE or draw
- * `src_rect` outside its buffer, an A4 draw `src_rect` with odd x0, a draw reading outside its `src_rect` (a styled
- * GLYPH outside its footprint) or a COPY outside `src`, a BOLD or ITALIC GLYPH with a `src_rect` larger than
+ * `src_rect` outside its buffer, an A4 draw `src_rect` with odd x0, a LINE with a shape outside SHR_LINE_*, a flag
+ * other than DIM or a `src_rect` or `src_origin` outside the rules above, a draw reading outside its `src_rect` (a
+ * styled GLYPH outside its footprint) or a COPY outside `src`, a BOLD or ITALIC GLYPH with a `src_rect` larger than
  * SHR_GLYPH_SYNTH_MAX, an ITALIC GLYPH with |slant_axis| > 4 * SHR_GLYPH_SYNTH_MAX, a bad rotation or ROTATE size, a
  * KEEP_BEGIN or KEEP_DRAW of id 0 or above caps.max_keeps, a second KEEP_BEGIN of an id in the batch, a KEEP_DRAW of an
  * id that holds nothing or is stored later in the batch, reading outside its keep or into a destination of another
@@ -256,12 +273,12 @@ typedef struct shr_draw_cmd {
     uint16_t flags;
     uint32_t buffer;       /* GLYPH, IMAGE, BUFFER_*: buffer id; KEEP_*: keep id */
     shr_rect dst;
-    shr_point src_origin;  /* GLYPH, IMAGE: rect pixel drawn at dst.x0, dst.y0; COPY: src pixel; KEEP_DRAW: keep pixel */
+    shr_point src_origin;  /* GLYPH, IMAGE, LINE: rect pixel at dst.x0, y0; COPY: src pixel; KEEP_DRAW: keep pixel */
     union {
         struct {
-            shr_color color;   /* FILL, GLYPH */
+            shr_color color;   /* FILL, GLYPH, LINE */
             shr_color bg;      /* GLYPH: the colour under `dst` with ON_FILL */
-            shr_rect src_rect; /* GLYPH, IMAGE: buffer region drawn from; UPDATE: region changed */
+            shr_rect src_rect; /* GLYPH, IMAGE: buffer region drawn from; LINE: pattern cell; UPDATE: region changed */
         };
         shr_image_ref src;     /* COPY, ROTATE: source surface; REGISTER: the buffer's memory */
     };

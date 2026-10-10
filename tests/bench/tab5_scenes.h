@@ -89,7 +89,8 @@ static const struct {
 static const shr_color fgs[] = {SHR_RGB(0xF8, 0xF8, 0xF2), SHR_RGB(0xFF, 0x79, 0xC6), SHR_RGB(0x50, 0xFA, 0x7B),
                                 SHR_RGB(0xF1, 0xFA, 0x8C), SHR_RGB(0x8B, 0xE9, 0xFD), SHR_RGB(0xBD, 0x93, 0xF9)};
 static const shr_color bgs[] = {SHR_RGB(0x28, 0x2A, 0x36), SHR_RGB(0x44, 0x47, 0x5A), SHR_RGB(0x62, 0x72, 0xA4)};
-static const uint32_t line_styles[] = {0, SHR_STYLE_BOLD, 0, SHR_STYLE_ITALIC, SHR_STYLE_UNDERLINE, 0,
+#define T5_UNDERLINE (1u << 31) /* paint_row: a line under every cell, in its colour */
+static const uint32_t line_styles[] = {0, SHR_STYLE_BOLD, 0, SHR_STYLE_ITALIC, T5_UNDERLINE, 0,
                                        SHR_STYLE_BOLD | SHR_STYLE_ITALIC};
 
 static uint32_t mix(uint32_t x) {
@@ -102,20 +103,39 @@ static uint32_t next_random(t5_scene *s) {
     return s->rng;
 }
 
-static int32_t paint(t5_scene *s, int32_t row, int32_t col, uint32_t h, uint32_t flags) {
+/* Appends `e` to the row's lines, joining it to the last one when it continues it alike: the cells' underlines
+ * become runs, as a VT connection hands them over. */
+static size_t t5_line_add(shr_text_line *l, size_t n, shr_text_line e) {
+    shr_text_line *p = n ? &l[n - 1] : NULL;
+    if (p && p->col + p->cols == e.col && p->kind == e.kind && p->shape == e.shape && p->flags == e.flags &&
+        p->color == e.color)
+        return p->cols = (uint16_t)(p->cols + e.cols), n;
+    return l[n] = e, n + 1;
+}
+
+/* One cell as a VT engine hands it over, its underline into `lines` (NULL: none); returns its span. */
+static int32_t paint(t5_scene *s, int32_t row, int32_t col, uint32_t h, uint32_t flags, shr_text_line *lines, size_t *n) {
     uint32_t g = h % T5_N(glyphs), span = glyphs[g].span;
     const char *t = glyphs[g].text;
     if (col + (int32_t)span > s->cols) t = " ", span = 1;
-    shr_text_style st = {fgs[(h >> 8) % T5_N(fgs)], bgs[(h >> 12) % T5_N(bgs)], flags | ((h >> 16) % 4 ? 0 : SHR_STYLE_BG)};
+    shr_text_style st = {fgs[(h >> 8) % T5_N(fgs)], (h >> 16) % 4 ? 0 : bgs[(h >> 12) % T5_N(bgs)], flags};
     t5_try(s, shr_pl_lyr_tilemap_set_cell(s->grid, row, col, t, strlen(t), span, st), "set_cell");
+    uint16_t blink = flags & SHR_STYLE_BLINK ? SHR_TEXT_LINE_BLINK : 0;
+    shr_text_line under = {(uint16_t)col, (uint16_t)span, SHR_LINE_UNDER, SHR_LINE_SINGLE, blink, st.fg};
+    if (lines) *n = t5_line_add(lines, *n, under);
     return (int32_t)span;
 }
 
+/* Text line `line` into `row`; with SHR_STYLE_BLINK every other cell blinks. */
 static void paint_row(t5_scene *s, int32_t row, uint32_t line, uint32_t flags) {
+    shr_text_line lines[256];
+    size_t n = 0;
+    bool under = (flags & T5_UNDERLINE) && s->cols <= 256;
     for (int32_t c = 0; c < s->cols;) {
-        uint32_t f = (row + c) & 1 ? flags & ~(uint32_t)SHR_STYLE_BLINK : flags;
-        c += paint(s, row, c, mix(line * 0x9E3779B1u + (uint32_t)c), f);
+        uint32_t f = ((row + c) & 1 ? flags & ~(uint32_t)SHR_STYLE_BLINK : flags) & ~T5_UNDERLINE;
+        c += paint(s, row, c, mix(line * 0x9E3779B1u + (uint32_t)c), f, under ? lines : NULL, &n);
     }
+    t5_try(s, shr_pl_lyr_tilemap_set_lines(s->grid, row, lines, n, NULL), "set_lines");
 }
 
 /* Latin text: words of printable ASCII, a colour per word. */
@@ -123,7 +143,7 @@ static void latin_row(t5_scene *s, int32_t row, uint32_t line, uint32_t flags) {
     for (int32_t c = 0; c < s->cols; c++) {
         uint32_t h = mix(line * 0x9E3779B1u + (uint32_t)c / 6), ch = (line * 31 + (uint32_t)c * 7) % 94 + 33;
         char t = c % 6 == 5 ? ' ' : (char)ch;
-        shr_text_style st = {fgs[h % T5_N(fgs)], bgs[0], flags};
+        shr_text_style st = {fgs[h % T5_N(fgs)], 0, flags};
         t5_try(s, shr_pl_lyr_tilemap_set_cell(s->grid, row, c, &t, 1, 1, st), "set_cell");
     }
 }
@@ -177,8 +197,8 @@ static void move_sprites(t5_scene *s) {
 /* A shell session: prompts and the short lines of a long listing, git status and a build, the rows below empty. */
 static void shell_screen(t5_scene *s) {
     static const char *const cmds[] = {"ls -l cores/compositor", "git status --short", "make test"};
-    shr_text_style user = {fgs[2], bgs[0], SHR_STYLE_BOLD}, path = {fgs[4], bgs[0], SHR_STYLE_BOLD};
-    shr_text_style out = {fgs[0], bgs[0], 0};
+    shr_text_style user = {fgs[2], 0, SHR_STYLE_BOLD}, path = {fgs[4], 0, SHR_STYLE_BOLD};
+    shr_text_style out = {fgs[0], 0, 0};
     char t[96];
     int32_t r = 0;
     for (int k = 0; r < s->rows - 8; k++) {
@@ -198,7 +218,7 @@ static void shell_screen(t5_scene *s) {
                          (unsigned)(h >> 4) % 60, f);
                 ts_put(&w, t, s->cols, out);
             } else if (k % 3 == 1) {
-                ts_put(&w, h & 1 ? " M " : "?? ", s->cols, (shr_text_style){fgs[h & 1 ? 1 : 3], bgs[0], 0});
+                ts_put(&w, h & 1 ? " M " : "?? ", s->cols, (shr_text_style){fgs[h & 1 ? 1 : 3], 0, 0});
                 snprintf(t, sizeof(t), "%s/%s", ts_dirs[(h >> 8) % TS_N(ts_dirs)], f);
                 ts_put(&w, t, s->cols, out);
             } else {
@@ -235,7 +255,7 @@ static void scroll_api_step(t5_scene *s) {
         }
     }
     char status[16];
-    const shr_text_style st = {fgs[0], bgs[1], SHR_STYLE_BG};
+    const shr_text_style st = {fgs[0], bgs[1], 0};
     int len = s->load == SCROLL_STATUS ? snprintf(status, sizeof(status), "frame %d", (int)t) : 0;
     for (int i = 0; i < len && i < s->cols; i++)
         t5_try(s, shr_pl_lyr_tilemap_set_cell(s->grid, s->rows - 1, i, &status[i], 1, 1, st), "set_cell");
@@ -261,12 +281,12 @@ static bool load_step(t5_scene *s) {
     case CHURN:
         for (int i = 0; i < T5_CHURN_CELLS; i++) {
             uint32_t h = next_random(s);
-            paint(s, (int32_t)(h % (uint32_t)s->rows), (int32_t)((h >> 8) % (uint32_t)s->cols), mix(h), 0);
+            paint(s, (int32_t)(h % (uint32_t)s->rows), (int32_t)((h >> 8) % (uint32_t)s->cols), mix(h), 0, NULL, NULL);
         }
         break;
     case RESTYLE:
         for (int32_t r = 0; r < s->rows; r++)
-            paint_row(s, r, (uint32_t)r, s->tick & 1 ? SHR_STYLE_BOLD | SHR_STYLE_ITALIC | SHR_STYLE_UNDERLINE : 0);
+            paint_row(s, r, (uint32_t)r, s->tick & 1 ? SHR_STYLE_BOLD | SHR_STYLE_ITALIC | T5_UNDERLINE : 0);
         break;
     case BLINK: return false;
     case CHURN_KO:
@@ -279,7 +299,7 @@ static bool load_step(t5_scene *s) {
         for (int32_t r = 0; r < s->rows; r++) paint_row(s, r, (uint32_t)(s->tick * 64 + (uint64_t)r), 0);
         break;
     case RESTYLE4: {
-        static const uint32_t styles[4] = {0, SHR_STYLE_BOLD | SHR_STYLE_ITALIC | SHR_STYLE_UNDERLINE, SHR_STYLE_BOLD,
+        static const uint32_t styles[4] = {0, SHR_STYLE_BOLD | SHR_STYLE_ITALIC | T5_UNDERLINE, SHR_STYLE_BOLD,
                                            SHR_STYLE_ITALIC};
         for (int32_t r = 0; r < s->rows; r++) paint_row(s, r, (uint32_t)r, styles[s->tick % 4]);
         break;
@@ -288,7 +308,7 @@ static bool load_step(t5_scene *s) {
         uint32_t h = next_random(s), line = mix(h);
         char t = (char)(line % 94 + 33);
         t5_try(s, shr_pl_lyr_tilemap_set_cell(s->grid, (int32_t)(h % (uint32_t)s->rows), (int32_t)((h >> 8) % (uint32_t)s->cols),
-                                              &t, 1, 1, (shr_text_style){fgs[line % T5_N(fgs)], bgs[0], 0}),
+                                              &t, 1, 1, (shr_text_style){fgs[line % T5_N(fgs)], 0, 0}),
                "set_cell");
         break;
     }

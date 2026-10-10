@@ -44,6 +44,12 @@ def scroll(top, bottom, n, flags=0x80, color=90):
     return bytes([2 | 8]) + i8(top, bottom, n, 0) + bytes([flags, color])
 
 
+def lines(row, *ls):
+    """ls: (col, cols, kind, shape, colour byte); colour & 3 picks alpha 255, 128, 0 or a refused one."""
+    return bytes([0xC0]) + i8(row) + bytes([len(ls)]) + b"".join(
+        i8(col, cols) + bytes([kind | shape << 2, c]) for col, cols, kind, shape, c in ls)
+
+
 def measure(s, cols, wrap=True):
     return bytes([4]) + i8(cols) + bytes([1 if wrap else 0]) + u16(len(s)) + s
 
@@ -73,6 +79,11 @@ def src_cmd(kind, rect, fmt, sw, sh, stride, length, origin=(0, 0)):
 def region(kind, rect, buf, src, origin=(0, 0), flags=0, axis=0):
     return (bytes([kind, flags]) + i8(*rect) + bytes([200, 100, 50, buf]) + i8(*src) + i8(*origin)
             + (i8(axis) if kind == 2 else b""))
+
+
+# LINE (kind 13) of `shape` over `rect`, its pattern cell w x h, `origin` the pattern position of rect's corner.
+def line(rect, shape, w, h, origin=(0, 0), dim=0, color=(200, 100, 50)):
+    return bytes([13, shape << 1 | dim]) + i8(*rect) + bytes(color) + bytes([w, h, 0]) + i8(*origin)
 
 
 # Buffer `buf` = w x h pixels at byte `off` of the source bytes; fmt as for src_cmd, | 0x40 DMA, | 0x80 DEVICE.
@@ -184,8 +195,16 @@ SEEDS = {
         + cell(0, 1, b"A", 2, flags=0x80, color=0x22) + RENDER
         + clear(0, 0, 1, 8, flags=0) + cell(0, 2, b"A", 2, flags=0x80, color=0x22) + RENDER
         + b"".join(cell(0, 2, b"A", 2, flags=f, color=0x22) + RENDER for f in (0x81, 0x80, 0x82, 0x80))
-        + cell(0, 2, b"A", 2, flags=0x88, color=0x22) + RENDER + cell(0, 2, b"B", 2, flags=0x88, color=0x22) + RENDER
+        + lines(0, (2, 2, 0, 0, 0x20)) + RENDER + lines(0, (2, 2, 0, 0, 0x24)) + RENDER
+        + lines(0, (2, 2, 0, 2, 0x24)) + RENDER + lines(0, (2, 2, 2, 2, 0x24)) + RENDER + lines(0, (2, 2, 2, 2, 0x25))
+        + RENDER + lines(0, (2, 1, 2, 2, 0x25)) + RENDER + lines(0) + RENDER
         + bytes([3 | 16, 2, 8]) + RENDER,
+        # lines of every shape moving with their rows, cut by clear and resize, and refused ones
+        bytes([1 | 2 | 0x30]) + bytes([3 | 16, 3, 8]) + text(0, 0, b"one\ntwo\nsix") + RENDER
+        + lines(1, (0, 8, 0, 0, 0x10), (1, 6, 1, 1, 0x11), (0, 3, 2, 2, 0x12), (3, 5, 0, 3, 0x20), (2, 4, 0, 4, 0x30))
+        + RENDER + scroll(0, 3, 1) + RENDER + scroll(0, 3, -1, 0) + RENDER + clear(0, 2, 2, 3) + RENDER
+        + lines(2, (0, 9, 0, 0, 0x10)) + lines(2, (0, 2, 0, 5, 0x10)) + lines(2, (0, 2, 3, 0, 0x10))
+        + lines(2, (0, 2, 0, 0, 0x13)) + lines(5, (0, 2, 0, 0, 0x10)) + RENDER + resize(3, 4) + RENDER,
         bytes([0]) + resize(3, 8) + text(0, 0, "A가😀B\tx\nwrap é".encode()) + RENDER,
         bytes([2]) + resize(3, 8) + cell(0, 0, b"$", flags=0x80) + cell(0, 1, "가".encode(), 2)
         + cell(1, 0, "👩‍💻".encode(), 2, 0x08) + cell(2, 7, b"", flags=0x80) + RENDER + cell(1, 1, b"x") + RENDER,
@@ -224,6 +243,11 @@ SEEDS = {
         bytes([0, 10, 10, 2, 3]) + batch(register(2, 2, 4, 4, 16, 8, 64), region(3, (0, 0, 4, 4), 2, (0, 0, 4, 4)),
                                          src_cmd(4, (1, 1, 3, 3), 3, 4, 4, 8, 32)),
         bytes([1, 7, 11, 0, 4]) + batch(rotate(1)) + batch(rotate(2)),
+        # every line shape, a dim one and one starting inside its pattern, then shapes and origins out of bounds
+        bytes([0, 23, 19, 0, 5]) + batch(fill((0, 0, 24, 20)), line((0, 13, 24, 14), 0, 8, 1),
+                                         line((0, 2, 24, 5), 1, 8, 3), line((3, 6, 20, 9), 2, 8, 3, (3, 0), dim=1),
+                                         line((0, 10, 24, 11), 3, 8, 3, (5, 1)), line((0, 16, 24, 17), 4, 8, 1))
+        + batch(line((0, 0, 8, 1), 6, 8, 1)) + batch(line((0, 0, 8, 1), 0, 8, 1, (8, 0))),
         # the destination moved onto itself down and up, also with the rest left undefined, and inside a group
         bytes([0, 23, 19, 0, 11]) + batch(src_cmd(4, (0, 3, 24, 20), 250, 0, 0, 0, 0), src_cmd(4, (2, 0, 20, 15), 251, 0, 0, 0, 0, (0, 4)))
         + batch(group(1, (0, 0, 8, 8)), src_cmd(4, (0, 0, 8, 8), 250, 0, 0, 0, 0, (0, 1)), END),

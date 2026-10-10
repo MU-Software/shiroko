@@ -32,6 +32,7 @@ typedef struct sw {
     int32_t pend_y0, pend_y1;
     shr__synth synth;
     shr__pal_memo pals;
+    shr__line_memo lines;
 } sw;
 
 shr_status shr_software_execute(const shr_surface *dst, const shr_draw_cmd *cmds, size_t count, const shr_image *buffers,
@@ -72,12 +73,14 @@ static __attribute__((noinline)) void image(sw *s, const shr_surface *dst, const
         shr__raster_draw(dst, c, s->buffers, origin, clip, NULL);
 }
 
-/* BOLD and ITALIC GLYPHs from the cache, IMAGEs into RGB565 from planes, the rest as they come. */
+/* BOLD and ITALIC GLYPHs from the cache, IMAGEs into RGB565 from planes, LINE cells kept, the rest as they come. */
 static void draw(sw *s, const shr_surface *dst, const shr_draw_cmd *c, shr_point origin, shr_rect clip) {
     if (c->kind == SHR_CMD_GLYPH && (c->flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC)))
         shr__synth_draw(&s->synth, &s->al, dst, c, s->buffers, origin, clip);
     else if (c->kind == SHR_CMD_IMAGE && dst->format == SHR_FORMAT_RGB565)
         image(s, dst, c, origin, clip);
+    else if (c->kind == SHR_CMD_LINE)
+        shr__raster_line(dst, c, origin, clip, &s->lines);
     else
         shr__raster_draw(dst, c, s->buffers, origin, clip, &s->pals);
 }

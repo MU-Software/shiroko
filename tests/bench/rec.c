@@ -21,6 +21,7 @@ static const uint8_t kind_fields[] = {
     [SHR_CMD_BUFFER_UPDATE] = F_BUF | F_RECT,
     [SHR_CMD_BUFFER_RELEASE] = F_BUF,
     [SHR_CMD_KEEP_RELEASE] = F_BUF,
+    [SHR_CMD_LINE] = F_DST | F_ORG | F_COLOR | F_RECT,
 };
 
 static shr_rect get_rect(const uint8_t *p) { return (shr_rect){(int32_t)rec_get32(p), (int32_t)rec_get32(p + 4), (int32_t)rec_get32(p + 8), (int32_t)rec_get32(p + 12)}; }

@@ -139,7 +139,7 @@ static inline bool fuzz_keep_draw(const shr_surface *dst, const void *self, cons
         shr_draw_cmd moved_src = cmds[i];
         if (moved_src.kind == SHR_CMD_COPY && moved_src.src.pixels == self) moved_src.src.pixels = dst->pixels;
         const shr_draw_cmd *c = &moved_src;
-        if (c->kind >= SHR_CMD_BUFFER_REGISTER) continue;
+        if (c->kind >= SHR_CMD_BUFFER_REGISTER && c->kind <= SHR_CMD_KEEP_RELEASE) continue;
         if (c->kind == SHR_CMD_KEEP_DRAW) {
             const fuzz_keep *k = c->buffer >= 1 && c->buffer <= nkeeps ? &keeps[c->buffer - 1] : NULL;
             if (!k || !k->held || c->src_origin.x < 0 || c->src_origin.y < 0 ||

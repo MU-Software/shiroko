@@ -19,8 +19,9 @@ static const shr_pixel_format FMTS[2] = {SHR_FORMAT_RGB565, SHR_FORMAT_RGBX8888}
 
 static shr_framebuffer_driver gl;
 
-enum { K_FILL, K_DIM, K_GLYPH, K_SYNTH, K_IMAGE, K_COPY, K_ROTATE, K_SCENE, KINDS };
-static const char *const kind_names[KINDS] = {"fill", "fill dim", "glyph", "styled", "image", "copy", "rotate", "scene"};
+enum { K_FILL, K_DIM, K_GLYPH, K_SYNTH, K_IMAGE, K_LINE, K_COPY, K_ROTATE, K_SCENE, KINDS };
+static const char *const kind_names[KINDS] = {"fill", "fill dim", "glyph", "styled", "image", "line", "copy", "rotate",
+                                             "scene"};
 static int max_diff[KINDS][2]; /* by destination format: RGB565, RGBX8888 */
 static void (*pre_execute)(void); /* runs right before the driver's execute() in compare_with() */
 
@@ -794,6 +795,35 @@ TEST images_match(void) {
     PASS();
 }
 
+static shr_draw_cmd line(shr_rect dst, uint32_t shape, int32_t w, int32_t h, shr_point origin, shr_color color) {
+    return (shr_draw_cmd){.kind = SHR_CMD_LINE, .flags = (uint16_t)(shape << SHR_LINE_SHAPE_SHIFT), .dst = dst,
+                          .src_origin = origin, .color = color, .src_rect = {0, 0, w, h}};
+}
+
+/* Every shape, DIM, phases and band rows cut by `dst`, cells of other sizes in turn (the kept cells change between
+ * draws), pieces at the edges. */
+TEST lines_match(void) {
+    const int32_t w = 71, h = 29;
+    static const int32_t cells[][2] = {{8, 3}, {8, 1}, {7, 2}, {13, 5}, {32, 8}, {1, 1}, {8, 3}};
+    shr_draw_cmd c[5 * 7 * 2 + 4];
+    size_t n = 0;
+    for (uint32_t shape = SHR_LINE_SINGLE; shape <= SHR_LINE_DASHED; shape++)
+        for (int i = 0; i < 7; i++)
+            for (int dim = 0; dim < 2; dim++) {
+                int32_t cw = cells[i][0], ch = cells[i][1], oy = ch > 2 && dim, y = (int32_t)(n % 11) * 2;
+                int32_t x0 = (int32_t)(rnd() % 9), x1 = w - (int32_t)(rnd() % 9);
+                c[n] = line((shr_rect){x0, y, x1, y + ch - oy}, shape, cw, ch, (shr_point){(int32_t)(rnd() % (uint32_t)cw), oy},
+                            rnd_color());
+                c[n++].flags |= (uint16_t)dim;
+            }
+    c[n++] = line((shr_rect){w - 1, h - 3, w, h}, SHR_LINE_CURLY, 8, 3, (shr_point){7, 0}, rnd_color());
+    c[n++] = line((shr_rect){0, 0, 1, 1}, SHR_LINE_DOTTED, 8, 3, (shr_point){0, 2}, rnd_color());
+    c[n++] = line((shr_rect){5, 5, 5, 8}, SHR_LINE_CURLY, 8, 3, (shr_point){0, 0}, rnd_color());
+    c[n++] = line((shr_rect){5, 5, 9, 5}, SHR_LINE_DOTTED, 8, 3, (shr_point){0, 0}, rnd_color());
+    EACH_TARGET(f, dev) ASSERT(compare(c, n, f, w, h, dev, K_LINE) <= MAX_BLEND(f));
+    PASS();
+}
+
 TEST copies_convert_exactly(void) {
     const int32_t w = 31, h = 17;
     enum { SW = 20, SH = 12 };
@@ -1263,6 +1293,12 @@ TEST invalid_batches_match_the_software_port(void) {
     same_one(&d, from(SHR_CMD_GLYPH, (shr_rect){0, 0, 3, 4}, i4, (shr_rect){2, 0, 5, 4}, o0, 0), SHR_OK);
     same_one(&d, from(SHR_CMD_GLYPH, r, 0, (shr_rect){0, 0, 4, 4}, o0, 0), SHR_E_INVALID_ARG);
     same_one(&d, from(SHR_CMD_GLYPH, r, IDS + 1, (shr_rect){0, 0, 4, 4}, o0, 0), SHR_E_INVALID_ARG);
+    same_one(&d, line(r, SHR_LINE_DASHED + 1, 8, 4, o0, 0), SHR_E_INVALID_ARG);
+    same_one(&d, line(r, SHR_LINE_CURLY, SHR_LINE_MAX_PERIOD + 1, 4, o0, 0), SHR_E_INVALID_ARG);
+    same_one(&d, line(r, SHR_LINE_DOTTED, 8, 3, o0, 0), SHR_E_INVALID_ARG); /* four rows of a three-row cell */
+    same_one(&d, line(r, SHR_LINE_SINGLE, 4, 4, (shr_point){4, 0}, 0), SHR_E_INVALID_ARG);
+    same_one(&d, line((shr_rect){0, 0, 17, 1}, SHR_LINE_SINGLE, 4, 1, o0, 0), SHR_E_INVALID_ARG);
+    same_one(&d, line(r, SHR_LINE_CURLY, 8, 4, (shr_point){7, 0}, 0), SHR_OK);
     same_status(&d, (shr_draw_cmd[]){fill, buf_cmd(SHR_CMD_BUFFER_RELEASE, 1, (shr_rect){0})}, 2, SHR_E_INVALID_ARG);
     shr_image_ref dev_src = src;
     dev_src.domain = SHR_MEMORY_DEVICE; /* not a surface of the driver */
@@ -1541,6 +1577,30 @@ TEST keeps_match_the_software_port(void) {
     PASS();
 }
 
+/* LINEs in a keep group, the drivers keeping their cells across batches. */
+TEST lines_in_keep_groups_match(void) {
+    enum { W = 48, H = 16 };
+    EACH_TARGET(f, dev) {
+        pair p;
+        pair_open(&p, 1 << 16, 1, f, W, H, dev);
+        for (int dim = 0; dim < 2; dim++) {
+            shr_rect k = {3, 4, 40, 12};
+            shr_draw_cmd g[] = {{.kind = SHR_CMD_KEEP_BEGIN, .dst = k, .buffer = 1},
+                                {.kind = SHR_CMD_FILL, .dst = k, .color = rnd_color()},
+                                line((shr_rect){3, 9, 40, 12}, SHR_LINE_CURLY, 8, 3, (shr_point){3, 0}, rnd_color()),
+                                line((shr_rect){4, 4, 39, 7}, SHR_LINE_DOTTED, 8, 3, (shr_point){5, 0}, rnd_color()),
+                                line((shr_rect){4, 7, 39, 8}, SHR_LINE_DASHED, 8, 1, (shr_point){1, 0}, rnd_color()),
+                                {.kind = SHR_CMD_KEEP_END},
+                                keep_draw(1, (shr_rect){5, 2, 42, 10}, (shr_point){0, 0})};
+            g[2].flags |= (uint16_t)dim;
+            pair_run(&p, g, 7, SHR_OK);
+            ASSERT(pair_diff(&p) <= MAX_BLEND(f));
+        }
+        pair_close(&p);
+    }
+    PASS();
+}
+
 /* A keep drawn is what its group draws directly, bit for bit, also from a later batch; keep draws and glyphs share
  * a draw call. */
 TEST keep_draws_are_exact(void) {
@@ -1755,8 +1815,17 @@ static size_t scene(shr_context *ctx, shr_pl_res_bitmap_font *font, shr_lyr **ls
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_text(text, 0, 0, t, strlen(t), (shr_text_style){SHR_RGB(0xF8, 0xF8, 0xF2), 0,
                                              SHR_STYLE_BOLD}, NULL, 0, SHR_TEXT_WRAP, &err),
                  SHR_OK);
-    shr_text_style dim = {SHR_RGB(0x50, 0xFA, 0x7B), SHR_RGB(0x44, 0x47, 0x5A), SHR_STYLE_DIM | SHR_STYLE_BG | SHR_STYLE_UNDERLINE};
+    shr_text_style dim = {(SHR_RGB(0x50, 0xFA, 0x7B) & 0xFFFFFFu) | 0x80000000u, SHR_RGB(0x44, 0x47, 0x5A), 0};
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_text(text, 2, 1, "dim bg", 6, dim, NULL, 0, 0, &err), SHR_OK);
+    const shr_text_line under = {1, 6, SHR_LINE_UNDER, SHR_LINE_SINGLE, 0, dim.fg};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(text, 2, &under, 1, &err), SHR_OK);
+    const shr_text_line lines[] = {{0, 3, SHR_LINE_UNDER, SHR_LINE_CURLY, 0, SHR_RGB(0xFF, 0x55, 0x55)},
+                                   {3, 3, SHR_LINE_UNDER, SHR_LINE_DOTTED, 0, SHR_RGB(0xF1, 0xFA, 0x8C)},
+                                   {6, 3, SHR_LINE_UNDER, SHR_LINE_DASHED, 0, (SHR_RGB(0xFF, 0x79, 0xC6) & 0xFFFFFFu) | 0x80000000u},
+                                   {9, 3, SHR_LINE_UNDER, SHR_LINE_DOUBLE, 0, SHR_RGB(0x8B, 0xE9, 0xFD)},
+                                   {0, 12, SHR_LINE_OVER, SHR_LINE_SINGLE, 0, SHR_RGB(0xBD, 0x93, 0xF9)},
+                                   {2, 6, SHR_LINE_STRIKE, SHR_LINE_CURLY, 0, SHR_RGB(0xF8, 0xF8, 0xF2)}};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(text, 1, lines, sizeof(lines) / sizeof(lines[0]), &err), SHR_OK);
 
     uint8_t rgba[24 * 24 * 4];
     for (int y = 0; y < 24; y++)
@@ -1909,6 +1978,7 @@ SUITE(driver) {
     RUN_TEST(styled_glyphs_at_atlas_edges);
     RUN_TEST(styled_glyphs_match_at_the_axis_bounds);
     RUN_TEST(images_match);
+    RUN_TEST(lines_match);
     RUN_TEST(copies_convert_exactly);
     RUN_TEST(copy_scrolls_within_a_surface);
     RUN_TEST(rotations_map_exactly);
@@ -1924,6 +1994,7 @@ SUITE(driver) {
     RUN_TEST(device_and_domain_rules);
     RUN_TEST(keep_caps_and_slot_textures);
     RUN_TEST(keeps_match_the_software_port);
+    RUN_TEST(lines_in_keep_groups_match);
     RUN_TEST(keep_draws_are_exact);
     RUN_TEST(keep_slots_by_id);
     RUN_TEST(gl_errors_empty_the_keeps);

@@ -619,6 +619,12 @@ static shr_status emit_group(shr_context *ctx, shr__frame *f, const shr_lyr *l, 
             if (!(c = push_cmd(ctx, f, &st))) return st;
             c->kind = SHR_CMD_FILL, c->flags = flags & SHR_GLYPH_DIM, c->dst = band_rect(f, d);
             c->color = compact ? rc->color : lc->color;
+        } else if (kind == SHR__LCMD_LINE) {
+            if (!(c = push_cmd(ctx, f, &st))) return st;
+            c->kind = SHR_CMD_LINE, c->flags = (uint16_t)((flags & SHR_GLYPH_DIM) | rc->id << SHR_LINE_SHAPE_SHIFT);
+            c->dst = band_rect(f, d), c->color = rc->color;
+            c->src_origin = (shr_point){(d.x0 - dst.x0) % SHR_CELL_WIDTH, d.y0 - dst.y0};
+            c->src_rect = (shr_rect){0, 0, SHR_CELL_WIDTH, dst.y1 - dst.y0};
         } else {
             shr__lcmd row; /* what emit_resolved reads */
             if (compact)

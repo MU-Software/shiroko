@@ -242,7 +242,8 @@ static const struct {
 static const shr_color fgs[] = {SHR_RGB(0xF8, 0xF8, 0xF2), SHR_RGB(0xFF, 0x79, 0xC6), SHR_RGB(0x50, 0xFA, 0x7B),
                                 SHR_RGB(0xF1, 0xFA, 0x8C), SHR_RGB(0x8B, 0xE9, 0xFD), SHR_RGB(0xBD, 0x93, 0xF9)};
 static const shr_color bgs[] = {SHR_RGB(0x28, 0x2A, 0x36), SHR_RGB(0x44, 0x47, 0x5A), SHR_RGB(0x62, 0x72, 0xA4)};
-static const uint32_t line_styles[] = {0, SHR_STYLE_BOLD, 0, SHR_STYLE_ITALIC, SHR_STYLE_UNDERLINE, 0,
+#define UNDERLINED (1u << 31) /* paint_row: a line under every cell, in its colour */
+static const uint32_t line_styles[] = {0, SHR_STYLE_BOLD, 0, SHR_STYLE_ITALIC, UNDERLINED, 0,
                                        SHR_STYLE_BOLD | SHR_STYLE_ITALIC};
 
 static uint32_t mix(uint32_t x) {
@@ -255,22 +256,39 @@ static uint32_t next_random(app *a) {
     return a->rng;
 }
 
-/* One cell as a VT engine hands it over; returns its span. */
-static int32_t paint(app *a, int32_t row, int32_t col, uint32_t h, uint32_t flags) {
+/* Appends `e` to the row's lines, joining it to the last one when it continues it alike: the cells' underlines
+ * become runs, as a VT connection hands them over. */
+static size_t line_add(shr_text_line *l, size_t n, shr_text_line e) {
+    shr_text_line *p = n ? &l[n - 1] : NULL;
+    if (p && p->col + p->cols == e.col && p->kind == e.kind && p->shape == e.shape && p->flags == e.flags &&
+        p->color == e.color)
+        return p->cols = (uint16_t)(p->cols + e.cols), n;
+    return l[n] = e, n + 1;
+}
+
+/* One cell as a VT engine hands it over, its underline into `lines` (NULL: none); returns its span. */
+static int32_t paint(app *a, int32_t row, int32_t col, uint32_t h, uint32_t flags, shr_text_line *lines, size_t *n) {
     uint32_t g = h % N(glyphs), span = glyphs[g].span;
     const char *t = glyphs[g].text;
     if (col + (int32_t)span > a->cols) t = " ", span = 1;
-    shr_text_style st = {fgs[(h >> 8) % N(fgs)], bgs[(h >> 12) % N(bgs)], flags | ((h >> 16) % 4 ? 0 : SHR_STYLE_BG)};
+    shr_text_style st = {fgs[(h >> 8) % N(fgs)], (h >> 16) % 4 ? 0 : bgs[(h >> 12) % N(bgs)], flags};
     stage_ok(&a->s, shr_pl_lyr_tilemap_set_cell(a->grid, row, col, t, strlen(t), span, st), "set_cell");
+    uint16_t blink = flags & SHR_STYLE_BLINK ? SHR_TEXT_LINE_BLINK : 0;
+    shr_text_line under = {(uint16_t)col, (uint16_t)span, SHR_LINE_UNDER, SHR_LINE_SINGLE, blink, st.fg};
+    if (lines) *n = line_add(lines, *n, under);
     return (int32_t)span;
 }
 
 /* Text line `line` into `row`; with SHR_STYLE_BLINK every other cell blinks. */
 static void paint_row(app *a, int32_t row, uint32_t line, uint32_t flags) {
+    shr_text_line lines[256];
+    size_t n = 0;
+    bool under = (flags & UNDERLINED) && a->cols <= 256;
     for (int32_t c = 0; c < a->cols;) {
-        uint32_t f = (row + c) & 1 ? flags & ~(uint32_t)SHR_STYLE_BLINK : flags;
-        c += paint(a, row, c, mix(line * 0x9E3779B1u + (uint32_t)c), f);
+        uint32_t f = ((row + c) & 1 ? flags & ~(uint32_t)SHR_STYLE_BLINK : flags) & ~UNDERLINED;
+        c += paint(a, row, c, mix(line * 0x9E3779B1u + (uint32_t)c), f, under ? lines : NULL, &n);
     }
+    stage_ok(&a->s, shr_pl_lyr_tilemap_set_lines(a->grid, row, lines, n, NULL), "set_lines");
 }
 
 static void build_sprites(app *a) {
@@ -337,7 +355,7 @@ static void scroll_api_step(app *a) {
         paint_row(a, r, line, line_styles[line % N(line_styles)]);
     }
     char status[16];
-    const shr_text_style st = {fgs[0], bgs[1], SHR_STYLE_BG};
+    const shr_text_style st = {fgs[0], bgs[1], 0};
     int len = a->load == SCROLL_STATUS ? snprintf(status, sizeof(status), "frame %d", t) : 0;
     for (int i = 0; i < len && i < a->cols; i++)
         stage_ok(&a->s, shr_pl_lyr_tilemap_set_cell(a->grid, a->rows - 1, i, &status[i], 1, 1, st), "set_cell");
@@ -361,12 +379,12 @@ static bool load_step(app *a) {
     case CHURN:
         for (long i = 0; i < a->n[CHURN]; i++) {
             uint32_t h = next_random(a);
-            paint(a, (int32_t)(h % (uint32_t)a->rows), (int32_t)((h >> 8) % (uint32_t)a->cols), mix(h), 0);
+            paint(a, (int32_t)(h % (uint32_t)a->rows), (int32_t)((h >> 8) % (uint32_t)a->cols), mix(h), 0, NULL, NULL);
         }
         break;
     case RESTYLE:
         for (int32_t r = 0; r < a->rows; r++)
-            paint_row(a, r, (uint32_t)r, a->tick & 1 ? SHR_STYLE_BOLD | SHR_STYLE_ITALIC | SHR_STYLE_UNDERLINE : 0);
+            paint_row(a, r, (uint32_t)r, a->tick & 1 ? SHR_STYLE_BOLD | SHR_STYLE_ITALIC | UNDERLINED : 0);
         break;
     case BLINK:
         a->s.now += BLINK_NS;

@@ -43,7 +43,7 @@ static void rec_log(void *user, shr_status st, const char *msg) {
 
 static shr_status rec_execute(void *user, const shr_surface *dst, const shr_draw_cmd *c, size_t n, shr_fence f) {
     size_t p = 0;
-    while (p < n && c[p].kind >= SHR_CMD_BUFFER_REGISTER) p++;
+    while (p < n && c[p].kind >= SHR_CMD_BUFFER_REGISTER && c[p].kind <= SHR_CMD_KEEP_RELEASE) p++;
     rec.npro = p < 64 ? p : 64;
     memcpy(rec.pro, c, rec.npro * sizeof(*c));
     rec.n = n - p < 512 ? n - p : 512;

@@ -1,4 +1,4 @@
-/* Recordings of a scene, replayed into one part alone. Format "SHRR" version 1, little-endian: records [u8 type]
+/* Recordings of a scene, replayed into one part alone. Format "SHRR" version 2, little-endian: records [u8 type]
  * [u24 length][payload padded to 4 bytes], a header first and an END record last. Two kinds:
  * - commands: the batches a driver receives, recorded at its vtable. A command is 64 bytes holding only the fields its
  *   kind reads (the others zero) with pointers as (target or memory number, offset), so a recording does not depend
@@ -16,7 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define REC_VERSION 1
+#define REC_VERSION 2
 #define REC_TARGETS 4
 #define REC_OPEN (-1) /* the frame index of everything before the first loop frame */
 #define REC_WARM 10   /* loop frames before p50 and p95 count, as in the Tab5 example */

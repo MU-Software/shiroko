@@ -323,21 +323,31 @@ shr_status shr_pl_res_bitmap_font_activation_select(const uint8_t *a, size_t a_l
 enum {
     SHR_STYLE_BOLD = 1u << 0,
     SHR_STYLE_ITALIC = 1u << 1,
-    SHR_STYLE_DIM = 1u << 2,
-    SHR_STYLE_UNDERLINE = 1u << 3,
-    SHR_STYLE_STRIKE = 1u << 4,
-    SHR_STYLE_BLINK = 1u << 5,
-    SHR_STYLE_CONCEAL = 1u << 6,
-    SHR_STYLE_BG = 1u << 7 /* paint `bg` under the occupied cells; otherwise transparent */
+    SHR_STYLE_BLINK = 1u << 2
 };
-#define SHR_STYLE_KNOWN_FLAGS 0xFFu
+#define SHR_STYLE_KNOWN_FLAGS 0x7u
 
-/* FG/BG are resolved colours: no inverse flag, no terminal colour modes. */
+/* FG/BG are resolved colours: no inverse flag, no terminal colour modes. Their alpha byte says how they draw: fg 255
+ * full, 128 dim (half strength), 0 concealed (no glyph); bg 255 painted under the occupied cells, 0 none (the tilemap
+ * background or transparent). Other alpha values are SHR_E_UNKNOWN_STYLE for now. A colour without alpha (0xRRGGBB)
+ * is concealed or unpainted: build colours with SHR_RGB. */
 typedef struct shr_text_style {
     shr_color fg;
     shr_color bg;
     uint32_t flags;
 } shr_text_style;
+
+/* A line drawn over cells [col, col + cols) of a row, above the glyphs: under at the font's underline, strike at its
+ * strikeout, over at the cell top; `shape` one of SHR_LINE_* (shiroko_driver.h). `color` alpha as fg's: 255 full, 128
+ * dim, 0 not drawn. */
+enum { SHR_LINE_UNDER = 0, SHR_LINE_STRIKE, SHR_LINE_OVER };
+enum { SHR_TEXT_LINE_BLINK = 1u << 0 }; /* hidden while the blink phase is off, as SHR_STYLE_BLINK */
+typedef struct shr_text_line {
+    uint16_t col, cols;
+    uint8_t kind, shape;
+    uint16_t flags;
+    shr_color color;
+} shr_text_line;
 
 /* Byte range [byte_start, byte_end) on cluster boundaries; non-empty, sorted, disjoint. */
 typedef struct shr_style_run {
@@ -372,16 +382,21 @@ shr_status shr_pl_lyr_tilemap_limits_get(shr_text_limits *out);
 
 /* Attaches a tilemap to a layer on first use (the layer then rejects shr_lyr_cmd_*) and sets its size;
  * cells keep their content where the grids overlap. A different font replaces the previous one.
- * `background` (NULL: none) paints every cell without SHR_STYLE_BG, which makes the rows opaque;
+ * `background` (NULL: none) paints every cell without a bg of its own, which makes the rows opaque;
  * without it such cells are transparent. The tilemap is freed with the layer. */
 shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *font, int32_t rows, int32_t cols,
                                      const shr_color *background);
 /* One cluster as the VT engine placed it: never re-segmented, re-measured or combined. It occupies
- * `span` cells from (row, col); cells it overlaps are cleared. Empty UTF-8 draws background and
- * decorations only. A cluster past the profile's limits (shr_text_limits) draws U+FFFD; past max_cell_bytes the cell
- * keeps only U+FFFD. */
+ * `span` cells from (row, col); cells it overlaps are cleared. Empty UTF-8 draws the background only, and the row's
+ * lines stay as they are. A cluster past the profile's limits (shr_text_limits) draws U+FFFD; past max_cell_bytes the
+ * cell keeps only U+FFFD. */
 shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col, const char *utf8, size_t length,
                                        uint32_t span, shr_text_style style);
+/* Replaces the lines of `row` with `lines` (drawn in this order); an equal list changes nothing. Each lies inside the
+ * grid with cols >= 1; at most 4 per column of the grid (SHR_E_LIMIT). SHR_E_UNKNOWN_STYLE: an unknown kind, shape or
+ * flag or a colour alpha other than 0, 128 and 255 (err->item_index: the line). On error nothing changes. */
+shr_status shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_text_line *lines, size_t count,
+                                        shr_error_info *err);
 /* Text laid out by the renderer from (row, col) as shr_pl_lyr_tilemap_measure() lays it out in
  * `cols - col` columns: Unicode clusters and widths, LF/CR/CRLF, TAB stops counted from `col` and,
  * with SHR_TEXT_WRAP, wrapping at the last column; lines continue at column `col`. Only what lies in
@@ -395,15 +410,16 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
 shr_status shr_pl_lyr_tilemap_set_text(shr_lyr *layer, int32_t row, int32_t col, const char *utf8, size_t length,
                                        shr_text_style style, const shr_style_run *runs, size_t run_count,
                                        uint32_t flags, shr_error_info *err);
-/* Clears rows x cols cells from (row, col), and the wide cells reaching into them, to style.bg with
- * SHR_STYLE_BG, else to blank (the tilemap background or transparent). Other style fields are ignored. */
+/* Clears rows x cols cells from (row, col), and the wide cells reaching into them, to style.bg (alpha 0: blank, the
+ * tilemap background or transparent), and the lines over them. Other style fields are ignored. SHR_E_NO_MEMORY: a
+ * line the cleared columns split in two found no room; nothing changed. */
 shr_status shr_pl_lyr_tilemap_clear(shr_lyr *layer, int32_t row, int32_t col, int32_t rows, int32_t cols,
                                     shr_text_style style);
 
 /* Moves the cells of rows [top, bottom) by n rows: up for n > 0 (rows top .. top + n - 1 leave), down for n < 0. The
  * rows it uncovers become cells cleared to `style` as shr_pl_lyr_tilemap_clear() clears them; |n| >= bottom - top
- * clears all of them. Moved cells keep their text and style, and the renderer moves their pixels instead of drawing
- * them again where it can. */
+ * clears all of them. Moved rows keep their text, styles and lines, and the renderer moves their pixels instead of
+ * drawing them again where it can. */
 shr_status shr_pl_lyr_tilemap_scroll(shr_lyr *layer, int32_t top, int32_t bottom, int32_t n, shr_text_style style);
 
 enum {

@@ -153,6 +153,16 @@ static shr_status region_check(const shr_draw_cmd *c, const shr_image *buffers, 
     return origin_check(c, r.x1 - r.x0, r.y1 - r.y0, image ? 0 : c->flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC));
 }
 
+static shr_status line_check(const shr_draw_cmd *c) {
+    int32_t w = c->src_rect.x1, h = c->src_rect.y1;
+    int64_t sy1 = (int64_t)c->src_origin.y + (c->dst.y1 - c->dst.y0);
+    bool bad = (c->flags & ~(SHR_GLYPH_DIM | 7u << SHR_LINE_SHAPE_SHIFT)) ||
+               c->flags >> SHR_LINE_SHAPE_SHIFT > SHR_LINE_DASHED || c->src_rect.x0 || c->src_rect.y0 || w < 1 ||
+               w > SHR_LINE_MAX_PERIOD || h < 1 || h > SHR_LINE_MAX_BAND || c->src_origin.x < 0 ||
+               c->src_origin.x >= w || c->src_origin.y < 0 || sy1 > h;
+    return bad ? SHR_E_INVALID_ARG : SHR_OK;
+}
+
 static shr_status copy_check(const shr_draw_cmd *c, shr__reach_fn fn, const void *user) {
     shr_image m;
     if (!screen_format((shr_pixel_format)c->src.format)) return SHR_E_UNSUPPORTED;
@@ -247,6 +257,7 @@ shr_status shr__raster_check(const shr_surface *dst, const shr_draw_cmd *cmds, s
         case SHR_CMD_FILL: break;
         case SHR_CMD_GLYPH: st = region_check(c, buffers, n, false); break;
         case SHR_CMD_IMAGE: st = region_check(c, buffers, n, true); break;
+        case SHR_CMD_LINE: st = line_check(c); break;
         case SHR_CMD_COPY:
             st = copy_check(c, fn, user);
             /* Row-wise memmove handles overlap only between identical layouts. */
@@ -553,6 +564,47 @@ static void do_glyph(const shr_surface *dst, const shr_draw_cmd *c, const shr_im
         glyph_rows(dst, c, b, r, s, SHR_FORMAT_RGBX8888, SHR_FORMAT_A4);
 }
 
+#define LINE_RUN (4 * SPAN)
+
+/* Cell rows of full coverage draw as FILLs, rows of none not at all, the others as A8 GLYPHs from the row repeated in
+ * a strip, in runs that each start at their phase. */
+static void do_line(const shr_surface *dst, const shr_draw_cmd *c, const uint8_t *cell, shr_rect r, shr_point s) {
+    int32_t w = c->src_rect.x1, n = r.x1 - r.x0, len = (n < LINE_RUN ? n : LINE_RUN) + w;
+    bool dim = c->flags & SHR_GLYPH_DIM;
+    uint8_t strip[LINE_RUN + SHR_LINE_MAX_PERIOD];
+    shr_image b = {strip, len, 1, sizeof(strip), sizeof(strip), SHR_FORMAT_A8, SHR_MEMORY_CPU};
+    shr_draw_cmd g = {.kind = SHR_CMD_GLYPH, .flags = dim, .color = c->color, .src_rect = {0, 0, len, 1}};
+    for (int32_t y = r.y0; y < r.y1; y++) {
+        const uint8_t *row = cell + (size_t)(s.y + y - r.y0) * (size_t)w;
+        uint32_t all = 255, any = 0;
+        for (int32_t x = 0; x < w; x++) all &= row[x], any |= row[x];
+        if (all == 255) {
+            do_fill(dst, (shr_rect){r.x0, y, r.x1, y + 1}, c->color, dim);
+            continue;
+        }
+        if (!any) continue;
+        memcpy(strip, row, (size_t)w);
+        for (int32_t have = w, k; have < len; have += k) { /* doubling: no division per byte */
+            k = have < len - have ? have : len - have;
+            memcpy(strip + have, strip, (size_t)k);
+        }
+        for (int32_t x = 0; x < n; x += LINE_RUN) {
+            int32_t k = n - x < LINE_RUN ? n - x : LINE_RUN;
+            do_glyph(dst, &g, &b, (shr_rect){r.x0 + x, y, r.x0 + x + k, y + 1}, (shr_point){(s.x + x) % w, 0});
+        }
+    }
+}
+
+void shr__raster_line(const shr_surface *dst, const shr_draw_cmd *c, shr_point origin, shr_rect clip,
+                      shr__line_memo *memo) SHR_NONBLOCKING {
+    shr_rect d = {c->dst.x0 - origin.x, c->dst.y0 - origin.y, c->dst.x1 - origin.x, c->dst.y1 - origin.y};
+    shr_rect r = shr__rect_intersect(d, clip);
+    if (shr__rect_empty(r)) return;
+    uint8_t tmp[SHR_LINE_MAX_PERIOD * SHR_LINE_MAX_BAND];
+    shr_point s = {c->src_origin.x + (r.x0 - d.x0), c->src_origin.y + (r.y0 - d.y0)};
+    do_line(dst, c, shr__raster_line_cell(c, memo, tmp), r, s);
+}
+
 shr__pal_set shr__pals[SHR__PAL_SETS];
 
 /* Bits 16.. pick the set of shr__pals, the top 4 bits the memo entry. */
@@ -832,6 +884,10 @@ void shr__raster_draw(const shr_surface *dst, const shr_draw_cmd *c, const shr_i
     }
     if (c->kind == SHR_CMD_ROTATE) {
         do_rotate(dst, c, r);
+        return;
+    }
+    if (c->kind == SHR_CMD_LINE) {
+        shr__raster_line(dst, c, origin, clip, NULL);
         return;
     }
     shr_point s = {c->src_origin.x + (r.x0 - d.x0), c->src_origin.y + (r.y0 - d.y0)};

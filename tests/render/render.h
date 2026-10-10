@@ -12,6 +12,8 @@
 #define CW SHR_CELL_WIDTH
 #define CH SHR_CELL_HEIGHT
 #define BLINK_NS 500000000u
+#define DIM(c) (((c) & 0xFFFFFFu) | 0x80000000u) /* fg or line alpha 128: half strength */
+#define HIDDEN(c) ((c) & 0xFFFFFFu)               /* fg alpha 0: concealed */
 
 /* Pixels may differ by at most max_delta per channel (native bit depth) on at most max_pixels pixels. */
 typedef struct fuzz {
@@ -87,6 +89,11 @@ shr_pl_res_image *stage_image(stage *s, int32_t w, int32_t h, const uint8_t *rgb
 void stage_text(stage *s, shr_lyr *l, int32_t row, int32_t col, const char *utf8, shr_text_style style, uint32_t flags);
 void stage_cell(stage *s, shr_lyr *l, int32_t row, int32_t col, const char *utf8, uint32_t span, shr_text_style style);
 void stage_fill(stage *s, shr_lyr *l, shr_rect r, shr_color c);
+void stage_lines(stage *s, shr_lyr *l, int32_t row, const shr_text_line *lines, size_t count);
+/* Appends `line` over the cells of bytes [b0, b1) of `utf8` that land on row `at` when set_text lays the text out from
+ * (row, col) of a grid `cols` wide with `flags`, one line per run of cells; returns the new count. */
+size_t stage_text_lines(const char *utf8, size_t b0, size_t b1, int32_t row, int32_t col, int32_t cols, uint32_t flags,
+                        int32_t at, shr_text_line line, shr_text_line *out, size_t n);
 /* Opens package `name` from `font_dir` as a scene with `flags` sees it (FONTS_NONE, FONTS_LATIN, FONTS_ASYNC). */
 shr_status stage_open_package(stage *s, uint32_t flags, const char *font_dir, const char *name, shr_asset_source *out);
 /* Completes every held read (more may follow) until none is left. */

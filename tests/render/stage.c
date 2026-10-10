@@ -73,6 +73,34 @@ void stage_fill(stage *s, shr_lyr *l, shr_rect r, shr_color c) {
     if (s->st == SHR_OK) stage_ok(s, shr_lyr_cmd_fill(l, r, c), "cmd_fill");
 }
 
+void stage_lines(stage *s, shr_lyr *l, int32_t row, const shr_text_line *lines, size_t count) {
+    if (s->st != SHR_OK) return;
+    shr_error_info err = {0};
+    shr_status st = shr_pl_lyr_tilemap_set_lines(l, row, lines, count, &err);
+    char what[64];
+    snprintf(what, sizeof(what), "set_lines row %d line %zu", row, err.item_index);
+    stage_ok(s, st, what);
+}
+
+size_t stage_text_lines(const char *utf8, size_t b0, size_t b1, int32_t row, int32_t col, int32_t cols, uint32_t flags,
+                        int32_t at, shr_text_line line, shr_text_line *out, size_t n) {
+    shr_text_cluster cl[256];
+    shr_text_extent ext;
+    if (shr_pl_lyr_tilemap_measure(utf8, strlen(utf8), cols - col, flags, cl, 256, &ext, NULL) != SHR_OK) return n;
+    for (size_t i = 0; i < ext.clusters; i++) {
+        int32_t c = col + cl[i].column, end = c + (int32_t)cl[i].cells > cols ? cols : c + (int32_t)cl[i].cells;
+        if (row + cl[i].row != at || cl[i].byte_offset < b0 || cl[i].byte_offset >= b1 || c >= end) continue;
+        shr_text_line *last = n ? &out[n - 1] : NULL;
+        if (last && last->col + last->cols == c && last->kind == line.kind && last->shape == line.shape &&
+            last->flags == line.flags && last->color == line.color) {
+            last->cols = (uint16_t)(end - last->col);
+            continue;
+        }
+        out[n] = line, out[n].col = (uint16_t)c, out[n].cols = (uint16_t)(end - c), n++;
+    }
+    return n;
+}
+
 /* Reads of FONTS_ASYNC packages: held while `hold`, completed by stage_release_reads(). */
 typedef struct async_source {
     stage *s;

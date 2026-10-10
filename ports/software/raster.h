@@ -53,10 +53,24 @@ typedef struct shr__pal_memo {
     uint32_t pal[SHR__MEMO_PALS][16];
 } shr__pal_memo;
 
-/* Draws one checked FILL/GLYPH/IMAGE/COPY/ROTATE command moved by -origin and limited to `clip`; ON_FILL GLYPH palettes
- * through `memo` (NULL: none). */
+/* Draws one checked FILL/GLYPH/IMAGE/COPY/ROTATE/LINE command moved by -origin and limited to `clip`; ON_FILL GLYPH
+ * palettes through `memo` (NULL: none). */
 void shr__raster_draw(const shr_surface *dst, const shr_draw_cmd *c, const shr_image *buffers, shr_point origin,
                       shr_rect clip, shr__pal_memo *memo) SHR_NONBLOCKING;
+
+/* The coverage (before DIM) of the w x h LINE pattern cell of `shape`, as shiroko_driver.h defines it, row by row into
+ * out[w * h]. DOTTED and CURLY take some 10^5 float operations: drivers keep them. */
+void shr__raster_line_coverage(uint8_t *out, uint32_t shape, int32_t w, int32_t h) SHR_NONBLOCKING;
+/* The CURLY and DOTTED cells a driver keeps between commands: key w << 8 | h, 0 for none. */
+typedef struct shr__line_memo {
+    uint32_t key[2];
+    uint8_t cov[2][SHR_LINE_MAX_PERIOD * SHR_LINE_MAX_BAND];
+} shr__line_memo;
+/* The cell of a checked LINE, from `memo` (NULL: computed into `tmp`). */
+const uint8_t *shr__raster_line_cell(const shr_draw_cmd *c, shr__line_memo *memo, uint8_t *tmp) SHR_NONBLOCKING;
+/* Draws a checked LINE as shr__raster_draw does, its cell through `memo`. */
+void shr__raster_line(const shr_surface *dst, const shr_draw_cmd *c, shr_point origin, shr_rect clip,
+                      shr__line_memo *memo) SHR_NONBLOCKING;
 
 /* RGBA8888 buffer `b` prepared for IMAGE into RGB565: per pixel the words n_r << 16 | n_b and n_g << 8 | A, with
  * A = 255 - alpha and n = (m * c * alpha + 32512) / 255 + 1 for colour c of m + 1 levels, so that blending onto 565

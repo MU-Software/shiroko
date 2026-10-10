@@ -30,7 +30,9 @@ static int tex_kind(shr_pixel_format f) {
     return f == SHR_FORMAT_RGB565 ? TEX_RGB565 : f == SHR_FORMAT_A4 || f == SHR_FORMAT_A8 ? TEX_R8 : TEX_RGBA8;
 }
 
-enum { MODE_FILL, MODE_GLYPH, MODE_SYNTH, MODE_IMAGE, MODE_KEEP, MODE_COPY, MODE_CW, MODE_180, MODE_CCW };
+enum { MODE_FILL, MODE_GLYPH, MODE_SYNTH, MODE_IMAGE, MODE_KEEP, MODE_COPY, MODE_CW, MODE_180, MODE_CCW, MODE_LINE };
+#define CELL_WORDS (SHR_LINE_MAX_PERIOD * SHR_LINE_MAX_BAND / 4) /* a CURLY or DOTTED cell in u_cells */
+_Static_assert(CELL_WORDS == 64, "the shader's u_cells: CURLY in words 0..63, DOTTED in 64..127");
 enum { FLAG_A4 = 8 }; /* beside SHR_GLYPH_DIM, BOLD and ITALIC */
 
 /* One quad, in destination coordinates: `clip` limits `dst`; `rect` is the buffer rect outside which coverage is 0;
@@ -102,6 +104,8 @@ typedef struct gl_drv {
     shr__keeps keeps;
     atlas atlas[TEX_KINDS];
     GLuint keep_fbo;
+    GLint cells[2];
+    uint32_t cell_key[2]; /* the CURLY and DOTTED cells u_cells holds: w << 8 | h, 0 for none */
 } gl_drv;
 
 /* One execute(): a CPU destination (target NULL) is drawn in a scratch texture holding `area`. */
@@ -132,7 +136,7 @@ static const char *const vs_src =
     "    vec2 pos = vec2(a_corner.x > 0.5 ? hi.x : lo.x, a_corner.y > 0.5 ? hi.y : lo.y) - vec2(u_origin);\n"
     "    gl_Position = vec4(pos * u_scale - 1.0, 0.0, 1.0);\n"
     "    v_rect = vec4(a_rect);\n"
-    "    v_src = vec4(a_info.z >= 6u ? a_src.xy : a_src.xy - a_dst.xy, a_src.z, a_info.w);\n"
+    "    v_src = vec4(a_info.z >= 6u && a_info.z <= 8u ? a_src.xy : a_src.xy - a_dst.xy, a_src.z, a_info.w);\n"
     "    v_info = vec4(a_info.xyz, 0.0);\n"
     "    v_color = a_color;\n"
     "}\n";
@@ -154,6 +158,7 @@ static const char *const fs_src =
     "uniform highp sampler2D u_src;\n"
     "uniform vec3 u_levels;\n"
     "uniform ivec2 u_origin;\n"
+    "uniform highp uvec4 u_cells[32];\n"
     "in vec4 v_rect;\n"
     "in vec4 v_src;\n"
     "in vec4 v_info;\n"
@@ -182,6 +187,15 @@ static const char *const fs_src =
     "    return x >= rect.x && x < rect.z ? c : 0;\n"
     "}\n"
     "int bolden(int l, int m, int r) { return (flags & 2) == 0 || r > m ? m : max(m, l); }\n"
+    "int line_cov(int x, int y) {\n"
+    "    int w = rect.z, shape = flags >> 4;\n"
+    "    x = x % w;\n"
+    "    if (shape == 0) return 255;\n"
+    "    if (shape == 1) return y == 0 || y == rect.w - 1 ? 255 : 0;\n"
+    "    if (shape == 4) return ((x / (w / 3 + 1)) & 1) == 0 ? 255 : 0;\n"
+    "    int i = y * w + x, k = (shape == 2 ? 0 : 64) + (i >> 2);\n"
+    "    return int((u_cells[k >> 2][k & 3] >> uint(8 * (i & 3))) & 255u);\n"
+    "}\n"
     "void main() {\n"
     "    ivec4 s4 = ivec4(floor(v_src + 0.5));\n"
     "    ivec3 info = ivec3(floor(v_info.xyz + 0.5));\n"
@@ -205,6 +219,10 @@ static const char *const fs_src =
     "        int q = s.x - k, i0 = masked(q - 2, s.y), i1 = masked(q - 1, s.y), i2 = masked(q, s.y);\n"
     "        int i3 = masked(q + 1, s.y);\n"
     "        int c = (bolden(i1, i2, i3) * (256 - f) + bolden(i0, i1, i2) * f + 128) >> 8;\n"
+    "        if ((flags & 1) != 0) c = (c + 1) >> 1;\n"
+    "        o = vec4(v_color.rgb, float(c) / 255.0);\n"
+    "    } else if (mode == 9) {\n"
+    "        int c = line_cov(s.x, s.y);\n"
     "        if ((flags & 1) != 0) c = (c + 1) >> 1;\n"
     "        o = vec4(v_color.rgb, float(c) / 255.0);\n"
     "    } else if (mode == 3) {\n"
@@ -640,6 +658,22 @@ static void put_rect(int16_t out[4], shr_rect r) {
     out[0] = (int16_t)r.x0, out[1] = (int16_t)r.y0, out[2] = (int16_t)r.x1, out[3] = (int16_t)r.y1;
 }
 
+/* A CURLY or DOTTED LINE's cell into u_cells, after the instances drawing with the cell it replaces. */
+static void line_cell(gl_drv *g, const shr_draw_cmd *c) {
+    uint32_t shape = c->flags >> SHR_LINE_SHAPE_SHIFT, k = shape == SHR_LINE_DOTTED;
+    uint32_t key = (uint32_t)c->src_rect.x1 << 8 | (uint32_t)c->src_rect.y1;
+    if ((shape != SHR_LINE_CURLY && shape != SHR_LINE_DOTTED) || g->cell_key[k] == key) return;
+    uint8_t cell[4 * CELL_WORDS] = {0};
+    uint32_t words[CELL_WORDS];
+    shr__raster_line_coverage(cell, shape, c->src_rect.x1, c->src_rect.y1);
+    for (int i = 0; i < CELL_WORDS; i++)
+        words[i] = cell[4 * i] | (uint32_t)cell[4 * i + 1] << 8 | (uint32_t)cell[4 * i + 2] << 16 |
+                   (uint32_t)cell[4 * i + 3] << 24;
+    flush(g);
+    glUniform4uiv(g->cells[k], CELL_WORDS / 4, words);
+    g->cell_key[k] = key;
+}
+
 /* Instances carry the part of `dst` inside `clip` and sources moved along with its corner. */
 static void draw(gl_drv *g, const run *x, const shr_draw_cmd *c, shr_rect clip) {
     shr_rect d = shr__rect_intersect(c->dst, clip);
@@ -649,7 +683,7 @@ static void draw(gl_drv *g, const run *x, const shr_draw_cmd *c, shr_rect clip) 
     shr_point m = {d.x0 - c->dst.x0, d.y0 - c->dst.y0};
     put_rect(v.dst, d);
     put_rect(v.clip, clip);
-    if (c->kind == SHR_CMD_FILL || c->kind == SHR_CMD_GLYPH)
+    if (c->kind == SHR_CMD_FILL || c->kind == SHR_CMD_GLYPH || c->kind == SHR_CMD_LINE)
         v.rgba[0] = (uint8_t)(c->color >> 16), v.rgba[1] = (uint8_t)(c->color >> 8), v.rgba[2] = (uint8_t)c->color;
     if (c->kind == SHR_CMD_FILL) {
         v.mode = MODE_FILL;
@@ -666,6 +700,11 @@ static void draw(gl_drv *g, const run *x, const shr_draw_cmd *c, shr_rect clip) 
         v.unit = unit_of(g, s->c), v.layer = (uint8_t)s->layer;
         v.mode = c->kind == SHR_CMD_IMAGE ? MODE_IMAGE : c->flags & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC) ? MODE_SYNTH : MODE_GLYPH;
         v.flags = (uint8_t)((c->flags & 7) | (g->bufs[c->buffer - 1].format == SHR_FORMAT_A4 ? FLAG_A4 : 0));
+    } else if (c->kind == SHR_CMD_LINE) {
+        line_cell(g, c);
+        put_rect(v.rect, c->src_rect);
+        v.src[0] = (int16_t)(c->src_origin.x + m.x), v.src[1] = (int16_t)(c->src_origin.y + m.y);
+        v.mode = MODE_LINE, v.flags = (uint8_t)((c->flags & SHR_GLYPH_DIM) | (c->flags >> SHR_LINE_SHAPE_SHIFT) << 4);
     } else if (c->kind == SHR_CMD_KEEP_DRAW) {
         atlas *a = &g->atlas[tex_kind(x->dst->format)];
         uint32_t layer;
@@ -853,6 +892,7 @@ static void setup(gl_drv *g) {
     g->scale = glGetUniformLocation(g->prog, "u_scale");
     g->origin = glGetUniformLocation(g->prog, "u_origin");
     g->levels = glGetUniformLocation(g->prog, "u_levels");
+    g->cells[0] = glGetUniformLocation(g->prog, "u_cells[0]"), g->cells[1] = glGetUniformLocation(g->prog, "u_cells[16]");
     static const GLint units[UNITS] = {0, 1, 2, 3, 4, 5, 6, 7};
     glUniform1iv(glGetUniformLocation(g->prog, "u_buf"), UNITS, units);
     glUniform1i(glGetUniformLocation(g->prog, "u_src"), SRC_UNIT);

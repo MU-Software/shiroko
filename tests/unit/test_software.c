@@ -1828,13 +1828,15 @@ TEST copier_trims_keep_draws(void) {
             for (int d = 0; d < 2; d++) ASSERT_EQ_LL(shr_software_driver_destroy(&drv[d]), SHR_OK);
         }
     }
-    /* A group of no rows stores no pixels, so nothing at its edges is read (a 128-byte slot, 48 columns). */
+    /* A group of no rows or no columns stores no pixels, so nothing at its edges is read (a 128-byte slot, 48 columns). */
     late_copier l = {0};
     const shr_software_copier lc = {.user = &l, .copy = late_copy, .wait = late_wait, .copy_trim = late_trim};
     shr_framebuffer_driver drv[2];
     for (int d = 0; d < 2; d++) ASSERT_EQ_LL(shr_software_driver_create(NULL, 128, 1, NBUF, &drv[d]), SHR_OK);
     ASSERT_EQ_LL(shr_software_driver_set_copier(&drv[1], &lc), SHR_OK);
     shr_draw_cmd empty[2] = {kbegin(1, (shr_rect){0, 2, 48, 2}), kend()};
+    trim_run(drv, &l, px, 0, FMTS[0], empty, 2, &fails);
+    empty[0] = kbegin(1, (shr_rect){5, 0, 5, 2});
     trim_run(drv, &l, px, 0, FMTS[0], empty, 2, &fails);
     for (int d = 0; d < 2; d++) ASSERT_EQ_LL(shr_software_driver_destroy(&drv[d]), SHR_OK);
     ASSERT(!fails && !l.bad);
@@ -1914,6 +1916,146 @@ TEST glyphs_on_fills_match_blending(void) {
                         ASSERT(drawn_in(&so, &sr, &sn, clip));
                     }
     ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
+    PASS();
+}
+
+/* ---- LINE ---- */
+
+static shr_draw_cmd line(shr_rect dst, uint32_t shape, int32_t w, int32_t h, shr_point origin, shr_color color) {
+    shr_draw_cmd c = cmd(SHR_CMD_LINE, dst);
+    c.flags = (uint16_t)(shape << SHR_LINE_SHAPE_SHIFT), c.src_rect = (shr_rect){0, 0, w, h}, c.src_origin = origin;
+    c.color = color;
+    return c;
+}
+
+/* The CURLY and DOTTED cells of the 8 x 16 underline band in A4 levels, as the font tools drew them before. */
+TEST line_cells_follow_the_sampled_shapes(void) {
+    static const uint8_t curly[24] = {0, 0, 8, 14, 14, 8, 0, 0, 2, 11, 11, 2, 2, 11, 11, 2, 14, 8, 0, 0, 0, 0, 8, 14};
+    static const uint8_t dotted[24] = {0, 2, 0, 1, 1, 0, 2, 0, 5, 15, 0, 9, 9, 0, 15, 5, 0, 2, 0, 1, 1, 0, 2, 0};
+    uint8_t cell[24];
+    shr__raster_line_coverage(cell, SHR_LINE_CURLY, 8, 3);
+    for (int i = 0; i < 24; i++) ASSERT_EQ_LL(cell[i], 17 * curly[i]);
+    shr__raster_line_coverage(cell, SHR_LINE_DOTTED, 8, 3);
+    for (int i = 0; i < 24; i++) ASSERT_EQ_LL(cell[i], 17 * dotted[i]);
+    shr__raster_line_coverage(cell, SHR_LINE_DASHED, 8, 1);
+    for (int i = 0; i < 8; i++) ASSERT_EQ_LL(cell[i], i < 3 || i > 5 ? 255 : 0);
+    shr__raster_line_coverage(cell, SHR_LINE_DOUBLE, 8, 3);
+    for (int i = 0; i < 24; i++) ASSERT_EQ_LL(cell[i], i / 8 == 1 ? 0 : 255);
+    shr__raster_line_coverage(cell, SHR_LINE_SINGLE, 5, 2);
+    for (int i = 0; i < 10; i++) ASSERT_EQ_LL(cell[i], 255);
+    PASS();
+}
+
+/* A LINE draws what an A8 GLYPH of its cell repeated from the same phase draws: rows wider than the raster's runs,
+ * from an odd column, DIM or not, stateless and through the driver's kept cells (two cell sizes in turn). */
+TEST line_equals_the_glyph_of_its_pattern(void) {
+    static const int32_t cells[][2] = {{8, 3}, {8, 1}, {7, 2}, {13, 5}, {32, 8}, {1, 1}, {5, 4}, {8, 3}};
+    enum { W = 301, H = 10, X0 = 3, X1 = W - 2, N = X1 - X0 };
+    static uint8_t a[W * H * 4], b[W * H * 4], d[W * H * 4], cov[N * 8];
+    shr_framebuffer_driver drv;
+    ASSERT_EQ_LL(shr_software_driver_create(NULL, 0, 0, 1, &drv), SHR_OK);
+    for (int fi = 0; fi < 2; fi++) {
+        shr_surface sa = packed(a, FMTS[fi], W, H), sb = packed(b, FMTS[fi], W, H), sd = packed(d, FMTS[fi], W, H);
+        for (size_t ci = 0; ci < sizeof(cells) / sizeof(cells[0]); ci++)
+            for (uint32_t shape = SHR_LINE_SINGLE; shape <= SHR_LINE_DASHED; shape++)
+                for (uint32_t dim = 0; dim < 2; dim++) {
+                    int32_t cw = cells[ci][0], ch = cells[ci][1], oy = ch > 2, rows = ch - oy;
+                    int32_t phase = (int32_t)(ci * 5 + shape) % cw;
+                    uint8_t cell[SHR_LINE_MAX_PERIOD * SHR_LINE_MAX_BAND];
+                    shr__raster_line_coverage(cell, shape, cw, ch);
+                    for (int32_t y = 0; y < rows; y++)
+                        for (int32_t x = 0; x < N; x++) cov[y * N + x] = cell[(oy + y) * cw + (phase + x) % cw];
+                    coverage_noise(a, sizeof(a));
+                    memcpy(b, a, sizeof(a)), memcpy(d, a, sizeof(a));
+                    shr_rect r = {X0, 1, X1, 1 + rows};
+                    shr_color color = SHR_RGB(rnd(), rnd(), rnd());
+                    shr_draw_cmd l = line(r, shape, cw, ch, (shr_point){phase, oy}, color);
+                    shr_draw_cmd g = glyph(r, color, (shr_image){cov, N, rows, N, (size_t)(N * rows), SHR_FORMAT_A8,
+                                                                 SHR_MEMORY_CPU},
+                                           (shr_point){0, 0});
+                    l.flags |= (uint16_t)dim, g.flags = (uint16_t)dim;
+                    ASSERT_EQ_LL(exec(&sa, &l, 1), SHR_OK);
+                    ASSERT_EQ_LL(exec(&sb, &g, 1), SHR_OK);
+                    ASSERT_MEM_EQ(a, b, sizeof(a));
+                    ASSERT_EQ_LL(drv.execute(drv.user, &sd, &l, 1, 1), SHR_OK);
+                    ASSERT_MEM_EQ(a, d, sizeof(a));
+                }
+    }
+    ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
+    PASS();
+}
+
+/* A SINGLE line draws as a FILL, DIM too; a line drawn in pieces, cut along x and across its band, equals one drawn
+ * whole, in a keep group too. */
+TEST line_pieces_equal_the_whole(void) {
+    enum { W = 37, H = 5 };
+    for (int i = 0; i < 2; i++) {
+        uint8_t a[W * H * 4], b[W * H * 4];
+        shr_surface sa = packed(a, FMTS[i], W, H), sb = packed(b, FMTS[i], W, H);
+        for (int dim = 0; dim < 2; dim++) {
+            memset(a, 0x5A, sizeof(a)), memset(b, 0x5A, sizeof(b));
+            shr_draw_cmd l = line((shr_rect){3, 1, 30, 3}, SHR_LINE_SINGLE, 8, 2, (shr_point){5, 0}, SHR_RGB(200, 10, 90));
+            shr_draw_cmd f = fill((shr_rect){3, 1, 30, 3}, SHR_RGB(200, 10, 90));
+            l.flags |= (uint16_t)dim, f.flags = (uint16_t)dim;
+            ASSERT_EQ_LL(exec(&sa, &l, 1), SHR_OK);
+            ASSERT_EQ_LL(exec(&sb, &f, 1), SHR_OK);
+            ASSERT_MEM_EQ(a, b, sizeof(a));
+        }
+        shr_framebuffer_driver drv;
+        ASSERT_EQ_LL(shr_software_driver_create(NULL, 1024, 1, 1, &drv), SHR_OK);
+        for (uint32_t shape = SHR_LINE_SINGLE; shape <= SHR_LINE_DASHED; shape++)
+            for (int32_t cut = 1; cut < 20; cut += 3) {
+                memset(a, 0x5A, sizeof(a)), memset(b, 0x5A, sizeof(b));
+                shr_draw_cmd whole = line((shr_rect){2, 1, 33, 4}, shape, 8, 3, (shr_point){3, 0}, SHR_RGB(250, 200, 20));
+                shr_draw_cmd parts[2] = {whole, whole};
+                parts[0].dst.x1 = 2 + cut, parts[1].dst.x0 = 2 + cut, parts[1].src_origin.x = (3 + cut) % 8;
+                parts[1].dst.y0 = 2, parts[1].src_origin.y = 1;
+                shr_draw_cmd top = whole;
+                top.dst.x0 = 2 + cut, top.dst.y1 = 2, top.src_origin.x = (3 + cut) % 8;
+                ASSERT_EQ_LL(exec(&sa, &whole, 1), SHR_OK);
+                ASSERT_EQ_LL(drv.execute(drv.user, &sb, parts, 2, 1), SHR_OK);
+                ASSERT_EQ_LL(drv.execute(drv.user, &sb, &top, 1, 1), SHR_OK);
+                shr_draw_cmd none = whole;
+                none.dst.x1 = none.dst.x0;
+                ASSERT_EQ_LL(drv.execute(drv.user, &sb, &none, 1, 1), SHR_OK);
+                ASSERT_MEM_EQ(a, b, sizeof(a));
+                shr_rect k = {0, 0, W, H};
+                shr_draw_cmd grp[5] = {kbegin(1, k), fill(k, SHR_RGB(1, 2, 3)), whole, kend(), kdraw(1, k, (shr_point){0, 0})};
+                ASSERT_EQ_LL(exec(&sa, &grp[1], 2), SHR_OK);
+                ASSERT_EQ_LL(drv.execute(drv.user, &sb, grp, 5, 1), SHR_OK);
+                ASSERT_MEM_EQ(a, b, sizeof(a));
+            }
+        ASSERT_EQ_LL(shr_software_driver_destroy(&drv), SHR_OK);
+    }
+    PASS();
+}
+
+TEST line_rejects_what_the_rules_leave_out(void) {
+    uint8_t px[16 * 8 * 2] = {0};
+    shr_surface s = packed(px, SHR_FORMAT_RGB565, 16, 8);
+    shr_draw_cmd ok = line((shr_rect){0, 0, 16, 3}, SHR_LINE_CURLY, 8, 3, (shr_point){7, 0}, 0);
+    ASSERT_EQ_LL(exec(&s, &ok, 1), SHR_OK);
+    shr_draw_cmd edge = line((shr_rect){0, 7, 16, 8}, SHR_LINE_DOTTED, SHR_LINE_MAX_PERIOD, SHR_LINE_MAX_BAND,
+                             (shr_point){SHR_LINE_MAX_PERIOD - 1, SHR_LINE_MAX_BAND - 1}, 0);
+    edge.flags |= SHR_GLYPH_DIM;
+    ASSERT_EQ_LL(exec(&s, &edge, 1), SHR_OK);
+    shr_draw_cmd bad[14];
+    for (int i = 0; i < 14; i++) bad[i] = ok;
+    bad[0].flags = (uint16_t)((SHR_LINE_DASHED + 1) << SHR_LINE_SHAPE_SHIFT);
+    bad[1].flags |= SHR_GLYPH_BOLD;
+    bad[2].src_rect.x0 = 1;
+    bad[3].src_rect.x1 = 0;
+    bad[4].src_rect.x1 = SHR_LINE_MAX_PERIOD + 1;
+    bad[5].src_rect.y1 = SHR_LINE_MAX_BAND + 1;
+    bad[6].src_origin.x = 8;
+    bad[7].src_origin.y = 1; /* three rows from row 1 of a three-row cell */
+    bad[8].dst.x1 = 17;
+    bad[9].src_origin.x = -1;
+    bad[10].src_rect.y0 = 1;
+    bad[11].flags |= 1u << 15;
+    bad[12].src_rect.y1 = 0, bad[12].dst.y1 = 0;
+    bad[13].src_origin.y = -1;
+    for (int i = 0; i < 14; i++) ASSERT_EQ_LL(exec(&s, &bad[i], 1), SHR_E_INVALID_ARG);
     PASS();
 }
 
@@ -2609,6 +2751,10 @@ int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(encoding_anchors);
     RUN_TEST(fill_is_opaque_and_respects_stride);
+    RUN_TEST(line_cells_follow_the_sampled_shapes);
+    RUN_TEST(line_equals_the_glyph_of_its_pattern);
+    RUN_TEST(line_pieces_equal_the_whole);
+    RUN_TEST(line_rejects_what_the_rules_leave_out);
     RUN_TEST(fill_rows_of_any_width_and_alignment);
     RUN_TEST(fill_dim_blends_at_half_strength);
     RUN_TEST(glyph_a8_blends_every_coverage);

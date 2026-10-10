@@ -122,6 +122,7 @@ typedef enum shr__lcmd_kind {
     SHR__LCMD_FILL = 1,
     SHR__LCMD_GLYPH,
     SHR__LCMD_IMAGE,
+    SHR__LCMD_LINE, /* row groups only */
     SHR__LCMD_CACHE_BEGIN,
     SHR__LCMD_CACHE_END
 } shr__lcmd_kind;
@@ -161,7 +162,8 @@ typedef struct shr__lcmd {
 } shr__lcmd;
 
 /* A row command: the compact form of a layer command that row groups keep. x in cells, y in pixels of the group.
- * GLYPH: `id` of the group's resource anchored at (x0, y0) of `dst`, `bg` with ON_FILL; FILL and CACHE_END: id and bg 0;
+ * GLYPH: `id` of the group's resource anchored at (x0, y0) of `dst`, `bg` with ON_FILL; LINE: `id` its SHR_LINE_* shape
+ * over the pixel rows of `dst`, the pattern a cell wide from x0, bg 0; FILL and CACHE_END: id and bg 0;
  * CACHE_END: all 0 but the kind. A row's cache pair, if any, is its first and last command, its key the group's. */
 typedef struct shr__rcmd {
     uint16_t x0, x1;

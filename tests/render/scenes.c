@@ -15,11 +15,19 @@
 #define DARK SHR_RGB(0x28, 0x2A, 0x36)
 #define N(a) (sizeof(a) / sizeof((a)[0]))
 #define STYLE(fg, bg, flags) ((shr_text_style){(fg), (bg), (flags)})
+#define LINE(kind, color) ((shr_text_line){0, 0, (kind), SHR_LINE_SINGLE, 0, (color)})
+#define UNDER(col, cols, color) ((shr_text_line){(col), (cols), SHR_LINE_UNDER, SHR_LINE_SINGLE, 0, (color)})
 
 static const shr_text_style plain = {FG, 0, 0};
 
 static shr_rect cells(int32_t col, int32_t row, int32_t cols, int32_t rows) {
     return (shr_rect){col * CW, row * CH, (col + cols) * CW, (row + rows) * CH};
+}
+
+/* `line` under all of `utf8` as stage_text places it from (row, col) of a grid `cols` wide. */
+static void text_line(stage *s, shr_lyr *l, int32_t row, int32_t col, int32_t cols, const char *utf8, shr_text_line line) {
+    shr_text_line out[64];
+    stage_lines(s, l, row, out, stage_text_lines(utf8, 0, strlen(utf8), row, col, cols, 0, row, line, out, 0));
 }
 
 /* ===== The scene of the original golden test, kept pixel for pixel ===== */
@@ -65,30 +73,38 @@ static shr_status overview(stage *s) {
                        "\U0001F1F0\U0001F1F7 italic 漢字 end";
     shr_style_run runs[2] = {{0, 1, {PINK, 0, SHR_STYLE_BOLD}}, {0, 6, {GREEN, 0, SHR_STYLE_ITALIC}}};
     runs[1].byte_start = (size_t)(strstr(body, "italic") - body), runs[1].byte_end = runs[1].byte_start + 6;
+    int32_t rows = (GH - 3 * CH) / CH, cols = (GW - 80) / CW;
     shr_lyr *text = stage_grid(s, 1, (shr_rect){0, CH, GW - 80, GH - 2 * CH}, NULL);
     if (text) {
         shr_error_info err;
-        stage_ok(s, shr_pl_lyr_tilemap_set_text(text, 0, 0, body, strlen(body), STYLE(FG, 0, SHR_STYLE_UNDERLINE), runs,
-                                                2, SHR_TEXT_WRAP, &err),
+        stage_ok(s, shr_pl_lyr_tilemap_set_text(text, 0, 0, body, strlen(body), plain, runs, 2, SHR_TEXT_WRAP, &err),
                  "set_text");
-        if ((GH - 2 * CH) / CH > 4 && (GW - 80) / CW >= 22) /* other cell sizes: the grid may be smaller */
-            stage_ok(s, shr_pl_lyr_tilemap_clear(text, 4, 16, 1, 6, STYLE(0, SEL, SHR_STYLE_BG)), "clear");
+        for (int32_t r = 0; r < rows; r++) { /* underlined but the runs */
+            shr_text_line ul[32], line = LINE(SHR_LINE_UNDER, FG);
+            size_t n = stage_text_lines(body, 1, runs[1].byte_start, 0, 0, cols, SHR_TEXT_WRAP, r, line, ul, 0);
+            n = stage_text_lines(body, runs[1].byte_end, strlen(body), 0, 0, cols, SHR_TEXT_WRAP, r, line, ul, n);
+            stage_lines(s, text, r, ul, n);
+        }
+        if ((GH - 2 * CH) / CH > 4 && cols >= 22) /* other cell sizes: the grid may be smaller */
+            stage_ok(s, shr_pl_lyr_tilemap_clear(text, 4, 16, 1, 6, STYLE(0, SEL, 0)), "clear");
     }
 
     shr_lyr *prompt = stage_grid(s, 1, (shr_rect){0, GH - CH, GW, GH}, NULL);
-    stage_cell(s, prompt, 0, 0, "$", 1, STYLE(FG, SEL, SHR_STYLE_BG));
+    stage_cell(s, prompt, 0, 0, "$", 1, STYLE(FG, SEL, 0));
     stage_cell(s, prompt, 0, 1, "", 1, STYLE(SEL, 0, 0));
-    stage_cell(s, prompt, 0, 2, "", 1, STYLE(0, FG, SHR_STYLE_BG));
-    stage_cell(s, prompt, 0, 4, "d", 1, STYLE(FG, 0, SHR_STYLE_DIM | SHR_STYLE_STRIKE));
+    stage_cell(s, prompt, 0, 2, "", 1, STYLE(0, FG, 0));
+    stage_cell(s, prompt, 0, 4, "d", 1, STYLE(DIM(FG), 0, 0));
     stage_cell(s, prompt, 0, 5, "", 1, STYLE(ORANGE, 0, 0));
-    stage_cell(s, prompt, 0, 7, "각", 2, STYLE(FG, 0, SHR_STYLE_UNDERLINE));
+    stage_cell(s, prompt, 0, 7, "각", 2, plain);
     stage_cell(s, prompt, 0, 9, "\U0001F600", 2, plain);
     stage_cell(s, prompt, 0, 11, "\U0001F469‍\U0001F4BB", 2, plain);
-    stage_cell(s, prompt, 0, 13, "x", 1, STYLE(FG, PURPLE, SHR_STYLE_BG | SHR_STYLE_CONCEAL));
+    stage_cell(s, prompt, 0, 13, "x", 1, STYLE(HIDDEN(FG), PURPLE, 0));
     stage_cell(s, prompt, 0, 14, "b", 1, STYLE(FG, 0, SHR_STYLE_BLINK | SHR_STYLE_BOLD));
     stage_cell(s, prompt, 0, 15, "█", 1, STYLE(GREEN, 0, 0));
     stage_cell(s, prompt, 0, 16, "─", 1, plain);
     stage_cell(s, prompt, 0, 17, "�", 1, plain);
+    shr_text_line pl[2] = {{4, 1, SHR_LINE_STRIKE, SHR_LINE_SINGLE, 0, DIM(FG)}, UNDER(7, 2, FG)};
+    stage_lines(s, prompt, 0, pl, 2);
 
     uint8_t rgba[24 * 24 * 4];
     for (int y = 0; y < 24; y++)
@@ -115,13 +131,15 @@ static shr_status overview(stage *s) {
 
 /* Rows set_text lays out the same way at WIDE_COLS and WIDE_COLS - 1 columns. */
 static void wide_common(stage *s, shr_lyr *l) {
-    shr_text_style cut = STYLE(FG, PURPLE, SHR_STYLE_BG);
+    shr_text_style cut = STYLE(FG, PURPLE, 0);
     stage_text(s, l, 0, 0, "abcdefghijklmno가", cut, 0);
     stage_text(s, l, 1, 0, "abcdefghijklmno\U0001F600", cut, 0);
-    stage_text(s, l, 2, 0, "abcdefghijklmno가나", STYLE(FG, SEL, SHR_STYLE_BG), SHR_TEXT_WRAP);
-    stage_cell(s, l, 6, 0, "漢", 2, STYLE(FG, 0, SHR_STYLE_UNDERLINE));
-    stage_cell(s, l, 6, 1, "x", 1, STYLE(YELLOW, 0, 0)); /* overlaps the wide cell, which is cleared */
-    stage_text(s, l, 7, 1, "漢字漢字漢字漢字", STYLE(FG, PURPLE, SHR_STYLE_BG), 0);
+    stage_text(s, l, 2, 0, "abcdefghijklmno가나", STYLE(FG, SEL, 0), SHR_TEXT_WRAP);
+    stage_cell(s, l, 6, 0, "漢", 2, plain);
+    stage_lines(s, l, 6, &UNDER(0, 2, FG), 1);
+    stage_cell(s, l, 6, 1, "x", 1, STYLE(YELLOW, 0, 0)); /* overlaps the wide cell, which is cleared, and its line */
+    stage_lines(s, l, 6, NULL, 0);
+    stage_text(s, l, 7, 1, "漢字漢字漢字漢字", STYLE(FG, PURPLE, 0), 0);
 }
 
 static shr_lyr *wide_grid(stage *s, int32_t cols) {
@@ -137,7 +155,7 @@ static shr_lyr *wide_grid(stage *s, int32_t cols) {
 static shr_status wide_edge(stage *s) {
     shr_lyr *l = wide_grid(s, WIDE_COLS);
     wide_common(s, l);
-    stage_cell(s, l, 4, WIDE_COLS - 2, "가", 2, STYLE(FG, SEL, SHR_STYLE_BG));
+    stage_cell(s, l, 4, WIDE_COLS - 2, "가", 2, STYLE(FG, SEL, 0));
     stage_cell(s, l, 5, WIDE_COLS - 2, "\U0001F469‍\U0001F4BB", 2, plain);
     if (l) {
         shr_text_style st = plain;
@@ -202,7 +220,7 @@ static shr_status emoji_sequences(stage *s) {
     shr_lyr *l = stage_grid(s, 1, cells(1, 1, cols, (int32_t)N(rows) + 2), NULL);
     for (size_t i = 0; i < N(rows); i++) stage_text(s, l, (int32_t)i, 0, rows[i], plain, 0);
     int32_t r = (int32_t)N(rows);
-    stage_text(s, l, r, cols - 5, "edge\U0001F600", STYLE(FG, SEL, SHR_STYLE_BG), 0);
+    stage_text(s, l, r, cols - 5, "edge\U0001F600", STYLE(FG, SEL, 0), 0);
     stage_cell(s, l, r + 1, cols - 2, "\U0001F1F0\U0001F1F7", 2, plain);
     stage_cell(s, l, r + 1, cols - 4, "#️⃣", 2, plain);
     stage_cell(s, l, r + 1, cols - 6, "☺︎", 1, plain);
@@ -213,36 +231,45 @@ static shr_status emoji_sequences(stage *s) {
 /* ===== Styles; the blink row shows the phase the scene's clock is in ===== */
 
 static shr_status styles(stage *s) {
+    enum { UL = 1, ST = 2 }; /* the lines over the sample; concealed text has none */
     static const struct {
         const char *label;
-        uint32_t flags;
+        uint32_t alpha, flags, lines;
+        bool bg;
     } rows[] = {
-        {"plain", 0},
-        {"bold", SHR_STYLE_BOLD},
-        {"italic", SHR_STYLE_ITALIC},
-        {"bold italic", SHR_STYLE_BOLD | SHR_STYLE_ITALIC},
-        {"dim", SHR_STYLE_DIM},
-        {"underline", SHR_STYLE_UNDERLINE},
-        {"strike", SHR_STYLE_STRIKE},
-        {"under+strike", SHR_STYLE_UNDERLINE | SHR_STYLE_STRIKE},
-        {"blink", SHR_STYLE_BLINK},
-        {"blink+bg+ul", SHR_STYLE_BLINK | SHR_STYLE_BG | SHR_STYLE_UNDERLINE},
-        {"conceal", SHR_STYLE_CONCEAL},
-        {"conceal+bg+ul", SHR_STYLE_CONCEAL | SHR_STYLE_BG | SHR_STYLE_UNDERLINE},
-        {"bg", SHR_STYLE_BG},
-        {"dim+bg", SHR_STYLE_DIM | SHR_STYLE_BG},
-        {"all", SHR_STYLE_KNOWN_FLAGS},
+        {"plain", 255, 0, 0, false},
+        {"bold", 255, SHR_STYLE_BOLD, 0, false},
+        {"italic", 255, SHR_STYLE_ITALIC, 0, false},
+        {"bold italic", 255, SHR_STYLE_BOLD | SHR_STYLE_ITALIC, 0, false},
+        {"dim", 128, 0, 0, false},
+        {"underline", 255, 0, UL, false},
+        {"strike", 255, 0, ST, false},
+        {"under+strike", 255, 0, UL | ST, false},
+        {"blink", 255, SHR_STYLE_BLINK, 0, false},
+        {"blink+bg+ul", 255, SHR_STYLE_BLINK, UL, true},
+        {"conceal", 0, 0, 0, false},
+        {"conceal+bg+ul", 0, 0, 0, true},
+        {"bg", 255, 0, 0, true},
+        {"dim+bg", 128, 0, 0, true},
+        {"all", 0, SHR_STYLE_KNOWN_FLAGS, 0, true},
     };
     const char *sample = "Agjy가漢\U0001F600─█é";
     shr_lyr *l = stage_grid(s, 1, cells(1, 1, 34, (int32_t)N(rows) + 1), NULL);
     for (size_t i = 0; i < N(rows); i++) {
         int32_t r = (int32_t)i;
+        shr_text_style st = STYLE(HIDDEN(i % 2 ? CYAN : FG) | rows[i].alpha << 24, rows[i].bg ? SEL : 0, rows[i].flags);
         stage_text(s, l, r, 0, rows[i].label, STYLE(EDGE, 0, 0), 0);
-        stage_text(s, l, r, 14, sample, STYLE(i % 2 ? CYAN : FG, SEL, rows[i].flags), 0);
+        stage_text(s, l, r, 14, sample, st, 0);
+        shr_text_line line = LINE(SHR_LINE_UNDER, st.fg), out[4];
+        line.flags = st.flags & SHR_STYLE_BLINK ? SHR_TEXT_LINE_BLINK : 0;
+        size_t n = rows[i].lines & UL ? stage_text_lines(sample, 0, strlen(sample), r, 14, 34, 0, r, line, out, 0) : 0;
+        line.kind = SHR_LINE_STRIKE;
+        n = rows[i].lines & ST ? stage_text_lines(sample, 0, strlen(sample), r, 14, 34, 0, r, line, out, n) : n;
+        if (n) stage_lines(s, l, r, out, n);
     }
     int32_t r = (int32_t)N(rows);
     stage_text(s, l, r, 0, "fg == bg", STYLE(EDGE, 0, 0), 0);
-    stage_text(s, l, r, 14, sample, STYLE(PINK, PINK, SHR_STYLE_BG), 0);
+    stage_text(s, l, r, 14, sample, STYLE(PINK, PINK, 0), 0);
     return s->st;
 }
 
@@ -284,9 +311,10 @@ static shr_status tilemap_over_image(stage *s) {
     for (int i = 0; i < 2; i++) {
         stage_text(s, both[i], 0, 0, i ? "transparent" : "background", STYLE(YELLOW, 0, SHR_STYLE_BOLD), 0);
         stage_text(s, both[i], 1, 0, "text 한글 \U0001F600 █▒", plain, 0);
-        stage_text(s, both[i], 2, 2, "bg cells", STYLE(FG, SEL, SHR_STYLE_BG), 0);
-        stage_text(s, both[i], 3, 0, "underline dim", STYLE(FG, 0, SHR_STYLE_UNDERLINE | SHR_STYLE_DIM), 0);
-        stage_cell(s, both[i], 4, 3, "", 4, STYLE(0, PURPLE, SHR_STYLE_BG));
+        stage_text(s, both[i], 2, 2, "bg cells", STYLE(FG, SEL, 0), 0);
+        stage_text(s, both[i], 3, 0, "underline dim", STYLE(DIM(FG), 0, 0), 0);
+        text_line(s, both[i], 3, 0, 18, "underline dim", LINE(SHR_LINE_UNDER, DIM(FG)));
+        stage_cell(s, both[i], 4, 3, "", 4, STYLE(0, PURPLE, 0));
         stage_text(s, both[i], 5, 0, "──┼── ", STYLE(CYAN, 0, 0), 0);
     }
     return s->st;
@@ -294,8 +322,9 @@ static shr_status tilemap_over_image(stage *s) {
 
 static void tm_text(stage *s, shr_lyr *l) {
     stage_text(s, l, 0, 0, "Background 한글 \U0001F600 é", plain, 0);
-    stage_text(s, l, 1, 2, "under█lined", STYLE(PINK, 0, SHR_STYLE_UNDERLINE), 0);
-    stage_text(s, l, 2, 0, "own bg", STYLE(FG, SEL, SHR_STYLE_BG), 0);
+    stage_text(s, l, 1, 2, "under█lined", STYLE(PINK, 0, 0), 0);
+    text_line(s, l, 1, 2, 24, "under█lined", LINE(SHR_LINE_UNDER, PINK));
+    stage_text(s, l, 2, 0, "own bg", STYLE(FG, SEL, 0), 0);
 }
 
 static shr_status tm_background(stage *s) {
@@ -359,8 +388,8 @@ static shr_status layers(stage *s) {
     stage_ok(s, shr_lyr_set_z(moved, -1), "set_z");
 
     shr_lyr *g = stage_grid(s, 6, (shr_rect){-CW, LH - 2 * CH + 4, 20 * CW, LH + 4}, NULL);
-    stage_text(s, g, 0, 0, "-off the left and bottom 가", STYLE(FG, SEL, SHR_STYLE_BG), 0);
-    stage_text(s, g, 1, 0, "-second row is cut", STYLE(FG, SEL, SHR_STYLE_BG), 0);
+    stage_text(s, g, 0, 0, "-off the left and bottom 가", STYLE(FG, SEL, 0), 0);
+    stage_text(s, g, 1, 0, "-second row is cut", STYLE(FG, SEL, 0), 0);
     return s->st;
 }
 
@@ -390,7 +419,7 @@ static shr_status hidden(stage *s) {
     shr_lyr *l = box_layer(s, 9, (shr_rect){10, 10, 100, 60}, RED);
     stage_ok(s, shr_lyr_set_visible(l, false), "set_visible");
     shr_lyr *g = stage_grid(s, 9, cells(1, 1, 8, 2), NULL);
-    stage_text(s, g, 0, 0, "hidden가", STYLE(RED, FG, SHR_STYLE_BG), 0);
+    stage_text(s, g, 0, 0, "hidden가", STYLE(RED, FG, 0), 0);
     stage_ok(s, shr_lyr_set_visible(g, false), "set_visible");
     return s->st;
 }
@@ -483,9 +512,10 @@ static shr_status tm_update_build(stage *s) {
 
 static void tm_changes(stage *s, shr_lyr *l) {
     stage_cell(s, l, 1, 4, "X", 1, STYLE(PINK, 0, SHR_STYLE_BOLD));
-    stage_cell(s, l, 2, 5, "漢", 2, STYLE(FG, SEL, SHR_STYLE_BG)); /* overlaps the second half of a wide cell */
-    stage_text(s, l, 3, 9, "\U0001F469‍\U0001F4BB!", STYLE(GREEN, 0, SHR_STYLE_UNDERLINE), 0);
-    if (l) stage_ok(s, shr_pl_lyr_tilemap_clear(l, 4, 3, 1, 4, STYLE(0, PURPLE, SHR_STYLE_BG)), "clear");
+    stage_cell(s, l, 2, 5, "漢", 2, STYLE(FG, SEL, 0)); /* overlaps the second half of a wide cell */
+    stage_text(s, l, 3, 9, "\U0001F469‍\U0001F4BB!", STYLE(GREEN, 0, 0), 0);
+    text_line(s, l, 3, 9, 26, "\U0001F469‍\U0001F4BB!", LINE(SHR_LINE_UNDER, GREEN));
+    if (l) stage_ok(s, shr_pl_lyr_tilemap_clear(l, 4, 3, 1, 4, STYLE(0, PURPLE, 0)), "clear");
     if (l) stage_ok(s, shr_pl_lyr_tilemap_clear(l, 5, 0, 1, 26, plain), "clear");
 }
 
@@ -530,7 +560,7 @@ static shr_status cleared(stage *s) {
     stage_text(s, l, 1, 0, "gone gone", plain, 0);
     stage_text(s, l, 2, 0, "가나다라", plain, 0);
     if (l) stage_ok(s, shr_pl_lyr_tilemap_clear(l, 1, 0, 1, 12, plain), "clear");
-    if (l) stage_ok(s, shr_pl_lyr_tilemap_clear(l, 2, 3, 1, 2, STYLE(0, PURPLE, SHR_STYLE_BG)), "clear");
+    if (l) stage_ok(s, shr_pl_lyr_tilemap_clear(l, 2, 3, 1, 2, STYLE(0, PURPLE, 0)), "clear");
     return s->st;
 }
 
@@ -538,7 +568,7 @@ static shr_status cleared_ref(stage *s) {
     shr_lyr *l = stage_grid(s, 1, cells(1, 1, 12, 4), NULL);
     stage_text(s, l, 0, 0, "keep", plain, 0);
     stage_cell(s, l, 2, 0, "가", 2, plain);
-    for (int32_t c = 2; c < 6; c++) stage_cell(s, l, 2, c, "", 1, STYLE(0, PURPLE, SHR_STYLE_BG));
+    for (int32_t c = 2; c < 6; c++) stage_cell(s, l, 2, c, "", 1, STYLE(0, PURPLE, 0));
     stage_cell(s, l, 2, 6, "라", 2, plain);
     return s->st;
 }
@@ -547,9 +577,11 @@ static shr_status cleared_ref(stage *s) {
 static shr_status text_layout(stage *s) {
     shr_lyr *l = stage_grid(s, 1, cells(1, 1, 16, 2), NULL);
     const char *t = "A가\U0001F600é 漢\t|";
-    shr_style_run run = {1, 4, {PINK, SEL, SHR_STYLE_BG | SHR_STYLE_UNDERLINE}};
+    shr_style_run run = {1, 4, {PINK, SEL, 0}};
     shr_error_info err;
     if (l) stage_ok(s, shr_pl_lyr_tilemap_set_text(l, 0, 0, t, strlen(t), plain, &run, 1, 0, &err), "set_text");
+    shr_text_line ul[2];
+    stage_lines(s, l, 0, ul, stage_text_lines(t, run.byte_start, run.byte_end, 0, 0, 16, 0, 0, LINE(SHR_LINE_UNDER, PINK), ul, 0));
     stage_text(s, l, 1, 3, "x\U0001F1F0\U0001F1F7#️⃣", plain, 0);
     return s->st;
 }
@@ -557,7 +589,8 @@ static shr_status text_layout(stage *s) {
 static shr_status text_cells(stage *s) {
     shr_lyr *l = stage_grid(s, 1, cells(1, 1, 16, 2), NULL);
     stage_cell(s, l, 0, 0, "A", 1, plain);
-    stage_cell(s, l, 0, 1, "가", 2, STYLE(PINK, SEL, SHR_STYLE_BG | SHR_STYLE_UNDERLINE));
+    stage_cell(s, l, 0, 1, "가", 2, STYLE(PINK, SEL, 0));
+    stage_lines(s, l, 0, &UNDER(1, 2, PINK), 1);
     stage_cell(s, l, 0, 3, "\U0001F600", 2, plain);
     stage_cell(s, l, 0, 5, "é", 1, plain);
     stage_cell(s, l, 0, 6, " ", 1, plain);
@@ -582,8 +615,10 @@ static void scroll_line(stage *s, shr_lyr *l, int32_t row, int line) {
     static const char *const text[] = {"line 0 abc 한글", "line 1 \U0001F600 wide 漢字", "line 2 ─── box ───",
                                        "line 3 é combining", "line 4 tab\there", "line 5 \U0001F469‍\U0001F4BB zwj",
                                        "line 6 0123456789", "line 7 last 끝"};
-    static const uint32_t flags[] = {0, SHR_STYLE_BOLD, SHR_STYLE_UNDERLINE, SHR_STYLE_ITALIC, SHR_STYLE_BG};
-    stage_text(s, l, row, 0, text[line % 8], STYLE(line % 2 ? PINK : FG, SEL, flags[line % 5]), 0);
+    static const uint32_t flags[] = {0, SHR_STYLE_BOLD, 0, SHR_STYLE_ITALIC, 0}; /* 2 underlined, 4 on SEL */
+    shr_color fg = line % 2 ? PINK : FG;
+    stage_text(s, l, row, 0, text[line % 8], STYLE(fg, line % 5 == 4 ? SEL : 0, flags[line % 5]), 0);
+    if (line % 5 == 2) text_line(s, l, row, 0, SC_COLS, text[line % 8], LINE(SHR_LINE_UNDER, fg));
 }
 
 static shr_lyr *scroll_grid(stage *s) {
@@ -614,7 +649,7 @@ static shr_status scroll_build(stage *s) {
     return s->st;
 }
 
-static const shr_text_style scroll_status = {FG, SEL, SHR_STYLE_BG};
+static const shr_text_style scroll_status = {FG, SEL, 0};
 
 /* Up two rows, then the rows between the first and the last down one; the cursor follows its line. */
 static shr_status scroll_update(stage *s) {
@@ -825,7 +860,7 @@ static shr_status sprites(stage *s, size_t range) {
         utf8_put(u, first + i);
         int32_t r0 = (int32_t)(i / 16) * 3, c0 = (int32_t)(i % 16) * 3;
         for (int32_t k = 0; k < 4; k++)
-            stage_cell(s, l, r0 + k / 2, c0 + k % 2, u, 1, STYLE(FG, (k + k / 2) % 2 ? SEL : DARK, SHR_STYLE_BG));
+            stage_cell(s, l, r0 + k / 2, c0 + k % 2, u, 1, STYLE(FG, (k + k / 2) % 2 ? SEL : DARK, 0));
     }
     return s->st;
 }
@@ -980,7 +1015,7 @@ static shr_status grapheme_page(stage *s) {
             shr_style_run runs[64];
             for (size_t k = 0; k < ext.clusters; k++)
                 runs[k] = (shr_style_run){cl[k].byte_offset, cl[k].byte_offset + cl[k].byte_length,
-                                          STYLE(FG, k % 2 ? SEL : EDGE, SHR_STYLE_BG)};
+                                          STYLE(FG, k % 2 ? SEL : EDGE, 0)};
             shr_error_info err;
             stage_ok(s, shr_pl_lyr_tilemap_set_text(l, page_row, col, cases[i].utf8, cases[i].len, plain, runs,
                                                     ext.clusters, 0, &err),
@@ -1076,7 +1111,7 @@ static shr_status utf8_stress(stage *s) {
         snprintf(what, sizeof(what), "%-19s%-17s@%zu", kuhn[i].id, shr_status_name(t), t ? te.byte_offset : 0);
         stage_text(s, l, r, 13, what, STYLE(t == SHR_OK ? GREEN : ORANGE, 0, 0), 0);
         snprintf(what, sizeof(what), "Kuhn %s set_cell", kuhn[i].id);
-        stage_expect(s, shr_pl_lyr_tilemap_set_cell(l, r, 54, kuhn[i].bytes, len, 2, STYLE(FG, SEL, SHR_STYLE_BG)), t,
+        stage_expect(s, shr_pl_lyr_tilemap_set_cell(l, r, 54, kuhn[i].bytes, len, 2, STYLE(FG, SEL, 0)), t,
                      what);
     }
     return s->st;

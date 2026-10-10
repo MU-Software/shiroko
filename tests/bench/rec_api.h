@@ -41,6 +41,8 @@ shr_status rec_shr_pl_lyr_tilemap_set_text(shr_lyr *layer, int32_t row, int32_t 
 shr_status rec_shr_pl_lyr_tilemap_clear(shr_lyr *layer, int32_t row, int32_t col, int32_t rows, int32_t cols,
                                         shr_text_style style);
 shr_status rec_shr_pl_lyr_tilemap_scroll(shr_lyr *layer, int32_t top, int32_t bottom, int32_t n, shr_text_style style);
+shr_status rec_shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_text_line *lines, size_t count,
+                                            shr_error_info *err);
 
 #ifndef REC_API_IMPL
 #define shr_create rec_shr_create
@@ -69,6 +71,7 @@ shr_status rec_shr_pl_lyr_tilemap_scroll(shr_lyr *layer, int32_t top, int32_t bo
 #define shr_pl_lyr_tilemap_set_text rec_shr_pl_lyr_tilemap_set_text
 #define shr_pl_lyr_tilemap_clear rec_shr_pl_lyr_tilemap_clear
 #define shr_pl_lyr_tilemap_scroll rec_shr_pl_lyr_tilemap_scroll
+#define shr_pl_lyr_tilemap_set_lines rec_shr_pl_lyr_tilemap_set_lines
 #endif
 
 #endif

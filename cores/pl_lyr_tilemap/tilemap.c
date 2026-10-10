@@ -6,7 +6,8 @@ _Static_assert((int64_t)SHR_MAX_GRID * SHR_CELL_WIDTH <= INT32_MAX && (int64_t)S
                "grid pixel extent must fit int32");
 _Static_assert(SHR_MAX_GRID <= 1 << 15 && SHR_MAX_SPAN <= 256 && SHR_STYLE_KNOWN_FLAGS <= 0xFF,
                "a row key packs column, span - 1, flags and has_glyph into 32 bits");
-_Static_assert(SHR_MAX_GRID <= UINT16_MAX, "row commands hold columns");
+_Static_assert(SHR_MAX_GRID <= UINT16_MAX, "row commands and lines hold columns");
+_Static_assert(SHR_CELL_WIDTH <= SHR_LINE_MAX_PERIOD && sizeof(shr_text_line) == 12, "line patterns are a cell wide");
 
 enum { CELL_EMPTY = 0, CELL_HEAD, CELL_CONT };
 #define CELL_INLINE 12
@@ -37,6 +38,12 @@ typedef struct shr__placed {
     shr__cell cell;
 } shr__placed;
 
+/* The lines of a row, `cap` entries at `at`. */
+typedef struct shr__lines {
+    shr_text_line *at;
+    uint32_t n, cap;
+} shr__lines;
+
 typedef struct shr__tilemap {
     shr__alloc al;
     shr_lyr *layer;
@@ -46,9 +53,11 @@ typedef struct shr__tilemap {
     bool has_bg, long_text; /* long_text: a cell got text beyond CELL_INLINE */
     shr_color bg;
     shr__cell *cells;
-    uint32_t *line; /* per screen row: its row of `cells`, | DIRTY */
-    shr__vec keys; /* uint64_t, the bytes a row's cache key hashes: two per head */
+    shr__lines *lines; /* per row of `cells` */
+    uint32_t *line; /* per screen row: its row of `cells` and `lines`, | DIRTY */
+    shr__vec keys; /* uint64_t, the bytes a row's cache key hashes: two per head and per line */
     shr__vec placed; /* shr__placed, set_text's cells until the text is valid, kept for the next call */
+    uint8_t band[3][5][2]; /* pixel rows [y0, y1) of the lines by kind and shape */
     shr__memo memo[1024];
 } shr__tilemap;
 
@@ -60,6 +69,8 @@ enum { TILEMAP_KIND = SHR_ALLOC_DESCRIPTOR | SHR_ALLOC_HOT };
 static shr__cell *row_at(const shr__tilemap *t, int32_t r) {
     return &t->cells[(size_t)(t->line[r] & ~DIRTY) * (size_t)t->cols];
 }
+
+static shr__lines *row_lines(const shr__tilemap *t, int32_t r) { return &t->lines[t->line[r] & ~DIRTY]; }
 
 static char *cell_heap(const shr__cell *e) {
     char *p;
@@ -127,6 +138,61 @@ static shr_status cell_make(shr__tilemap *t, const char *utf8, size_t len, uint3
 
 static shr__cell blank(shr_text_style style) { return head(style, 0, 0, 1, false); }
 
+static void lines_free(const shr__alloc *al, shr__lines *l) {
+    shr__free(al, l->at, l->cap * sizeof(*l->at), SHR_ALIGNOF(shr_text_line), SHR_ALLOC_PAYLOAD);
+}
+
+/* Room for n lines, keeping those held: rows keep their room when they empty, and a row that needs more trades with
+ * the smallest empty row that has it, else takes new room in powers of two. */
+static bool lines_room(shr__tilemap *t, shr__lines *l, size_t n) {
+    if (n <= l->cap) return true;
+    shr__lines *e = NULL;
+    for (int32_t r = 0; r < t->rows; r++) {
+        shr__lines *x = &t->lines[r];
+        if (!x->n && x->cap >= n && (!e || x->cap < e->cap)) e = x;
+    }
+    size_t cap = 4;
+    while (cap < n) cap *= 2;
+    shr__lines got = e ? *e : (shr__lines){shr__malloc(&t->al, cap * sizeof(*l->at), SHR_ALIGNOF(shr_text_line),
+                                                       SHR_ALLOC_PAYLOAD), 0, (uint32_t)cap};
+    if (!got.at) return false;
+    if (l->n) memcpy(got.at, l->at, l->n * sizeof(*l->at));
+    got.n = l->n, l->n = 0;
+    if (e)
+        *e = *l;
+    else
+        lines_free(&t->al, l);
+    *l = got;
+    return true;
+}
+
+/* Lines that hold columns on both sides of [c0, c1): cutting it out splits them. */
+static size_t lines_split(const shr__lines *l, int32_t c0, int32_t c1) {
+    size_t n = 0;
+    for (uint32_t i = 0; i < l->n; i++) n += l->at[i].col < c0 && l->at[i].col + l->at[i].cols > c1;
+    return n;
+}
+
+/* Cuts columns [c0, c1) out of the lines, with room for the splits: the lines move to the end of the room and come
+ * back piece by piece, never past one not read yet. */
+static void lines_cut(shr__lines *l, int32_t c0, int32_t c1) {
+    if (!l->n) return;
+    shr_text_line *at = l->at, *src = at + l->cap - l->n;
+    uint32_t n = l->n, w = 0;
+    memmove(src, at, n * sizeof(*src));
+    for (uint32_t i = 0; i < n; i++) {
+        shr_text_line e = src[i], x = e;
+        int32_t a = e.col, b = e.col + e.cols;
+        if (b <= c0 || a >= c1) {
+            at[w++] = e;
+            continue;
+        }
+        if (a < c0) x.cols = (uint16_t)(c0 - a), at[w++] = x;
+        if (b > c1) x = e, x.col = (uint16_t)c1, x.cols = (uint16_t)(b - c1), at[w++] = x;
+    }
+    l->n = w;
+}
+
 /* Clears [*c0, *c1) of row r widened to the wide cells reaching into it. */
 static void clear_cells(shr__tilemap *t, int32_t r, int32_t *c0, int32_t *c1) {
     if (*c0 >= *c1) return;
@@ -168,16 +234,40 @@ static void put(shr__rcmd *c, uint8_t kind, uint32_t flags, int32_t c0, int32_t 
     *c = (shr__rcmd){(uint16_t)c0, (uint16_t)c1, (uint8_t)y0, (uint8_t)y1, kind, (uint8_t)flags, color, 0, 0};
 }
 
-/* One group per row, in row coordinates placed at the row's y: the backgrounds as runs of one colour, then per cell
- * glyph and decorations, which stay inside their cells, so a glyph lies on its cell's background alone. Only rows that
- * opaque backgrounds cover completely get a cache hint, since a cached row replaces what lies under it. The first pass
- * counts the commands, the second writes the runs and the cells' commands into their two parts of the group. */
+/* The band of each kind and shape in the cell: SINGLE and DASHED one row at the line, DOUBLE and DOTTED three around
+ * it, CURLY a wave of amplitude min(w / pi, rows below the baseline - 1) below an underline, around the others; moved
+ * inside the cell. */
+static void line_bands(shr__tilemap *t) {
+    const shr__line_metrics lm = shr__bitmap_font_line_metrics();
+    int32_t amp = SHR_CELL_WIDTH * 113 / 355, below = SHR_CELL_HEIGHT - lm.baseline - 1;
+    amp = amp < below ? amp : below;
+    amp = amp < 1 ? 1 : amp > SHR_LINE_MAX_BAND - 1 ? SHR_LINE_MAX_BAND - 1 : amp;
+    for (int kind = SHR_LINE_UNDER; kind <= SHR_LINE_OVER; kind++)
+        for (int shape = SHR_LINE_SINGLE; shape <= SHR_LINE_DASHED; shape++) {
+            int32_t y = kind == SHR_LINE_UNDER ? lm.underline_y : kind == SHR_LINE_STRIKE ? lm.strike_y : 0;
+            bool thin = shape == SHR_LINE_SINGLE || shape == SHR_LINE_DASHED, curly = shape == SHR_LINE_CURLY;
+            int32_t h = thin ? 1 : curly ? amp + 1 : 3;
+            int32_t top = thin || (curly && kind == SHR_LINE_UNDER) ? y : y - (h - 1) / 2;
+            top = top > SHR_CELL_HEIGHT - h ? SHR_CELL_HEIGHT - h : top;
+            top = top < 0 ? 0 : top;
+            t->band[kind][shape][0] = (uint8_t)top;
+            t->band[kind][shape][1] = (uint8_t)(top + (h < SHR_CELL_HEIGHT ? h : SHR_CELL_HEIGHT));
+        }
+}
+
+static bool filled(const shr__tilemap *t, const shr__cell *e) { return t->has_bg || (e->bg >> 24) != 0; }
+
+/* One group per row, in row coordinates placed at the row's y: the backgrounds as runs of one colour, then the glyphs,
+ * which stay inside their cells, so a glyph lies on its cell's background alone, then the lines. Only rows that opaque
+ * backgrounds cover completely get a cache hint, since a cached row replaces what lies under it. The first pass counts
+ * the commands, the second writes the runs and the other commands into their two parts of the group. */
 static shr_status build_row(shr__tilemap *t, int32_t r) {
     const shr__cell *row = row_at(t, r);
-    const shr__line_metrics lm = shr__bitmap_font_line_metrics();
+    const shr__lines *lines = row_lines(t, r);
+    const shr_text_line *at = lines->at;
     shr__res *res = shr__bitmap_font_res(t->font);
     t->keys.len = 0;
-    if (!shr__vec_reserve(&t->keys, &t->al, 2 * (size_t)t->cols + 2)) return SHR_E_NO_MEMORY;
+    if (!shr__vec_reserve(&t->keys, &t->al, 2 * (size_t)t->cols + 2 * (size_t)lines->n + 2)) return SHR_E_NO_MEMORY;
     uint64_t *keys = t->keys.data, *k = keys;
     *k++ = res->serial, *k++ = (uint64_t)t->has_bg << 32 | t->bg;
     int32_t covered = 0;
@@ -187,17 +277,24 @@ static shr_status build_row(shr__tilemap *t, int32_t r) {
     for (int32_t c = 0; c < t->cols; c++) {
         const shr__cell *e = &row[c];
         if (e->kind == CELL_CONT) continue;
-        bool is_head = e->kind == CELL_HEAD;
-        uint32_t f = is_head ? e->flags : 0;
-        bool filled = t->has_bg || (f & SHR_STYLE_BG);
-        shr_color color = (f & SHR_STYLE_BG) ? e->bg : t->bg;
-        runs += filled && !(was && color == was_color);
-        was = filled, was_color = color;
+        bool is_head = e->kind == CELL_HEAD, fill = is_head ? filled(t, e) : t->has_bg;
+        shr_color color = is_head && (e->bg >> 24) ? e->bg : t->bg;
+        runs += fill && !(was && color == was_color);
+        was = fill, was_color = color;
         if (!is_head) continue;
-        covered += filled ? e->span : 0;
+        covered += fill ? e->span : 0;
         k[0] = (uint64_t)e->fg << 32 | e->bg;
-        k[1] = (uint64_t)e->glyph << 32 | (uint32_t)c << 17 | (uint32_t)(e->span - 1) << 9 | f << 1 | e->has_glyph, k += 2;
-        n += !(f & SHR_STYLE_CONCEAL) * (e->has_glyph + !!(f & SHR_STYLE_UNDERLINE) + !!(f & SHR_STYLE_STRIKE));
+        k[1] = (uint64_t)e->glyph << 32 | (uint32_t)c << 17 | (uint32_t)(e->span - 1) << 9 | (uint32_t)e->flags << 1 |
+               e->has_glyph,
+        k += 2;
+        n += e->has_glyph && (e->fg >> 24);
+    }
+    for (uint32_t i = 0; i < lines->n; i++) {
+        const shr_text_line *e = &at[i];
+        k[0] = e->col | (uint64_t)e->cols << 16 | (uint64_t)e->kind << 32 | (uint64_t)e->shape << 40 |
+               (uint64_t)e->flags << 48;
+        k[1] = e->color, k += 2;
+        n += (e->color >> 24) != 0;
     }
     if (!runs && !n) return shr__lyr_group_set(t->layer, (uint32_t)r, NULL, 0);
     size_t cached = covered >= t->cols || t->has_bg, total = runs + n + 2 * cached;
@@ -210,25 +307,27 @@ static shr_status build_row(shr__tilemap *t, int32_t r) {
         const shr__cell *e = &row[c < t->cols ? c : 0];
         if (c < t->cols && e->kind == CELL_CONT) continue;
         bool is_head = c < t->cols && e->kind == CELL_HEAD;
-        uint32_t f = is_head ? e->flags : 0;
-        bool filled = c < t->cols && (t->has_bg || (f & SHR_STYLE_BG));
-        shr_color color = (f & SHR_STYLE_BG) ? e->bg : t->bg;
-        bool same = was && filled && color == was_color;
-        if (was && !same) put(fills++, SHR__LCMD_FILL, 0, run, c, 0, SHR_CELL_HEIGHT, was_color);
-        if (filled && !same) run = c;
-        was = filled, was_color = color;
-        if (!is_head || (f & SHR_STYLE_CONCEAL)) continue;
-        shr_color bg = (f & SHR_STYLE_BG) ? e->bg : t->bg; /* 0 without one */
-        uint32_t fx = ((f & SHR_STYLE_DIM) ? SHR__LCMD_DIM : 0) | ((f & SHR_STYLE_BLINK) ? SHR__LCMD_BLINK : 0);
-        uint32_t gx = fx | ((f & SHR_STYLE_BOLD) ? SHR__LCMD_BOLD : 0) | ((f & SHR_STYLE_ITALIC) ? SHR__LCMD_ITALIC : 0);
-        gx |= (t->has_bg || (f & SHR_STYLE_BG)) ? SHR__LCMD_ON_FILL : 0; /* glyph flags: not on the lines */
-        int32_t c1 = c + e->span;
-        if (e->has_glyph) {
-            put(out, SHR__LCMD_GLYPH, gx, c, c1, 0, SHR_CELL_HEIGHT, e->fg);
-            out->id = e->glyph, out->bg = bg, out++;
-        }
-        if (f & SHR_STYLE_UNDERLINE) put(out++, SHR__LCMD_FILL, fx, c, c1, lm.underline_y, lm.underline_y + 1, e->fg);
-        if (f & SHR_STYLE_STRIKE) put(out++, SHR__LCMD_FILL, fx, c, c1, lm.strike_y, lm.strike_y + 1, e->fg);
+        bool fill = c < t->cols && (is_head ? filled(t, e) : t->has_bg);
+        shr_color color = is_head && (e->bg >> 24) ? e->bg : t->bg;
+        bool same = was && fill && color == was_color;
+        if (was && !same) put(fills++, SHR__LCMD_FILL, 0, run, c, 0, SHR_CELL_HEIGHT, was_color | 0xFF000000u);
+        if (fill && !same) run = c;
+        was = fill, was_color = color;
+        if (!is_head || !e->has_glyph || !(e->fg >> 24)) continue;
+        uint32_t f = e->flags, gx = ((e->fg >> 24) == 128 ? SHR__LCMD_DIM : 0) | (fill ? SHR__LCMD_ON_FILL : 0);
+        gx |= ((f & SHR_STYLE_BLINK) ? SHR__LCMD_BLINK : 0) | ((f & SHR_STYLE_BOLD) ? SHR__LCMD_BOLD : 0) |
+              ((f & SHR_STYLE_ITALIC) ? SHR__LCMD_ITALIC : 0);
+        put(out, SHR__LCMD_GLYPH, gx, c, c + e->span, 0, SHR_CELL_HEIGHT, e->fg | 0xFF000000u);
+        out->id = e->glyph, out->bg = fill ? color | 0xFF000000u : 0, out++;
+    }
+    for (uint32_t i = 0; i < lines->n; i++) {
+        const shr_text_line *e = &at[i];
+        if (!(e->color >> 24)) continue;
+        const uint8_t *y = t->band[e->kind][e->shape];
+        uint32_t fx = ((e->color >> 24) == 128 ? SHR__LCMD_DIM : 0) |
+                      ((e->flags & SHR_TEXT_LINE_BLINK) ? SHR__LCMD_BLINK : 0);
+        put(out, SHR__LCMD_LINE, fx, e->col, e->col + e->cols, y[0], y[1], e->color | 0xFF000000u);
+        out->id = e->shape, out++;
     }
     uint64_t key[2] = {0, 0};
     if (cached) {
@@ -259,7 +358,9 @@ static shr_status flush(void *state) {
 
 static void free_grid(shr__tilemap *t) {
     for (size_t i = 0; i < (size_t)t->rows * (size_t)t->cols; i++) cell_free(&t->al, &t->cells[i]);
+    for (int32_t r = 0; t->lines && r < t->rows; r++) lines_free(&t->al, &t->lines[r]);
     SHR_FREE_ARRAY(&t->al, t->cells, shr__cell, (size_t)t->rows * (size_t)t->cols);
+    SHR_FREE_ARRAY(&t->al, t->lines, shr__lines, (size_t)t->rows);
     SHR_FREE_HOT_ARRAY(&t->al, t->line, uint32_t, (size_t)t->rows);
 }
 
@@ -295,8 +396,9 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
     shr__tilemap *t = shr__lyr_state(layer, &tilemap_kind);
     const shr__alloc *al = t ? &t->al : shr__ctx_alloc(ctx);
     shr__cell *cells = SHR_NEW_ARRAY(al, shr__cell, (size_t)rows * (size_t)cols);
+    shr__lines *lines = SHR_NEW_ARRAY(al, shr__lines, (size_t)rows);
     uint32_t *line = SHR_NEW_HOT_ARRAY(al, uint32_t, (size_t)rows);
-    shr_status st = cells && line ? SHR_OK : SHR_E_NO_MEMORY;
+    shr_status st = cells && lines && line ? SHR_OK : SHR_E_NO_MEMORY;
     /* Kept heads are copied (sharing their text) so the old grid stays intact until everything succeeded. */
     for (int32_t r = 0; t && st == SHR_OK && r < t->rows; r++)
         for (int32_t c = 0; st == SHR_OK && c < t->cols; c++) {
@@ -320,6 +422,7 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
             *t = (shr__tilemap){.al = *al, .layer = layer, .ctx = ctx, .font = font};
             SHR_VEC_INIT_HOT(&t->keys, uint64_t);
             SHR_VEC_INIT(&t->placed, shr__placed);
+            line_bands(t);
             if ((st = shr__lyr_attach(layer, &tilemap_kind, t, tilemap_destroy, flush)) != SHR_OK)
                 shr__free(al, t, sizeof(*t), SHR_ALIGNOF(shr__tilemap), TILEMAP_KIND), t = NULL;
             else
@@ -328,14 +431,20 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
     }
     if (st != SHR_OK) {
         SHR_FREE_ARRAY(al, cells, shr__cell, (size_t)rows * (size_t)cols);
+        SHR_FREE_ARRAY(al, lines, shr__lines, (size_t)rows);
         SHR_FREE_HOT_ARRAY(al, line, uint32_t, (size_t)rows);
         return st;
     }
-    for (int32_t r = 0; r < t->rows; r++)
+    for (int32_t r = 0; r < t->rows; r++) {
         for (int32_t c = 0; c < t->cols; c++) {
             shr__cell *e = &row_at(t, r)[c];
             if (kept(e, r, c, rows, cols)) *e = (shr__cell){0}; /* now owned by the new grid */
         }
+        if (r >= rows) continue;
+        shr__lines *l = row_lines(t, r);
+        lines_cut(l, cols, INT32_MAX);
+        lines[r] = *l, *l = (shr__lines){0};
+    }
     free_grid(t);
     if (font != t->font) {
         memset(t->memo, 0, sizeof(t->memo)); /* cluster ids are the font's */
@@ -343,7 +452,7 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
         res->users++;
         t->font = font;
     }
-    t->rows = rows, t->cols = cols, t->cells = cells, t->line = line;
+    t->rows = rows, t->cols = cols, t->cells = cells, t->lines = lines, t->line = line;
     t->has_bg = background != NULL;
     t->bg = background ? *background : 0;
     for (int32_t r = 0; r < rows; r++) line[r] = (uint32_t)r | DIRTY;
@@ -353,13 +462,36 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
 
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "memo keys are cell text bytes read as words");
 
+static shr__memo *memo_slot(shr__tilemap *t, uint64_t key) {
+    uint32_t lo = (uint32_t)key, hi = (uint32_t)(key >> 32);
+    return &t->memo[(uint64_t)(lo ^ hi) * 0x9E3779B9u >> 22 & 1023];
+}
+
+/* The head at (r, c) already holds this cluster: its text in `key` up to 8 bytes, else at `utf8`. */
+static bool cell_same(const shr__tilemap *t, int32_t r, int32_t c, const char *utf8, size_t len, uint64_t key,
+                      uint32_t span, shr_text_style s) {
+    const shr__cell *old = &row_at(t, r)[c];
+    uint64_t was;
+    memcpy(&was, old->text, sizeof(was));
+    bool same = (old->kind == CELL_HEAD) & (old->span == span) & (old->len == len) & (old->fg == s.fg) &
+                (old->bg == s.bg) & (old->flags == s.flags);
+    return same && (len <= 8 ? was == key : !memcmp(cell_text(old), utf8, len));
+}
+
+/* Places the cluster memo `m` holds. */
+static void cell_memo(shr__tilemap *t, int32_t r, int32_t c, const shr__memo *m, uint32_t span, shr_text_style s) {
+    shr__cell *e = place(t, r, c, span);
+    *e = head(s, m->glyph, m->len, span, m->has_glyph);
+    memcpy(e->text, &m->key, sizeof(m->key));
+}
+
 shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col, const char *utf8, size_t length,
                                        uint32_t span, shr_text_style style) {
     shr__tilemap *t;
     shr_status st = tilemap_get(layer, &t);
     if (st != SHR_OK) return st;
     if ((length && !utf8) || span == 0) return SHR_E_INVALID_ARG;
-    if (style.flags & ~SHR_STYLE_KNOWN_FLAGS) return SHR_E_UNKNOWN_STYLE;
+    if ((st = shr__style_check(&style, NULL, 0)) != SHR_OK) return st;
     if (length > SHR_MAX_TEXT_BYTES || span > SHR_MAX_SPAN) return SHR_E_LIMIT;
     if (row < 0 || row >= t->rows || col < 0 || (int64_t)col + span > t->cols) return SHR_E_INVALID_ARG;
     uint32_t cps[SHR_CLUSTER_SCALARS];
@@ -369,7 +501,7 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
         if ((st = cluster_decode(utf8, length, cps, &n, &cls)) != SHR_OK) return st;
         utf8 = SHR_REPLACEMENT_UTF8, length = 3;
     }
-    uint64_t key = 0, was;
+    uint64_t key = 0;
     shr__memo *m = NULL;
     if (length && length <= 8) {
         /* The text zero-padded in 32-bit halves, without reads past the end: the first 4 bytes and the ones after them
@@ -382,25 +514,50 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
         lo |= u[0] | (uint32_t)u[h] << 8 * h | (uint32_t)u[l] << 8 * l;
         hi >>= 8 * (8 - length) & 31;
         key = lo | (uint64_t)hi << 32;
-        m = &t->memo[(uint64_t)(lo ^ hi) * 0x9E3779B9u >> 22 & 1023];
+        m = memo_slot(t, key);
     }
-    const shr__cell *old = &row_at(t, row)[col];
-    memcpy(&was, old->text, sizeof(was));
-    bool same = (old->kind == CELL_HEAD) & (old->span == span) & (old->len == length) & (old->fg == style.fg) &
-                (old->bg == style.bg) & (old->flags == style.flags);
-    if (same && (length <= 8 ? was == key : !memcmp(cell_text(old), utf8, length))) return SHR_OK; /* unchanged */
-    if (m && m->len == length && m->key == key) {
-        shr__cell *e = place(t, row, col, span);
-        *e = head(style, m->glyph, length, span, m->has_glyph);
-        memcpy(e->text, &key, sizeof(key));
-        return SHR_OK;
-    }
+    if (cell_same(t, row, col, utf8, length, key, span, style)) return SHR_OK;
+    if (m && m->len == length && m->key == key) return cell_memo(t, row, col, m, span, style), SHR_OK;
     shr__cell e;
     if ((st = cluster_decode(utf8, length, cps, &n, &cls)) != SHR_OK) return st;
     if ((st = cell_make(t, utf8, length, span, style, cps, n, &cls, &e)) != SHR_OK) return st;
     if (m) *m = (shr__memo){key, e.glyph, (uint8_t)length, e.has_glyph};
     t->long_text |= length > CELL_INLINE;
     *place(t, row, col, span) = e;
+    return SHR_OK;
+}
+
+static shr_status lines_check(const shr__tilemap *t, const shr_text_line *in, size_t n, shr_error_info *err) {
+    if (n && !in) return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "missing lines");
+    if (n > 4 * (size_t)t->cols) return shr__fail(err, SHR_E_LIMIT, 0, SIZE_MAX, "more than 4 lines per column");
+    for (size_t i = 0; i < n; i++) {
+        const shr_text_line *e = &in[i];
+        if (!e->cols || e->col + e->cols > t->cols) return shr__fail(err, SHR_E_INVALID_ARG, 0, i, "line outside the grid");
+        if (e->kind > SHR_LINE_OVER || e->shape > SHR_LINE_DASHED || (e->flags & ~SHR_TEXT_LINE_BLINK) ||
+            !shr__alpha_known(e->color, true))
+            return shr__fail(err, SHR_E_UNKNOWN_STYLE, 0, i, "unknown line kind, shape, flag or colour alpha");
+    }
+    return SHR_OK;
+}
+
+/* Checked lines of row r, with room for them. */
+static void lines_set(shr__tilemap *t, int32_t r, const shr_text_line *in, size_t n) {
+    shr__lines *l = row_lines(t, r);
+    if (l->n == n && (!n || !memcmp(l->at, in, n * sizeof(*in)))) return; /* unchanged */
+    if (n) memcpy(l->at, in, n * sizeof(*in));
+    l->n = (uint32_t)n, t->line[r] |= DIRTY;
+}
+
+shr_status shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_text_line *lines, size_t count,
+                                        shr_error_info *err) {
+    shr__err_clear(err);
+    shr__tilemap *t;
+    shr_status st = tilemap_get(layer, &t);
+    if (st != SHR_OK) return shr__fail(err, st, 0, SIZE_MAX, "not a tilemap layer or context busy");
+    if (row < 0 || row >= t->rows) return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "row outside the grid");
+    if ((st = lines_check(t, lines, count, err)) != SHR_OK) return st;
+    if (!lines_room(t, row_lines(t, row), count)) return shr__fail(err, SHR_E_NO_MEMORY, 0, SIZE_MAX, "no memory");
+    lines_set(t, row, lines, count);
     return SHR_OK;
 }
 
@@ -462,20 +619,30 @@ shr_status shr_pl_lyr_tilemap_set_text(shr_lyr *layer, int32_t row, int32_t col,
     return st;
 }
 
+/* Clears and scrolls read the flags and bg alone. */
+static shr_status clear_style(shr_text_style style) {
+    style.fg = 0;
+    return shr__style_check(&style, NULL, 0);
+}
+
 shr_status shr_pl_lyr_tilemap_clear(shr_lyr *layer, int32_t row, int32_t col, int32_t rows, int32_t cols,
                                     shr_text_style style) {
     shr__tilemap *t;
     shr_status st = tilemap_get(layer, &t);
     if (st != SHR_OK) return st;
-    if (style.flags & ~SHR_STYLE_KNOWN_FLAGS) return SHR_E_UNKNOWN_STYLE;
+    if ((st = clear_style(style)) != SHR_OK) return st;
     if (row < 0 || col < 0 || rows < 0 || cols < 0 || (int64_t)row + rows > t->rows || (int64_t)col + cols > t->cols)
         return SHR_E_INVALID_ARG;
-    bool bg = (style.flags & SHR_STYLE_BG) != 0;
-    const shr__cell e = blank((shr_text_style){0, style.bg, SHR_STYLE_BG});
+    for (int32_t r = row; r < row + rows; r++) {
+        shr__lines *l = row_lines(t, r);
+        if (!lines_room(t, l, l->n + lines_split(l, col, col + cols))) return SHR_E_NO_MEMORY;
+    }
+    const shr__cell e = blank((shr_text_style){0, style.bg, 0});
     for (int32_t r = row; r < row + rows; r++) {
         int32_t c0 = col, c1 = col + cols;
         clear_cells(t, r, &c0, &c1);
-        for (int32_t c = c0; bg && c < c1; c++) row_at(t, r)[c] = e;
+        for (int32_t c = c0; (style.bg >> 24) && c < c1; c++) row_at(t, r)[c] = e;
+        lines_cut(row_lines(t, r), col, col + cols);
     }
     return SHR_OK;
 }
@@ -494,7 +661,7 @@ shr_status shr_pl_lyr_tilemap_scroll(shr_lyr *layer, int32_t top, int32_t bottom
     shr__tilemap *t;
     shr_status st = tilemap_get(layer, &t);
     if (st != SHR_OK) return st;
-    if (style.flags & ~SHR_STYLE_KNOWN_FLAGS) return SHR_E_UNKNOWN_STYLE;
+    if ((st = clear_style(style)) != SHR_OK) return st;
     if (top < 0 || top > bottom || bottom > t->rows) return SHR_E_INVALID_ARG;
     int32_t h = bottom - top;
     int64_t k = n < 0 ? -(int64_t)n : n;
