@@ -555,7 +555,7 @@ static uint64_t keep_copy_trim(void *user, void *dst, size_t dst_stride, const v
                                size_t bytes, int32_t rows, const shr_software_trim *t) {
     int s = slot_of(dst);
     size_t all = bytes + t->lo + t->hi;
-    if (s < 0 || s >= 2 || all * rows < DMA_MIN_BYTES || (uintptr_t)dst % CONFIG_CACHE_L2_CACHE_LINE_SIZE ||
+    if (s < 0 || s >= BANDS || all * rows < DMA_MIN_BYTES || (uintptr_t)dst % CONFIG_CACHE_L2_CACHE_LINE_SIZE ||
         ((uintptr_t)src | bytes) % 32 || dst_stride % CONFIG_CACHE_L2_CACHE_LINE_SIZE)
         return keep_copy(user, (uint8_t *)dst - t->lo, dst_stride, (const uint8_t *)src - t->lo, src_stride, all, rows);
     a.bytes.copied[0] += bytes * rows;
