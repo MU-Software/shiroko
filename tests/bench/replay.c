@@ -7,9 +7,10 @@
  * churn 30); cost: the scenes of the app cost table. SHR_REPLAY_PROFILE=tab5 (the only one so far),
  * SHR_REPLAY_PART=driver-sw or compositor (default both), SHR_REPLAY_REPS (default 5), SHR_REPLAY_FRAMES=1 adds BF lines
  * per frame, SHR_REPLAY_SAVE=DIR / SHR_REPLAY_LOAD=DIR write or read DIR/<scene>.shrr (commands) and
- * DIR/<scene>.calls.shrr instead of recording. SHR_REPLAY_KEEPS: the driver's keep slots in screens of rows (default
- * 4, the Tab5 example's default, so the hashes match the device's; recordings loaded must have been made with the same
- * count). */
+ * DIR/<scene>.calls.shrr instead of recording. SHR_REPLAY_KEEPS: the driver's keep slots in screens of rows, and
+ * SHR_REPLAY_BANDS: the bands (1 or 2); 4 and 2 by default, the Tab5 example's defaults, so the hashes match the
+ * device's (set them as its CONFIG_SHIROKO_TAB5_KEEP_SCREENS and BANDS); recordings loaded must have been made with
+ * the same counts. */
 #include <shiroko/port_software.h>
 #include <shiroko/shiroko.h>
 
@@ -31,6 +32,7 @@
 static struct {
     const char *fonts;
     uint32_t keeps;
+    uint32_t ntargets; /* the frame buffer and the bands */
     shr_surface targets[3];
     rec_package packages[T5_N(t5_packages)];
     t5_scene s;
@@ -107,11 +109,14 @@ static uint32_t record(int load, int32_t frames, shr_framebuffer_driver *sw, rec
     cd.output = &output;
     shr_screen_desc sd;
     t5_screen_desc(s, &sd);
-    sd.bands = g.targets + 1, sd.band_count = 2, sd.band_align = BAND_ALIGN;
+    sd.bands = g.targets + 1, sd.band_count = g.ntargets - 1, sd.band_align = BAND_ALIGN;
     rec_profile p = {load_names[load], &cd, &sd, T5_REC_STEP_NS, frames, g.packages, T5_N(g.packages)};
-    check(rec_begin(w, &p, sw, g.targets, 3), "rec_begin");
+    check(rec_begin(w, &p, sw, g.targets, g.ntargets), "rec_begin");
     rec_frame(w, REC_OPEN, s->frozen);
-    if (c) check(rec_calls_begin(c, &p, &sw->caps, g.targets, 3), "rec_calls_begin"), rec_frame(&c->w, REC_OPEN, s->frozen);
+    if (c) {
+        check(rec_calls_begin(c, &p, &sw->caps, g.targets, g.ntargets), "rec_calls_begin");
+        rec_frame(&c->w, REC_OPEN, s->frozen);
+    }
     cd.driver = &w->drv;
     check(shr_create(&cd, &s->ctx), "create");
     check(shr_screen_configure(s->ctx, &sd), "screen_configure");
@@ -191,8 +196,8 @@ static void replay_driver(int load, int32_t frames, bool drive, int reps, bool p
     int32_t bad = -2;
     for (int rep = -1; drive && rep < reps; rep++) {
         shr_framebuffer_driver d = new_driver();
-        for (int k = 0; k < 3; k++) memset(g.targets[k].pixels, 0x5A, g.targets[k].byte_length);
-        rec_host h = {&d, g.targets, 3, cmds, mem_alloc, mem_free, now_ns, NULL, NULL, NULL, fb_checksum, NULL};
+        for (uint32_t k = 0; k < g.ntargets; k++) memset(g.targets[k].pixels, 0x5A, g.targets[k].byte_length);
+        rec_host h = {&d, g.targets, g.ntargets, cmds, mem_alloc, mem_free, now_ns, NULL, NULL, NULL, fb_checksum, NULL};
         uint32_t sum = 0;
         int32_t b = -2;
         check(rec_play(buf, len, &h, rep < 0, t, &sum, &b), "rec_play");
@@ -246,7 +251,7 @@ static void replay_calls(int load, int32_t frames, int reps, bool per_frame, con
     void *scratch = malloc(scratch_bytes);
     if (!t || !st || !scratch) check(SHR_E_NO_MEMORY, "replay");
     shr_framebuffer_driver sw = new_driver();
-    rec_calls_host h = {&sw, g.targets, 3, NULL, open_package, now_ns, NULL, NULL, scratch, scratch_bytes};
+    rec_calls_host h = {&sw, g.targets, g.ntargets, NULL, open_package, now_ns, NULL, NULL, scratch, scratch_bytes};
     v = (rec_writer){.buf = v.buf, .cap = v.cap, .hash_only = true};
     check(rec_calls_play(buf, len, &h, &v, t, t + in.frames), "rec_calls_play");
     int32_t bad = -2;
@@ -298,9 +303,14 @@ int main(int argc, char **argv) {
     }
     const char *profile = getenv("SHR_REPLAY_PROFILE"), *part = getenv("SHR_REPLAY_PART");
     const char *reps_env = getenv("SHR_REPLAY_REPS"), *frames_env = getenv("SHR_REPLAY_FRAMES");
-    const char *keeps_env = getenv("SHR_REPLAY_KEEPS");
+    const char *keeps_env = getenv("SHR_REPLAY_KEEPS"), *bands_env = getenv("SHR_REPLAY_BANDS");
+    int bands = bands_env ? atoi(bands_env) : 2;
     if ((profile && strcmp(profile, "tab5")) || (part && strcmp(part, "driver-sw") && strcmp(part, "compositor"))) {
         fprintf(stderr, "only SHR_REPLAY_PROFILE=tab5 and SHR_REPLAY_PART=driver-sw or compositor so far\n");
+        return 2;
+    }
+    if (bands < 1 || bands > 2) {
+        fprintf(stderr, "SHR_REPLAY_BANDS must be 1 or 2\n");
         return 2;
     }
     if (SHR_PIXEL_FORMAT != SHR_FORMAT_RGB565) {
@@ -309,8 +319,9 @@ int main(int argc, char **argv) {
     }
     g.fonts = argv[1];
     g.keeps = (keeps_env ? (uint32_t)atoi(keeps_env) : 4) * (OUT_W / SHR_CELL_HEIGHT);
+    g.ntargets = 1 + (uint32_t)bands;
     g.targets[0] = surface(OUT_W, OUT_H, 0);
-    g.targets[1] = surface(OUT_H, BAND_H, 1), g.targets[2] = surface(OUT_H, BAND_H, 1);
+    for (uint32_t k = 1; k < g.ntargets; k++) g.targets[k] = surface(OUT_H, BAND_H, 1);
     for (size_t i = 0; i < T5_N(t5_packages); i++) {
         char path[1024];
         size_t n;
@@ -331,6 +342,6 @@ int main(int argc, char **argv) {
         if (!part || !strcmp(part, "compositor")) replay_calls(load, frames, reps, per_frame, save, load_dir, ref, nref);
         free(ref);
     }
-    for (int k = 0; k < 3; k++) free(g.targets[k].pixels);
+    for (uint32_t k = 0; k < g.ntargets; k++) free(g.targets[k].pixels);
     return 0;
 }
