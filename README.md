@@ -15,7 +15,7 @@ SPDX-License-Identifier: MIT (see `LICENSE`; third-party notices in `NOTICE`).
 - For `make tab5-build` only: Docker with the `espressif/idf:v6.1` image (M5Stack Tab5, ESP32-P4); vcpkg installs
   zstd's decoder sources (overlay port `cmake/ports/zstd-source`, feature `zstd-source`) for ESP-IDF to compile
 
-On macOS: `brew install cmake uv zig`.
+On macOS: `brew install cmake uv`.
 
 ## Fonts and the build
 
