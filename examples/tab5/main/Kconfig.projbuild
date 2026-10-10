@@ -42,8 +42,8 @@ menu "shiroko Tab5 example"
         bool "Run every drawing mode"
         default n
         help
-            Runs each scene composed in PSRAM (A), with one band (B) and, with two bands, with two (C); only the
-            mode of SHIROKO_TAB5_BANDS when off.
+            Runs each scene composed in PSRAM (A), with one band (B) and, when SHIROKO_TAB5_BANDS is 2, with two
+            (C). Off runs only the mode of SHIROKO_TAB5_BANDS.
 
     config SHIROKO_TAB5_FPS_CAP
         int "Frame-rate cap (frames per second, 0 = uncapped)"
