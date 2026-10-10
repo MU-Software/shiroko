@@ -20,7 +20,9 @@ TEST why_names_each_reason(void) {
     ASSERT_EQ(tab5_copy_why(BAND_AT + 64, 2560, SLOT_AT, 2496, 2496 * 16, TAB5_COPY_LEN, false),
               (unsigned)TAB5_COPY_LINE_START);
     ASSERT_EQ(tab5_copy_why(BAND_AT, 2550, SLOT_AT, 2550, 2550 * 16, TAB5_COPY_LEN, false), (unsigned)TAB5_COPY_RULE);
-    ASSERT_EQ(tab5_copy_why(SLOT_AT, 2550, BAND_AT, 2550, 2550 * 16, TAB5_COPY_LEN, true), 0u);
+    ASSERT_EQ(tab5_copy_why(SLOT_AT, 2544, BAND_AT, 2544, 2544 * 16, TAB5_COPY_LEN, true), 0u);
+    ASSERT_EQ(tab5_copy_why(SLOT_AT, 2550, BAND_AT, 2550, 2550 * 16, TAB5_COPY_LEN, true), /* ends off a line */
+              (unsigned)TAB5_COPY_LINE_START);
     ASSERT_EQ(tab5_copy_why(SLOT_AT, 2544, BAND_AT, 2544, 2544 * 16, TAB5_COPY_LEN_SAFE, true),
               (unsigned)TAB5_COPY_RULE);
     PASS();

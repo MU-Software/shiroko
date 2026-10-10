@@ -694,7 +694,9 @@ static void move_setup(void) {
 
 /* The DMA2D copies rows whose length or source is off 32 bytes (keeps of cells not 16 pixels wide) right as far as
  * measured, not as documented: copy_len allows them once copies of this build's rows and of others, both ways between
- * a PSRAM block `k` and band 0 while the CPU writes PSRAM past the block, change exactly the bytes they copy. */
+ * a PSRAM block `k` and band 0 while the CPU writes PSRAM past the block, change exactly the bytes they copy. Only
+ * copies keep_copy would give the DMA2D are tried: one whose destination ends inside a cache line can lose its last
+ * bytes to that line's write-back on the boards with a panel. */
 static bool copy_try(uint8_t *k, size_t koff, size_t boff, size_t bytes, int32_t rows, bool store) {
     uint8_t *b = a.bands[0].pixels;
     size_t bs = a.bands[0].stride, bn = a.bands[0].byte_length;
@@ -720,13 +722,21 @@ static bool copy_try(uint8_t *k, size_t koff, size_t boff, size_t bytes, int32_t
 
 static void copy_setup(void) {
     const size_t row = (size_t)(BSP_LCD_V_RES / CW * CW * 2);
-    const size_t lengths[] = {row, 2544, 2550, 2530, 2546, 2556, 650}, offsets[] = {0, 2, 16, row};
+    const size_t lengths[] = {row, 2544, 2550, 2530, 2546, 2556, 650, 640}, offsets[] = {0, 2, 16, row};
     uint8_t *k = heap_caps_aligned_alloc(TAB5_COPY_LINE, 2 * COPY_TRY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     int wrong = 0, tries = 0;
     for (size_t l = 0; k && l < N(lengths); l++)
         for (size_t o = 0; o < N(offsets); o++)
-            for (int t = 0; t < 4; t++, tries++)
-                wrong += !copy_try(k, offsets[o], t & 2 ? TAB5_COPY_LINE : 0, lengths[l], BAND_H - (t >> 1), t & 1);
+            for (int t = 0; t < 4; t++) { /* the copies keep_copy would give the DMA2D */
+                size_t n = lengths[l], rows = (size_t)(BAND_H - (t >> 1)), bs = a.bands[0].stride;
+                uintptr_t kp = (uintptr_t)k + offsets[o];
+                uintptr_t bp = (uintptr_t)a.bands[0].pixels + (t & 2 ? TAB5_COPY_LINE : 0);
+                unsigned why = t & 1 ? tab5_copy_why(kp, n, bp, n, n * rows, TAB5_COPY_LEN, true)
+                                     : tab5_copy_why(bp, bs, kp, n, n * rows, TAB5_COPY_LEN, true);
+                if (why & ~(unsigned)TAB5_COPY_SMALL) continue;
+                tries++;
+                wrong += !copy_try(k, offsets[o], t & 2 ? TAB5_COPY_LINE : 0, n, (int32_t)rows, t & 1);
+            }
     free(k);
     copy_len = k && !wrong ? TAB5_COPY_LEN : TAB5_COPY_LEN_SAFE;
     printf("copy self-test (rows of %zu B and %zu other lengths, %zu source offsets, both ways, CPU writing PSRAM):"

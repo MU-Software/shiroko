@@ -14,8 +14,11 @@
 #endif
 #define TAB5_COPY_LEN_SAFE 32 /* else */
 
-/* SMALL and LINE (dst off a cache line: an image at any x) are by design; RULE alone (src or bytes off `len`, dst rows
- * off cache lines) means a copy the DMA2D could take goes to the CPU. */
+/* SMALL and LINE are by design. LINE: the bytes the DMA writes do not start and end on cache lines (an image at any x;
+ * contiguous rows ending inside a line): the P4 cache is not coherent with the DMA, and a cache line it shares with
+ * other data can be written back over the DMA's bytes (ESP-IDF's memory synchronization guide; the last bytes of such
+ * copies came out old on the Tab5 boards with a panel). RULE alone (src or bytes off `len`, dst rows off cache lines)
+ * means a copy the DMA2D could take goes to the CPU. */
 enum { TAB5_COPY_SMALL = 1, TAB5_COPY_LINE_START = 2, TAB5_COPY_RULE = 4 };
 
 /* Why a copy of rows of `bytes` from src to dst, `total` bytes in all, goes to the CPU; 0: the DMA2D takes it.
@@ -24,8 +27,9 @@ static inline unsigned tab5_copy_why(uintptr_t dst, size_t dst_stride, uintptr_t
                                      size_t len, bool packed) {
     unsigned rule =
         ((src | bytes) % len != 0) | ((dst_stride % TAB5_COPY_LINE != 0) & !(packed & (dst_stride == bytes)));
-    return (total < TAB5_COPY_MIN) * TAB5_COPY_SMALL | (dst % TAB5_COPY_LINE != 0) * TAB5_COPY_LINE_START |
-           rule * TAB5_COPY_RULE;
+    unsigned line =
+        (dst % TAB5_COPY_LINE != 0) | (packed & (dst_stride == bytes) & ((dst + total) % TAB5_COPY_LINE != 0));
+    return (total < TAB5_COPY_MIN) * TAB5_COPY_SMALL | line * TAB5_COPY_LINE_START | rule * TAB5_COPY_RULE;
 }
 
 #endif
