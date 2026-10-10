@@ -71,6 +71,8 @@ typedef struct shr__frame {
      * registry takes the plan once the driver accepted the raster. */
     shr__vec prologue, planned; /* shr_draw_cmd, shr__planned */
     uint64_t resident;          /* driver-held bytes once the prologue ran */
+    uint32_t taken;             /* ids the plan holds for the frame's buffers */
+    uint32_t short_bufs;        /* buffers that got no id: drawn with a fallback, or not drawn */
     shr__vec kept;              /* shr__kept: stores of the plan, in batch order */
     uint64_t kept_bytes;        /* their bytes */
     size_t kept_at;             /* the first one not committed */
@@ -251,6 +253,8 @@ struct shr_context {
     bool stale;  /* the output may not show the current state */
     bool failed; /* the last frame failed: no automatic frames until something changes */
     bool blink_shown, last_provisional;
+    uint32_t short_bufs; /* of the last frame, 0 after a submission or a resource change: a redraw while it falls */
+    bool short_logged;   /* since the last frame that got every buffer an id */
     bool output_blocked, output_isolated;
     uint64_t next_frame_id;
     uint64_t next_start_ns; /* earliest start of the next frame under min_frame_interval_ns */

@@ -50,6 +50,7 @@ typedef struct shr__buf {
     uint32_t id;        /* driver id, 0 = not registered; compositor-owned like the fields below */
     shr_rect dirty;     /* written since the driver last saw it */
     uint64_t used;      /* last frame that drew from it */
+    uint64_t refused;   /* last frame that found no id for it */
     bool owned;         /* `mem` came from shr__buf_alloc */
     shr__lru_node lru;
 } shr__buf;
@@ -83,6 +84,8 @@ typedef struct shr__res_ops {
     /* For a frame being built: the pixels of `id`, pinned until frame_end(frame), in *out until the next resolve().
      * SHR_E_NOT_FOUND = draw nothing; other errors fail the frame. */
     shr_status (*resolve)(shr__res *res, uint64_t id, uint64_t frame, const shr__resolved **out);
+    /* NULL or, as resolve(), provisional pixels for `id` drawn instead when its buffer gets no id in the frame. */
+    shr_status (*fallback)(shr__res *res, uint64_t id, uint64_t frame, const shr__resolved **out);
     /* Exactly once per frame in which resolve() succeeded, also for failed or superseded frames. */
     void (*frame_end)(shr__res *res, uint64_t frame);
     /* Called from shr_pump(). true: provisional pixels may now resolve differently. */

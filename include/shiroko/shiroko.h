@@ -60,7 +60,7 @@ typedef struct shr_blink_profile {
 typedef enum shr_trace_kind {
     SHR_TRACE_SUBMIT = 1,
     SHR_TRACE_RASTER_BEGIN,   /* value1 = damaged pixels */
-    SHR_TRACE_RASTER_END,     /* value0 = commands the frame's batches held */
+    SHR_TRACE_RASTER_END,     /* value0 = commands the frame's batches held, value1 = buffers that got no driver id */
     SHR_TRACE_CONVERT,        /* value0 = bytes read + written; with bands once all are converted, for all */
     SHR_TRACE_PRESENT,
     SHR_TRACE_DISPLAYED,      /* value0 = output timestamp */
@@ -225,7 +225,9 @@ shr_status shr_fence_signal(shr_context *ctx, shr_fence fence, shr_fence_state s
  * A layer holds a retained command list in its own coordinates, clipped to its rectangle. Layers
  * composite by ascending z, then creation order. Changing a layer only records damage; nothing is
  * drawn before shr_submit(). Automatic frames (blink, shr_request_redraw(), fallback glyphs that
- * resolved) wait while such changes are not submitted. */
+ * resolved) wait while such changes are not submitted. A frame drawing from more buffers (font pages, images) than
+ * the driver's caps.max_buffers or caps.buffer_bytes hold draws the rest with fallback glyphs (images: not at all) and,
+ * on a preserved output, draws them again in the frames that follow while each leaves fewer out. */
 
 typedef struct shr_lyr shr_lyr;
 

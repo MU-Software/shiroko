@@ -1,3 +1,4 @@
+#include "compositor.h"
 #include "font_core.h"
 #include "harness.h"
 
@@ -2728,6 +2729,90 @@ TEST test_provisional_redrawn_when_ready(void) {
     PASS();
 }
 
+static shr_framebuffer_driver short_driver;
+static int short_frames; /* frames whose buffers got no id */
+static void short_trace(void *user, const shr_trace_event *ev) {
+    (void)user;
+    short_frames += ev->kind == SHR_TRACE_RASTER_END && ev->value1;
+}
+static void tweak_short_ids(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    d->trace = short_trace;
+    drv->caps.max_buffers = 3;
+}
+static void tweak_short_keeps(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    d->trace = short_trace;
+    shr_software_driver_create(NULL, 1u << 20, 64, 4, &short_driver);
+    *drv = short_driver;
+}
+
+/* Real glyphs among the cells of test_buffer_ids_run_short. */
+static int short_drawn(const harness *h) {
+    const int32_t at[4][3] = {{0, 0, 1}, {0, 1, 1}, {0, 2, 2}, {1, 0, 2}}; /* row, column, span */
+    int n = 0;
+    for (int i = 0; i < 4; i++)
+        n += lit(h->out.shown, at[i][1] * CW, (at[i][1] + at[i][2]) * CW, at[i][0] * CH, (at[i][0] + 1) * CH) == 16;
+    return n;
+}
+
+/* A frame drawing from more pages than the driver has buffer ids is presented: the pages that got an id draw, the
+ * others the provisional fallback (one id stays for its page), and on a preserved output the next frame redraws them
+ * once the ids are free, also with bands and outside the row cache. It never fails nor keeps redrawing. */
+TEST test_buffer_ids_run_short(void) {
+    static spkg latin, cjk;
+    static uint8_t band_px[2][HW * 8 * SCREEN_BPP];
+    synth(&latin);
+    synth_as(&cjk, ROLE_CJK, "ko", 0xAC00, 0xAC01, SY_A4);
+    for (int mode = 0; mode < 6; mode++) { /* preserved or not; plain, bands, keeps */
+        bool preserved = mode & 1;
+        tsrc sl = {latin.d, latin.n, .mode = SRC_READ}, sc = {cjk.d, cjk.n, .mode = SRC_READ};
+        lib l = {.src = {[ROLE_LATIN] = &sl, [ROLE_CJK] = &sc}};
+        harness h;
+        shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT | (preserved ? SHR_OUTPUT_PRESERVES_CONTENT : 0),
+                                        mode >> 1 == 2 ? tweak_short_keeps : tweak_short_ids);
+        if (mode >> 1 == 1) {
+            shr_surface b[2];
+            for (int i = 0; i < 2; i++)
+                b[i] = (shr_surface){band_px[i], HW, 8, HW * SCREEN_BPP, sizeof(band_px[i]), SHR_PIXEL_FORMAT, 1, 0, 0};
+            shr_screen_desc sd;
+            shr_screen_desc_init(&sd);
+            sd.width = HW, sd.height = HH, sd.bands = b, sd.band_count = 2;
+            ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_OK);
+        }
+        shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
+        shr_lyr *layer;
+        const shr_text_style white = {SHR_RGB(255, 255, 255), 0, 0};
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, (shr_rect){0, 0, HW, HH}, &layer), SHR_OK);
+        const shr_color bg = SHR_RGB(0, 0, 0);
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(layer, f, 2, 4, &bg), SHR_OK); /* opaque, cacheable rows */
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(layer, 0, 0, "A", 1, 1, white), SHR_OK); /* latin page 0 */
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(layer, 0, 1, "\xF3\xB0\x80\x90", 4, 1, white), SHR_OK); /* page 1 */
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(layer, 0, 2, "\xEA\xB0\x80", 3, 2, white), SHR_OK);   /* cjk 0 */
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(layer, 1, 0, "\xEA\xB0\x81", 3, 2, white), SHR_OK);   /* cjk 1 */
+        for (int redraw = 0; redraw < 3; redraw++) { /* the rows are stored and drawn from the row cache */
+            short_frames = 0;
+            if (redraw) shr_request_redraw(ctx);
+            shr_submit(ctx);
+            settle(ctx);
+            shr_deadline dl;
+            ASSERT(shr_next_deadline(ctx, &dl) == SHR_OK && dl.kind != SHR_DEADLINE_NOW);
+            ASSERT_EQ_LL(count_events(ctx, SHR_EVENT_PRESENT_FAILED, NULL), 0);
+            if (mode >> 1 == 2 && redraw) { /* both rows stored whole, only once whole: no buffer ids needed */
+                ASSERT(short_drawn(&h) == 4 && !short_frames && ctx->keep_resident);
+                continue;
+            }
+            ASSERT_EQ_LL(short_drawn(&h), preserved ? 4 : 2 + (mode >> 1 == 2));
+            ASSERT(lit(h.out.shown, 2 * CW, 4 * CW, 0, CH) > 0 && lit(h.out.shown, 0, 2 * CW, CH, 2 * CH) > 0);
+            ASSERT_EQ_LL(short_frames, 1);
+            if (mode >> 1 == 2) /* the row with a fallback is not kept */
+                ASSERT_EQ_LL(ctx->keep_resident, (preserved ? 2u : 1u) * 4u * CW * CH * SCREEN_BPP);
+        }
+        ASSERT_EQ_LL(shr_lyr_destroy(layer), SHR_OK);
+        harness_close(&h);
+        if (mode >> 1 == 2) shr_software_driver_destroy(&short_driver);
+    }
+    PASS();
+}
+
 static shr_framebuffer_driver cached_driver;
 static void tweak_cached(shr_context_desc *d, shr_framebuffer_driver *drv) {
     (void)d;
@@ -3193,6 +3278,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_destroy_with_outstanding_reads);
     RUN_TEST(test_shutdown_with_outstanding_reads);
     RUN_TEST(test_provisional_redrawn_when_ready);
+    RUN_TEST(test_buffer_ids_run_short);
     RUN_TEST(test_cooled_package_redrawn);
     RUN_TEST(test_failed_page_event_in_frames);
     RUN_TEST(test_preload);

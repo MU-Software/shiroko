@@ -153,6 +153,7 @@ struct shr_pl_res_bitmap_font {
     size_t nslots;
     bool changed, blocked, shutting_down;
     shr__memo memo[SHR_FONT_MEMO]; /* by id */
+    shr__resolved spare;           /* the last answer of fallback() */
 };
 
 static inline uint64_t shr__font_now(const shr_pl_res_bitmap_font *f) { return shr__ctx_now(f->res.ctx); }
@@ -238,7 +239,9 @@ void shr__pages_preload(shr_pl_res_bitmap_font *f);
 void shr__page_done(shr__page *p, shr_status result);
 bool shr__page_due(const shr__page *p, uint64_t now);
 void shr__font_frame_end(shr_pl_res_bitmap_font *f, uint64_t frame);
-shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t frame, shr__resolved *out);
+/* With `fallback`: the provisional glyph drawn while the glyph's page is not ready. */
+shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t frame, bool fallback,
+                             shr__resolved *out);
 
 /* Glyph id layout: scalar or cluster index, emoji presentation, interned cluster. */
 #define SHR_ID_VALUE 0x1FFFFFull

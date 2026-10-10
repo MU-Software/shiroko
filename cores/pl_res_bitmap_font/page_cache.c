@@ -370,7 +370,8 @@ static int text_chain(shr_pl_res_bitmap_font *f, const uint32_t *cps, size_t n, 
     return GLYPH_MISSING;
 }
 
-shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t frame, shr__resolved *out) {
+shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t frame, bool fallback,
+                             shr__resolved *out) {
     uint32_t one = (uint32_t)(id & SHR_ID_VALUE), fffd = 0xFFFD, base = one;
     const uint32_t *cps = &one;
     size_t n = 1;
@@ -384,13 +385,13 @@ shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t fr
     }
     if (frame > f->frame) f->frame = frame;
     hit h = {0};
-    int r;
-    if (id & SHR_ID_EMOJI) { /* the emoji glyph, else the text glyph of a single visible scalar */
+    int r = GLYPH_PENDING;
+    if (!fallback && (id & SHR_ID_EMOJI)) { /* the emoji glyph, else the text glyph of a single visible scalar */
         r = try_package(f, ROLE_EMOJI, cps, n, c, frame, &h);
         if (r == GLYPH_MISSING && n > 1 && kind == SHR_GLYPH_SCALAR)
             r = try_package(f, ROLE_EMOJI, &base, 1, NULL, frame, &h);
         if (r == GLYPH_MISSING && kind == SHR_GLYPH_SCALAR) r = text_chain(f, &base, 1, NULL, frame, &h);
-    } else {
+    } else if (!fallback) {
         r = text_chain(f, cps, n, c, frame, &h);
         if (r == GLYPH_MISSING && n > 1 && kind == SHR_GLYPH_SCALAR) r = text_chain(f, &base, 1, NULL, frame, &h);
     }

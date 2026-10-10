@@ -22,10 +22,16 @@ static shr_status op_resolve(shr__res *res, uint64_t id, uint64_t frame, const s
     shr__memo *m = &f->memo[((id & UINT32_MAX) * 0x9E3779B1u >> (32 - SHR_FONT_MEMO_BITS)) % SHR_FONT_MEMO];
     *out = &m->r;
     if (m->frame == frame && m->id == id) return m->r.buf ? SHR_OK : SHR_E_NOT_FOUND;
-    shr_status st = shr__font_resolve(f, id, frame, &m->r);
+    shr_status st = shr__font_resolve(f, id, frame, false, &m->r);
     if (st == SHR_E_NOT_FOUND) m->r.buf = NULL;
     m->id = id, m->frame = st == SHR_OK || st == SHR_E_NOT_FOUND ? frame : 0;
     return st;
+}
+
+static shr_status op_fallback(shr__res *res, uint64_t id, uint64_t frame, const shr__resolved **out) {
+    shr_pl_res_bitmap_font *f = font_of(res);
+    *out = &f->spare;
+    return shr__font_resolve(f, id, frame, true, &f->spare);
 }
 
 static void op_frame_end(shr__res *res, uint64_t frame) {
@@ -119,7 +125,7 @@ static void op_shutdown(shr__res *res) {
 
 static void op_free(shr__res *res) { font_free(font_of(res)); }
 
-static const shr__res_ops font_ops = {op_resolve, op_frame_end, op_pump, op_has_work, op_deadline,
+static const shr__res_ops font_ops = {op_resolve, op_fallback, op_frame_end, op_pump, op_has_work, op_deadline,
                                       op_io_done, op_shutdown, op_free};
 
 shr_status shr_pl_res_bitmap_font_desc_init(shr_pl_res_bitmap_font_desc *desc) {

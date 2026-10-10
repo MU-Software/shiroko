@@ -20,6 +20,7 @@ static void frame_reset(shr_context *ctx) {
     f->band_y = f->oy = 0, f->band_k = 0;
     f->synced = 0;
     f->nmoves = 0;
+    f->taken = f->short_bufs = 0;
     f->state = FRAME_IDLE;
     f->has_output = f->built = f->running = f->took_damage = f->prov_stale = false;
     f->refused = false;
@@ -75,18 +76,20 @@ static shr_status plan_begin(shr_context *ctx, shr__frame *f, bool submitted) {
 }
 
 /* A free id for `b`, evicting registered buffers the frame does not draw from, least recently used first.
- * Touched buffers move to the front of the LRU, so the oldest one is untouched unless none is. */
+ * Touched buffers move to the front of the LRU, so the oldest one is untouched unless none is. SHR_E_WOULD_BLOCK: the
+ * frame's buffers hold every id or byte; SHR_E_LIMIT: `b` alone takes more bytes than the driver holds. */
 static shr_status plan_take(shr_context *ctx, shr__frame *f, shr__buf *b) {
     const shr_driver_caps *k = &ctx->driver.caps;
     uint64_t budget = (k->buffer_flags & SHR_BUFFER_COPIES) && k->buffer_bytes ? k->buffer_bytes : UINT64_MAX;
     uint32_t id = 0;
+    if (b->mem.byte_length > budget) return SHR_E_LIMIT;
     for (uint32_t i = 0; i < k->max_buffers && !id; i++)
         if (slot_free(&ctx->slots[i], f->frame_id)) id = i + 1;
     while (!id || f->resident + b->mem.byte_length > budget) {
         shr__lru_node *n = shr__lru_oldest(ctx->lru);
         shr__buf *v = n ? SHR_CONTAINER(n, shr__buf, lru) : NULL;
         shr__slot *s = v ? &ctx->slots[v->id - 1] : NULL;
-        if (!s || s->stamp == f->frame_id) return SHR_E_LIMIT;
+        if (!s || s->stamp == f->frame_id) return SHR_E_WOULD_BLOCK;
         shr_status st = prologue_push(ctx, f, SHR_CMD_BUFFER_RELEASE, v->id, NULL);
         if (st != SHR_OK) return st;
         s->stamp = f->frame_id, s->taken = false;
@@ -95,21 +98,31 @@ static shr_status plan_take(shr_context *ctx, shr__frame *f, shr__buf *b) {
         if (!id) id = v->id;
     }
     ctx->slots[id - 1].stamp = f->frame_id, ctx->slots[id - 1].taken = true;
+    f->taken++;
     f->resident += b->mem.byte_length;
     b->id = id;
     return prologue_push(ctx, f, SHR_CMD_BUFFER_REGISTER, id, b);
 }
 
-/* From the first use in a frame on, b->id is the buffer's id in the frame's plan. */
-static shr_status frame_use(shr_context *ctx, shr__frame *f, shr__buf *b) {
+/* From the first use in a frame on, b->id is the buffer's id in the frame's plan. A buffer with a fallback (`spare`)
+ * leaves the frame's last id to the others, so the fallback can be drawn. SHR_E_WOULD_BLOCK: no id for `b` in the
+ * frame, nor in the plan. */
+static shr_status frame_use(shr_context *ctx, shr__frame *f, shr__buf *b, bool spare) {
     if (b->used == f->frame_id) return SHR_OK;
+    if (spare && f->taken + 1 >= ctx->driver.caps.max_buffers) return SHR_E_WOULD_BLOCK;
     shr__planned *p = shr__vec_push(&f->planned, &ctx->al);
     if (!p) return SHR_E_NO_MEMORY;
     *p = (shr__planned){b, b->id};
+    uint64_t used = b->used;
     b->used = f->frame_id;
     shr__slot *s = b->id ? &ctx->slots[b->id - 1] : NULL;
-    if (!s || s->stamp == f->frame_id) return plan_take(ctx, f, b); /* new, or evicted earlier in this plan */
+    if (!s || s->stamp == f->frame_id) { /* new, or evicted earlier in this plan */
+        shr_status st = plan_take(ctx, f, b);
+        if (st == SHR_E_WOULD_BLOCK) f->planned.len--, b->used = used;
+        return st;
+    }
     s->stamp = f->frame_id, s->taken = true;
+    f->taken++;
     lru_touch(ctx, b);
     if (!s->known) return prologue_push(ctx, f, SHR_CMD_BUFFER_REGISTER, b->id, b);
     if (shr__rect_empty(b->dirty)) return SHR_OK;
@@ -502,7 +515,8 @@ static inline shr_rect band_rect(const shr__frame *f, shr_rect r) {
     return (shr_rect){r.x0, r.y0 - f->oy, r.x1, r.y1 - f->oy};
 }
 
-/* Pixels of one GLYPH/IMAGE command inside `clip`; *provisional is set when a fallback was drawn. */
+/* Pixels of one GLYPH/IMAGE command inside `clip`; *provisional is set when a fallback was drawn. A buffer that gets
+ * no id in the frame draws the resource's fallback, else nothing, and is drawn again once the ids are free. */
 static shr_status emit_resolved(shr_context *ctx, shr__frame *f, shr_point o, const shr__lcmd *lc, shr_rect clip,
                                 bool *provisional) {
     const shr__resolved *r;
@@ -517,42 +531,52 @@ static shr_status emit_resolved(shr_context *ctx, shr__frame *f, shr_point o, co
         return SHR_E_NO_MEMORY;
     }
     if (slot) *slot = lc->res;
-    bool glyph = lc->kind == SHR__LCMD_GLYPH;
-    uint32_t syn = glyph ? lc->flags & r->synth & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC) : 0;
-    int32_t w = r->rect.x1 - r->rect.x0, h = r->rect.y1 - r->rect.y0;
-    if (r->scale_w) w = r->scale_w, h = r->scale_h;
-    int32_t x0 = 0, x1 = w;
-    if (syn) shr__glyph_footprint(w, h, syn, r->slant_axis, &x0, &x1);
-    int32_t x, y;
-    shr_rect full;
-    bool far = __builtin_add_overflow(o.x, lc->anchor.x, &x);
-    far |= __builtin_add_overflow(x, r->offset.x, &x);
-    far |= __builtin_add_overflow(o.y, lc->anchor.y, &y);
-    far |= __builtin_add_overflow(y, r->offset.y, &y);
-    far |= __builtin_add_overflow(x, x0, &full.x0);
-    far |= __builtin_add_overflow(x, x1, &full.x1);
-    far |= __builtin_add_overflow(y, h, &full.y1);
-    full.y0 = y;
-    int64_t fx = x, fy = y;
-    if (__builtin_expect(far, 0)) {
-        fx = (int64_t)o.x + lc->anchor.x + r->offset.x, fy = (int64_t)o.y + lc->anchor.y + r->offset.y;
-        full = (shr_rect){shr__clamp32(fx + x0), shr__clamp32(fy), shr__clamp32(fx + x1), shr__clamp32(fy + h)};
+    const shr__res_ops *ops = lc->res->ops;
+    const bool glyph = lc->kind == SHR__LCMD_GLYPH;
+    for (bool spare = ops->fallback && !r->provisional;; spare = false) {
+        uint32_t syn = glyph ? lc->flags & r->synth & (SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC) : 0;
+        int32_t w = r->rect.x1 - r->rect.x0, h = r->rect.y1 - r->rect.y0;
+        if (r->scale_w) w = r->scale_w, h = r->scale_h;
+        int32_t x0 = 0, x1 = w;
+        if (syn) shr__glyph_footprint(w, h, syn, r->slant_axis, &x0, &x1);
+        int32_t x, y;
+        shr_rect full;
+        bool far = __builtin_add_overflow(o.x, lc->anchor.x, &x);
+        far |= __builtin_add_overflow(x, r->offset.x, &x);
+        far |= __builtin_add_overflow(o.y, lc->anchor.y, &y);
+        far |= __builtin_add_overflow(y, r->offset.y, &y);
+        far |= __builtin_add_overflow(x, x0, &full.x0);
+        far |= __builtin_add_overflow(x, x1, &full.x1);
+        far |= __builtin_add_overflow(y, h, &full.y1);
+        full.y0 = y;
+        int64_t fx = x, fy = y;
+        if (__builtin_expect(far, 0)) {
+            fx = (int64_t)o.x + lc->anchor.x + r->offset.x, fy = (int64_t)o.y + lc->anchor.y + r->offset.y;
+            full = (shr_rect){shr__clamp32(fx + x0), shr__clamp32(fy), shr__clamp32(fx + x1), shr__clamp32(fy + h)};
+        }
+        shr_rect d = shr__rect_intersect(full, clip);
+        if (shr__rect_empty(d)) return SHR_OK;
+        *provisional = r->provisional;
+        if ((st = frame_use(ctx, f, r->buf, spare)) == SHR_E_WOULD_BLOCK) {
+            if (r->buf->refused != f->frame_id) r->buf->refused = f->frame_id, f->short_bufs++;
+            *provisional = true;
+            if (!spare || (st = ops->fallback(lc->res, lc->id, f->frame_id, &r)) == SHR_E_NOT_FOUND) return SHR_OK;
+            if (st != SHR_OK) return st;
+            continue;
+        }
+        if (st != SHR_OK) return st;
+        shr_draw_cmd *c = push_cmd(ctx, f, &st);
+        if (!c) return st;
+        c->kind = glyph ? SHR_CMD_GLYPH : SHR_CMD_IMAGE;
+        c->flags = (uint16_t)(glyph ? (lc->flags & (SHR_GLYPH_DIM | SHR_GLYPH_ON_FILL)) | syn : 0);
+        c->buffer = r->buf->id;
+        c->dst = band_rect(f, d);
+        c->src_origin = (shr_point){(int32_t)(d.x0 - fx), (int32_t)(d.y0 - fy)};
+        c->color = lc->color, c->bg = lc->bg, c->src_rect = r->rect;
+        c->slant_axis = syn & SHR_GLYPH_ITALIC ? r->slant_axis : 0;
+        if (r->scale_w) c->flags = SHR_IMAGE_SCALED, c->scale_w = r->scale_w, c->scale_h = r->scale_h;
+        return SHR_OK;
     }
-    shr_rect d = shr__rect_intersect(full, clip);
-    if (shr__rect_empty(d)) return SHR_OK;
-    *provisional = r->provisional;
-    if ((st = frame_use(ctx, f, r->buf)) != SHR_OK) return st;
-    shr_draw_cmd *c = push_cmd(ctx, f, &st);
-    if (!c) return st;
-    c->kind = glyph ? SHR_CMD_GLYPH : SHR_CMD_IMAGE;
-    c->flags = (uint16_t)(glyph ? (lc->flags & (SHR_GLYPH_DIM | SHR_GLYPH_ON_FILL)) | syn : 0);
-    c->buffer = r->buf->id;
-    c->dst = band_rect(f, d);
-    c->src_origin = (shr_point){(int32_t)(d.x0 - fx), (int32_t)(d.y0 - fy)};
-    c->color = lc->color, c->bg = lc->bg, c->src_rect = r->rect;
-    c->slant_axis = syn & SHR_GLYPH_ITALIC ? r->slant_axis : 0;
-    if (r->scale_w) c->flags = SHR_IMAGE_SCALED, c->scale_w = r->scale_w, c->scale_h = r->scale_h;
-    return SHR_OK;
 }
 
 static shr_status keep_draw(shr_context *ctx, shr__frame *f, uint32_t id, shr_rect dst, shr_rect part) {
@@ -1001,12 +1025,18 @@ static void start_frame(shr_context *ctx) {
 }
 
 static void raster_complete(shr_context *ctx, shr__frame *f) {
-    shr__ctx_trace(ctx, SHR_TRACE_RASTER_END, f->frame_id, f->pushed + f->prologue.len, 0);
+    shr__ctx_trace(ctx, SHR_TRACE_RASTER_END, f->frame_id, f->pushed + f->prologue.len, f->short_bufs);
     if (ctx->band_count) shr__ctx_trace(ctx, SHR_TRACE_CONVERT, f->frame_id, f->converted, 0);
     f->prologue.len = 0;
     resolved_end(&f->resolved, f->frame_id);
     f->took_damage = false;
     shr__target *t = f->target_rec >= 0 && ctx->targets[f->target_rec].used ? &ctx->targets[f->target_rec] : NULL;
+    if (f->short_bufs && !ctx->short_logged)
+        shr__ctx_log(ctx, SHR_E_LIMIT, "driver buffer ids ran short: fallbacks drawn");
+    ctx->short_logged = f->short_bufs > 0;
+    /* What got no id is drawn again at once, while fewer buffers go without: the next frame draws less. */
+    if (f->short_bufs && t && (!ctx->short_bufs || f->short_bufs < ctx->short_bufs)) f->prov_stale = true;
+    ctx->short_bufs = f->short_bufs;
     if (t && f->provisional.len) shr__moves_drop(ctx, &t->damage); /* moved since: the rects would be out of place */
     if (f->prov_stale && f->provisional.len) {
         for (size_t i = 0; t && i < f->provisional.len; i++)
@@ -1148,6 +1178,7 @@ static void provisional_changed(shr_context *ctx) {
     }
     if (ctx->last_provisional) ctx->stale = true;
     ctx->last_provisional = false;
+    ctx->short_bufs = 0;
     if (ctx->frame.state == FRAME_RASTER) ctx->frame.prov_stale = true;
 }
 
@@ -1180,6 +1211,7 @@ shr_status shr_submit(shr_context *ctx) {
     ctx->staged.nmoves = 0;
     ctx->submitted = ctx->has_submitted = true;
     ctx->failed = false;
+    ctx->short_bufs = 0;
     shr__ctx_trace(ctx, SHR_TRACE_SUBMIT, ctx->next_frame_id, 0, 0);
     return first;
 }

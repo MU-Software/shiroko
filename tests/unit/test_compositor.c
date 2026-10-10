@@ -18,7 +18,7 @@ static struct {
     shr_draw_cmd pro[64];
     size_t npro;
     int frames, logs, kinds[16];
-    uint64_t damaged, commands; /* of the last RASTER_BEGIN, RASTER_END */
+    uint64_t damaged, commands, short_bufs; /* of the last RASTER_BEGIN, RASTER_END */
     uint64_t submit_id;         /* of the last SUBMIT */
     uint64_t converted;         /* of the last CONVERT */
     int syncs;
@@ -31,7 +31,7 @@ static void rec_trace(void *user, const shr_trace_event *ev) {
     (void)user;
     rec.kinds[ev->kind]++;
     if (ev->kind == SHR_TRACE_RASTER_BEGIN) rec.frames++, rec.damaged = ev->value1;
-    if (ev->kind == SHR_TRACE_RASTER_END) rec.commands = ev->value0;
+    if (ev->kind == SHR_TRACE_RASTER_END) rec.commands = ev->value0, rec.short_bufs = ev->value1;
     if (ev->kind == SHR_TRACE_SUBMIT) rec.submit_id = ev->id;
     if (ev->kind == SHR_TRACE_CONVERT) rec.converted = ev->value0;
 }
@@ -131,7 +131,7 @@ static void fk_free(shr__res *r) {
     shr__buf_free(r->ctx, &((fake *)r)->buf);
 }
 
-static const shr__res_ops fk_ops = {fk_resolve, fk_end, fk_pump, fk_work, fk_deadline, fk_io, fk_shutdown, fk_free};
+static const shr__res_ops fk_ops = {fk_resolve, NULL, fk_end, fk_pump, fk_work, fk_deadline, fk_io, fk_shutdown, fk_free};
 static const shr__res_ops bare_ops = {.resolve = fk_resolve, .free = fk_free};
 
 static void fake_wrap(fake *f, shr_pixel_format format, shr_memory_domain domain) {
@@ -2054,7 +2054,8 @@ static void tweak_two_ids(shr_context_desc *d, shr_framebuffer_driver *drv) {
 }
 
 /* A band's commands are built once the band before ran, yet buffer ids stay held for the frame: no band evicts a
- * buffer an earlier band drew from, also one that took the id of a buffer it evicted. */
+ * buffer an earlier band drew from, also one that took the id of a buffer it evicted; a buffer left without is not
+ * drawn. */
 TEST test_band_buffers_held_for_frame(void) {
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_two_ids);
@@ -2069,13 +2070,15 @@ TEST test_band_buffers_held_for_frame(void) {
     paint(l, 2, old);
     frame(ctx);
     drain(ctx);
-    /* A takes the id of X in band 0, B that of Y in band 1; C finds none in band 2. */
+    /* A takes the id of X in band 0, B that of Y in band 1; C finds none in band 2, where A draws again. */
     const shr__lcmd cur[4] = {glyph(&r[2], 0, 0, GREEN), glyph(&r[3], 0, 16, BLUE), glyph(&r[4], 0, 32, RED),
                               glyph(&r[2], 8, 32, GREEN)};
     paint(l, 4, cur);
     frame(ctx);
-    ASSERT_EQ_LL(expect_event(ctx, SHR_EVENT_PRESENT_FAILED).status, SHR_E_LIMIT);
-    ASSERT_EQ_LL(h.drv.calls, 6 + 4); /* bands 0 and 1 ran */
+    expect_event(ctx, SHR_EVENT_PRESENT_ACCEPTED);
+    expect_event(ctx, SHR_EVENT_FRAME_RELEASED);
+    ASSERT(r[2].buf.id == 1 && r[3].buf.id == 2 && r[4].buf.id == 0 && rec.short_bufs == 1);
+    ASSERT(px(h.out.shown, 0, 0) == GREEN && px(h.out.shown, 0, 16) == BLUE && px(h.out.shown, 8, 32) == GREEN);
     const shr__lcmd again[3] = {glyph(&r[2], 0, 0, GREEN), glyph(&r[3], 0, 16, BLUE), glyph(&r[2], 8, 32, GREEN)};
     paint(l, 3, again);
     frame(ctx);
@@ -2637,7 +2640,7 @@ TEST test_buffer_lost_batch_released(void) {
     PASS();
 }
 
-/* Every driver has max_buffers ids; a frame drawing from more buffers fails with SHR_E_LIMIT. */
+/* Every driver has max_buffers ids; a frame drawing from more buffers leaves out what gets none. */
 TEST test_buffer_eviction_by_ids(void) {
     limit_ids = 2, limit_flags = SHR_BUFFER_COPIES, limit_bytes = 0;
     harness h;
@@ -2652,11 +2655,6 @@ TEST test_buffer_eviction_by_ids(void) {
     frame(ctx);
     ASSERT(rec.npro == 2 && pro_is(0, SHR_CMD_BUFFER_RELEASE, 1) && pro_is(1, SHR_CMD_BUFFER_REGISTER, 1));
     ASSERT(a.buf.id == 0 && b.buf.id == 2 && c.buf.id == 1);
-    draw_fakes(l, 3, (fake *[]){&a, &b, &c});
-    frame(ctx);
-    shr_event ev;
-    ASSERT(count_events(ctx, SHR_EVENT_PRESENT_FAILED, &ev) == 1 && ev.status == SHR_E_LIMIT);
-    ASSERT(a.buf.id == 0 && b.buf.id == 2 && c.buf.id == 1 && ctx->slots[0].buf == &c.buf);
     draw_fakes(l, 1, (fake *[]){&a}); /* frees an id while a frame waits: the freed buffer was its victim */
     h.drv.block_next = 1;
     frame(ctx);
@@ -2673,8 +2671,22 @@ TEST test_buffer_eviction_by_ids(void) {
     draw_fakes(l, 1, (fake *[]){&a});
     frame(ctx);
     ASSERT_EQ_LL(rec.npro, 0); /* no stale RELEASE of the id a holds */
+    /* With every id the frame's: the buffer left without one is not drawn, then drawn by the next frame by itself. */
+    fake d;
+    fake_attach(&d, ctx, &fk_ops);
+    draw_fakes(l, 3, (fake *[]){&a, &c, &d});
+    int logs = rec.logs;
+    shr_request_redraw(ctx);
+    frame(ctx);
+    ASSERT(count_events(ctx, SHR_EVENT_PRESENT_FAILED, NULL) == 0 && h.out.presents == 5 && rec.logs == logs + 1);
+    ASSERT(rec.short_bufs == 1 && d.buf.id == 0 && px(h.out.shown, 9, 1) == WHITE && px(h.out.shown, 17, 1) != WHITE);
+    ASSERT_EQ_LL(deadline(ctx), SHR_DEADLINE_NOW);
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 6 && rec.short_bufs == 0 && d.buf.id != 0 && rec.damaged == 8 * 16);
+    ASSERT(px(h.out.shown, 1, 1) == WHITE && px(h.out.shown, 9, 1) == WHITE && px(h.out.shown, 17, 1) == WHITE);
+    ASSERT_EQ_LL(rec.logs, logs + 1);
     destroy_layers(&l, 1);
-    a.res.dead = c.res.dead = true;
+    a.res.dead = c.res.dead = d.res.dead = true;
     harness_close(&h);
     PASS();
 }

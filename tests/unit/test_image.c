@@ -483,6 +483,50 @@ TEST test_image_pinned_by_frames(void) {
     PASS();
 }
 
+/* An image that gets no buffer id is left out of the frame and, on a preserved output, drawn by the frames after it
+ * while each leaves fewer out; one that a whole frame would leave out again is left at that. */
+TEST test_image_left_out_without_id(void) {
+    caps = (shr_driver_caps){.max_buffers = 2};
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak);
+    caps = (shr_driver_caps){0};
+    static const uint8_t rgba[3][4] = {{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}};
+    static uint8_t px4[3][16], wide[HW * HH * 4];
+    shr_pl_res_image *img[3], *top;
+    for (int i = 0; i < 3; i++) {
+        for (int k = 0; k < 4; k++) memcpy(px4[i] + 4 * k, rgba[i], 4);
+        ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, px4[i], 8, &img[i]), SHR_OK);
+    }
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    set_commands(l, 3, img);
+    frame(ctx);
+    ASSERT(h.out.presents == 1 && px(h.out.shown, 0, 0) == RED && px(h.out.shown, 4, 0) == GREEN);
+    ASSERT(px(h.out.shown, 8, 0) != BLUE);
+    shr_deadline dl;
+    ASSERT(shr_next_deadline(ctx, &dl) == SHR_OK && dl.kind == SHR_DEADLINE_NOW);
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 2 && px(h.out.shown, 8, 0) == BLUE && rec.damaged == 4);
+
+    for (size_t i = 0; i < sizeof(wide); i += 4) wide[i + 2] = 255, wide[i + 3] = 128;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, HW, HH, wide, HW * 4, &top), SHR_OK);
+    shr_lyr *over = image_layer(ctx, 1, top, FULL, (shr_point){0, 0});
+    set_commands(l, 2, img);
+    frame(ctx);
+    ASSERT(h.out.presents == 3 && px(h.out.shown, 0, 0) == RED && px(h.out.shown, 20, 20) == 0);
+    shr_pump(ctx); /* the whole screen again, which leaves it out again */
+    shr_pump(ctx);
+    ASSERT(h.out.presents == 4 && rec.frames == 4 && rec.damaged == HW * HH && px(h.out.shown, 20, 20) == 0);
+    ASSERT(shr_next_deadline(ctx, &dl) == SHR_OK && dl.kind != SHR_DEADLINE_NOW);
+    ASSERT_EQ_LL(shr_lyr_destroy(over), SHR_OK);
+    ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
+    for (int i = 0; i < 3; i++) ASSERT_EQ_LL(shr_pl_res_image_release(img[i]), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(top), SHR_OK);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
 /* The memory the pending batch registered for buffer `id`. */
 static const uint8_t *pending_buffer(const harness *h, uint32_t id) {
     for (size_t i = 0; i < h->drv.pending_count; i++)
@@ -680,6 +724,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_image_update_arguments);
     RUN_TEST(test_image_update_damages_every_buffer);
     RUN_TEST(test_image_pinned_by_frames);
+    RUN_TEST(test_image_left_out_without_id);
     RUN_TEST(test_image_double_buffer);
     RUN_TEST(test_image_pinned_across_bands);
     RUN_TEST(test_image_id_freed_while_a_frame_is_built);
