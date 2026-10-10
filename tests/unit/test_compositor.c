@@ -877,6 +877,7 @@ static void probe(unsigned kind) {
     host.kinds |= 1u << kind;
     host.probes++;
     static const uint32_t rgba = 0xFFFFFFFFu;
+    const shr_image_source one = {1, 1, SHR_IMAGE_SRC_RGBA8888, &rgba, 4};
     shr_screen_desc sd;
     shr_screen_desc_init(&sd);
     sd.width = HW, sd.height = HH;
@@ -884,6 +885,7 @@ static void probe(unsigned kind) {
     shr_deadline dl;
     shr_lyr *l;
     shr_pl_res_image *img;
+    uint64_t used;
     shr_rect r = {0, 0, 1, 1}, none = {0, 0, 0, 0};
     shr__lcmd c = fill(r, 0);
     fake f;
@@ -901,7 +903,9 @@ static void probe(unsigned kind) {
         shr__lyr_attach(host.lyr, &host, NULL, NULL, NULL), shr__res_attach(ctx, &f.res, &fk_ops),
         shr__ctx_read(ctx, &f.res, &src, 0, 0, NULL, 0), shr_pl_res_image_create(ctx, 1, 1, &rgba, 4, &img),
         shr_pl_res_image_update(host.img, r, &rgba, 4), shr_pl_res_image_update(host.img, none, NULL, 0),
-        shr_lyr_cmd_image(host.lyr, host.img, none, (shr_point){0, 0}), shr_pl_res_image_release(host.img)};
+        shr_lyr_cmd_image(host.lyr, host.img, none, (shr_point){0, 0}), shr_pl_res_image_budget(ctx, &used, NULL),
+        shr_pl_res_image_create_scaled(ctx, &one, r, 1, 1, SHR_SCALE_BILINEAR, &img),
+        shr_pl_res_image_view(host.img, r, 1, 1, 0, &img), shr_pl_res_image_release(host.img)};
     for (size_t i = 0; i < sizeof(st) / sizeof(st[0]); i++) host.wrong += st[i] != SHR_E_STATE;
     host.wrong += shr_fence_signal(ctx, 1u << 30, SHR_FENCE_SUCCEEDED) != SHR_E_NOT_FOUND;
     host.wrong += shr_asset_complete(ctx, 0, SHR_OK) != SHR_E_NOT_FOUND;

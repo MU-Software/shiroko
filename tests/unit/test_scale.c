@@ -539,6 +539,59 @@ TEST opaque_images_scale_widened(void) {
     PASS();
 }
 
+/* A copy is kept as RGB565 only when the pixels its taps read around `src` are opaque too: an opaque `src` next to a
+ * transparent column stays RGBA8888 (4 budget bytes a pixel) and its edge pixel blends. */
+TEST copies_keep_the_alpha_their_taps_read(void) {
+    static const uint8_t px[12] = {255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 255, 0};
+    const shr_image_source source = {3, 1, SHR_IMAGE_SRC_RGBA8888, px, 12};
+    const shr_scale_src m = {px, 12, 3, 1, 0, 0, 2, 1, 4, 1};
+    for (int k = 0; k < 2; k++) { /* create_scaled, a copy view */
+        harness h;
+        scale_driver = true, budget = 0;
+        shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak);
+        shr_pl_res_image *base = NULL, *img;
+        uint64_t before, after;
+        if (k) ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 3, 1, px, 12, &base), SHR_OK);
+        ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &before, NULL), SHR_OK);
+        if (k)
+            ASSERT_EQ_LL(shr_pl_res_image_view(base, (shr_rect){0, 0, 2, 1}, 4, 1, SHR_SCALE_COPY, &img), SHR_OK);
+        else
+            ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &source, (shr_rect){0, 0, 2, 1}, 4, 1, SHR_SCALE_BILINEAR,
+                                                        &img),
+                         SHR_OK);
+        ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &after, NULL), SHR_OK);
+        ASSERT_EQ_LL(after - before, 16);
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, (shr_rect){0, 0, HW, HH}, &l), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_cmd_fill(l, (shr_rect){0, 0, HW, HH}, SHR_RGB(30, 90, 200)), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_cmd_image(l, img, (shr_rect){0, 0, 4, 1}, (shr_point){5, 3}), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_cmd_commit(l), SHR_OK);
+        frame(ctx);
+        uint8_t fill[4];
+        uint16_t fill16;
+        memcpy(fill, h.out.shown, 4), memcpy(&fill16, h.out.shown, 2);
+        for (int32_t x = 0; x < 4; x++) {
+            uint8_t want[4], d[4];
+            shr_scale_px(&m, SHR_FILTER_BILINEAR, x, 0, want);
+            const uint8_t *got = h.out.shown + ((size_t)3 * HW + (size_t)(x + 5)) * SCREEN_BPP;
+            uint16_t g16;
+            memcpy(&g16, got, 2), memcpy(d, fill, 4);
+            shr_blend8888(d, want);
+            ASSERT(x < 3 || want[3] < 255); /* the edge pixel reads the transparent column */
+            if (SCREEN_BPP == 2 ? g16 != shr_blend565(fill16, want) : memcmp(got, d, 3) != 0) {
+                fprintf(stderr, "case %d pixel %d\n", k, x);
+                FAIL();
+            }
+        }
+        ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
+        ASSERT_EQ_LL(shr_pl_res_image_release(img), SHR_OK);
+        if (base) ASSERT_EQ_LL(shr_pl_res_image_release(base), SHR_OK);
+        harness_close(&h);
+    }
+    PASS();
+}
+
 /* A driver view holds no budget bytes and keeps its released base (and the base's bytes) until it goes. */
 TEST views_keep_their_base(void) {
     harness h;
@@ -650,6 +703,7 @@ int main(int argc, char **argv) {
     RUN_TEST(copies_equal_driver_views);
     RUN_TEST(views_follow_updates);
     RUN_TEST(opaque_images_scale_widened);
+    RUN_TEST(copies_keep_the_alpha_their_taps_read);
     RUN_TEST(views_keep_their_base);
     RUN_TEST(scale_arguments);
     RUN_TEST(driver_view_arguments);

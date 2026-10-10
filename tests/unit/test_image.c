@@ -318,7 +318,8 @@ TEST test_image_create_from_arguments(void) {
     PASS();
 }
 
-/* Too large for what is left: refused before a pixel is read (the rows here are one byte long). */
+/* Too large for what is left: refused before a pixel is read (the rows here are one byte long); a translucent image
+ * that would fit only as RGB565 is refused after its alpha is read. */
 TEST test_image_budget_before_reading(void) {
     harness h;
     budget_bytes = 4096;
@@ -331,6 +332,10 @@ TEST test_image_budget_before_reading(void) {
     s[0].stride = 64, s[1].stride = 3u << 20;
     shr_pl_res_image *img;
     for (int i = 0; i < 2; i++) ASSERT_EQ_LL(shr_pl_res_image_create_from(ctx, &s[i], &img), SHR_E_LIMIT);
+    static uint8_t px[40 * 40 * 4]; /* 3200 bytes as RGB565, 6400 as RGBA8888 */
+    memset(px, 255, sizeof(px));
+    px[3] = 254;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 40, 40, px, 40 * 4, &img), SHR_E_LIMIT);
     harness_close(&h);
     ASSERT_EQ_LL(oom.live, 0);
     PASS();

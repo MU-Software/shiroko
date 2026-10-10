@@ -4,10 +4,16 @@
 
 #define INLINE static inline __attribute__((always_inline))
 
+/* RGB565 pixel v as an RGBA8888 word (R in the low byte), alpha 255. */
+static inline uint32_t rgb565_rgba(uint32_t v) {
+    uint32_t r = v >> 11, g = v >> 5 & 63, b = v & 31;
+    return (r << 3 | r >> 2) | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2) << 16 | 0xFF000000u;
+}
+
 /* One pixel of `format` as straight RGBA: gray g -> (g, g, g), no alpha -> 255. */
 static inline void src_rgba(uint32_t format, const uint8_t *p, uint8_t out[4]) {
     if (format == SHR__SRC_RGB565) {
-        uint32_t v = shr__565_rgba((uint32_t)p[0] | (uint32_t)p[1] << 8);
+        uint32_t v = rgb565_rgba((uint32_t)p[0] | (uint32_t)p[1] << 8);
         out[0] = (uint8_t)v, out[1] = (uint8_t)(v >> 8), out[2] = (uint8_t)(v >> 16), out[3] = 255;
         return;
     }
@@ -50,7 +56,7 @@ INLINE uint32_t texel_word(uint32_t f, const uint8_t *p) {
     } else if (f == SHR__SRC_RGB565) {
         uint16_t u;
         memcpy(&u, p, 2);
-        v = shr__565_rgba(u);
+        v = rgb565_rgba(u);
     } else {
         uint8_t c[4];
         src_rgba(f, p, c);
@@ -116,6 +122,15 @@ static void row_bilinear(const shr__scale *s, int32_t y, int32_t x0, int32_t n, 
     }
 }
 
+/* BILINEAR taps of scaled column i of source columns [s0, s0 + s) over d in an n-column source (shr__scale). */
+static inline void scale_taps(int32_t s0, int32_t s, int32_t d, int32_t n, int32_t i, int32_t *a, int32_t *b,
+                              uint32_t *f) {
+    uint32_t t = (uint32_t)((((uint64_t)(2 * i + 1) * (uint32_t)s + (uint32_t)d) << 15) / (uint32_t)d);
+    int32_t k = s0 + (int32_t)(t >> 16) - 1;
+    *a = k < 0 ? 0 : k >= n ? n - 1 : k, *b = k + 1 < 0 ? 0 : k + 1 >= n ? n - 1 : k + 1;
+    *f = t >> 8 & 255;
+}
+
 /* Source span [*a, *b) in 1/256 px that scaled index i covers on a shrinking axis. */
 static void box_span(int32_t s, int32_t d, int32_t i, int32_t *a, int32_t *b) {
     *a = (int32_t)(((int64_t)i * s * 256) / d), *b = (int32_t)(((int64_t)(i + 1) * s * 256) / d);
@@ -130,8 +145,8 @@ static uint32_t box_w(int32_t a, int32_t b, int32_t k) {
 INLINE void px_box(const shr__scale *s, uint32_t f, int32_t i, int32_t j, uint8_t *out) {
     int32_t sw = s->src.x1 - s->src.x0, sh = s->src.y1 - s->src.y0, xk[2], yk[2], ax = 0, bx = 0, ay = 0, by = 0;
     uint32_t fx, fy;
-    shr__scale_taps(s->src.x0, sw, s->dw, s->w, i, &xk[0], &xk[1], &fx);
-    shr__scale_taps(s->src.y0, sh, s->dh, s->h, j, &yk[0], &yk[1], &fy);
+    scale_taps(s->src.x0, sw, s->dw, s->w, i, &xk[0], &xk[1], &fx);
+    scale_taps(s->src.y0, sh, s->dh, s->h, j, &yk[0], &yk[1], &fy);
     bool hx = sw > s->dw, hy = sh > s->dh;
     int32_t kx0 = 0, kx1 = 1, ky0 = 0, ky1 = 1;
     if (hx) box_span(sw, s->dw, i, &ax, &bx), kx0 = ax >> 8, kx1 = (bx - 1) >> 8;

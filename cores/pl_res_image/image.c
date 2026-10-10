@@ -197,6 +197,7 @@ shr_status shr_pl_res_image_create(shr_context *ctx, int32_t width, int32_t heig
 
 shr_status shr_pl_res_image_budget(shr_context *ctx, uint64_t *used, uint64_t *limit) {
     if (!ctx) return SHR_E_INVALID_ARG;
+    if (shr__ctx_in_callback(ctx)) return SHR_E_STATE;
     void **slot = shr__ctx_plugin_slot(ctx, &budget_kind);
     budget *b = slot ? *slot : NULL;
     if (used) *used = b ? b->used : 0;
