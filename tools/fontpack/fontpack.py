@@ -935,6 +935,8 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
         if kind == "cp" and v in generated:
             rows, bx, top = sprite_glyph(v, m, fmt, baseline)
             if rows is None:
+                if v != 0x2800:
+                    sys.exit(f"{name}: generated U+{v:04X} has no ink at {cw}x{lh}")
                 record_of.append(None)
                 continue
             packed = pack_rows(rows, fmt)

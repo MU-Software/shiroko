@@ -398,7 +398,8 @@ def circle_pieces(cp, c, m):
 def separated_quadrant_rects(w, h):
     gap = max(1, w // 12)
     mx, my = gap * 2 + w % 2, gap * 2 + h % 2
-    qw, qh = (w - gap * 2 - mx) // 2, (h - gap * 2 - my) // 2
+    qw, qh = max(1, (w - gap * 2 - mx) // 2), max(1, (h - gap * 2 - my) // 2)
+    mx, my = min(mx, w - gap * 2 - qw * 2), min(my, h - gap * 2 - qh * 2)  # small cells: pieces keep 1 px
     xs, ys = (gap, gap + qw + mx), (gap, gap + qh + my)
     return [(xs[b % 2], ys[b // 2], xs[b % 2] + qw, ys[b // 2] + qh) for b in range(4)]
 
@@ -406,8 +407,9 @@ def separated_quadrant_rects(w, h):
 def separated_sextant_rects(w, h):
     gap = max(1, w // 12)
     mx, my = gap * 2 + w % 2, gap * 2 + (h % 3) // 2
-    sw = (w - gap * 2 - mx) // 2
-    sh = (h - gap * 2 - my * 2) // 3
+    sw = max(1, (w - gap * 2 - mx) // 2)
+    sh = max(1, (h - gap * 2 - my * 2) // 3)
+    mx, my = min(mx, w - gap * 2 - sw * 2), min(my, (h - gap * 2 - sh * 3) // 2)
     mh = h - gap * 2 - my * 2 - sh * 2
     xs = (gap, gap + sw + mx)
     y1 = gap + sh + my

@@ -2,7 +2,7 @@
 reference images). Each module's check(m) returns violation strings; empty means the glyphs hold."""
 from . import box, cells, curves, names
 
-SIZES = ((8, 16), (10, 20), (6, 12), (7, 14), (9, 17), (12, 24), (16, 32))
+SIZES = ((8, 16), (10, 20), (6, 12), (7, 14), (9, 17), (12, 24), (16, 32), (6, 8))
 MODULES = (box, cells, curves, names)
 
 
