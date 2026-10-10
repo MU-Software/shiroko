@@ -12,7 +12,9 @@
  M   mirror pairs equal within one z2d sample row where the geometry is symmetric in the cell
  K   complement pairs (shapes sharing one diagonal) add up to a full cell
  P   Powerline: E0B0/E0B2 edge column full except the corner rows the triangle cannot fill, E0B4/E0B6 edge column
-     full, triangle tips reach the opposite edge, E0B4/E0B6 reach min(w, h / 2) on the middle row; E0D2 has a light
+     full, triangle tips reach the opposite edge, E0B4-E0B7 reach min(w, h / 2) on the middle row; E0B1/E0B3 tips on
+     the far column and its top pixel empty, E0B5/E0B7 ink in both corners of their edge column, E0B8-E0BE their
+     corner full and the opposite one empty; chevron arms and outlines as wide as the light line; E0D2 has a light
      line's gap in its full column 0 and opens to the right
  F   fade lines F5D2-F5D5: A4 levels fall away from the bright end, at least min(n, 15) levels
  A   axis-parallel glyphs use only 0/255
@@ -20,6 +22,7 @@
 import functools
 import math
 import operator
+import statistics
 
 from .. import box as _box  # noqa: F401  (registers the drawers)
 from .. import branch, legacy, powerline  # noqa: F401
@@ -28,6 +31,8 @@ from ..registry import render
 # z2d rounds an edge through a sample centre half away from zero, so a shape and its mirror image can differ by one
 # sample per sub-scanline and edge (4 samples = 64 per pixel).
 MIRROR_TOL = 64
+# a stroke's measured width may miss the drawn width by this much where z2d's samples cut its edges
+WIDTH_TOL = 0.5
 U, R, D, L = 1, 2, 4, 8
 ARC_EDGES = {0x256D: D | R, 0x256E: D | L, 0x256F: U | L, 0x2570: U | R}
 # The branch glyphs as kitty (where they come from) defines them, not read from branch.py: F5DA-F5ED a light line
@@ -72,6 +77,28 @@ def mosaic_pairs(m):
            for i, p in enumerate(legacy.MOSAICS)}
     comp = [(a, b) for a in ins for b in ins if a < b and all(p != q for p, q in zip(ins[a], ins[b]))]
     return mirror, comp
+
+
+def seg_dist(p, a, z):
+    dx, dy = z[0] - a[0], z[1] - a[1]
+    u = max(0, min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(p[0] - a[0] - u * dx, p[1] - a[1] - u * dy)
+
+
+def stroke_width(b, w, h, segs, i):
+    """Width across segment i of a stroked path: in each row (column, if the segment is flatter than 45 degrees) of its
+    middle half, the ink nearer to it than to the other segments, scaled by the slope; the median of those rows."""
+    a, z = segs[i]
+    d = (z[0] - a[0], z[1] - a[1])
+    k = int(abs(d[1]) >= abs(d[0]))
+    lo, hi = sorted((a[k] + d[k] / 4, a[k] + 3 * d[k] / 4))
+    lines = range(max(0, math.ceil(lo)), min((w, h)[k], math.floor(hi))) or [int((lo + hi) / 2)]
+    sums = []
+    for r in lines:
+        pts = [(s + 0.5, r + 0.5) if k else (r + 0.5, s + 0.5) for s in range((h, w)[k])]
+        sums.append(sum(b[int(y) * w + int(x)] for x, y in pts
+                        if seg_dist((x, y), a, z) <= min(seg_dist((x, y), *o) for o in segs)))
+    return statistics.median(sums) / 255 * abs(d[k]) / math.hypot(*d)
 
 
 def _hflip(b, w, h):
@@ -171,8 +198,8 @@ def check(m):
 
     pairs = [(0x2571, 0x2572, "h"), (0x2573, 0x2573, "h"), (0x2573, 0x2573, "v"), (0xE0B0, 0xE0B2, "h"),
              (0xE0B0, 0xE0B0, "v"), (0xE0B8, 0xE0BA, "h"), (0xE0BC, 0xE0BE, "h"), (0xE0B8, 0xE0BC, "v"),
-             (0xE0B4, 0xE0B4, "v"), (0xE0B1, 0xE0B1, "v"), (0xE0B1, 0xE0B3, "h"), (0xE0D2, 0xE0D4, "h"),
-             (0xE0D2, 0xE0D2, "v"),
+             (0xE0B4, 0xE0B4, "v"), (0xE0B1, 0xE0B1, "v"), (0xE0B1, 0xE0B3, "h"), (0xE0B5, 0xE0B7, "h"),
+             (0xE0D2, 0xE0D4, "h"), (0xE0D2, 0xE0D2, "v"),
              (0x1FBD0, 0x1FBD3, "h"), (0x1FBD0, 0x1FBD2, "v"), (0x1FBD4, 0x1FBD6, "h"), (0x1FBD5, 0x1FBD7, "h"),
              (0x1FBE0, 0x1FBE2, "v"), (0x1FBE1, 0x1FBE3, "h"), (0x1FBE8, 0x1FBEA, "v"), (0x1FBE9, 0x1FBEB, "h"),
              (0x1FBEC, 0x1FBEF, "h"), (0x1FBED, 0x1FBEE, "h")]
@@ -198,19 +225,31 @@ def check(m):
             err("K", f"U+{a:04X} + U+{b:04X} not a full cell ({bad} px)")
 
     k = math.ceil(h / (2 * w))
-    for cp, x in ((0xE0B0, 0), (0xE0B2, w - 1)):
-        edge = col(g(cp), x)
-        if any(v != 255 for v in edge[k:h - k]):
+    tip_rows = {(h - 1) // 2, h // 2}  # the row or the two rows around h / 2
+    for cp, x in ((0xE0B0, 0), (0xE0B2, w - 1), (0xE0B1, 0), (0xE0B3, w - 1)):
+        edge, tip = col(g(cp), x), col(g(cp), w - 1 - x)
+        if cp in (0xE0B0, 0xE0B2) and any(v != 255 for v in edge[k:h - k]):
             err("P", f"U+{cp:04X} edge column {x} has a gap: {edge}")
-        tip = col(g(cp), w - 1 - x)
-        if not all(tip[y] for y in {(h - 1) // 2, h // 2}):  # the row or the two rows around h / 2
-            err("P", f"U+{cp:04X} tip does not reach column {w - 1 - x}")
-    for cp, x in ((0xE0B4, 0), (0xE0B6, w - 1)):
-        if any(v != 255 for v in col(g(cp), x)):
-            err("P", f"U+{cp:04X} edge column {x} has a gap: {col(g(cp), x)}")
-        ink = [i for i, v in enumerate(row(g(cp), h // 2)) if v]
-        if (ink[-1] + 1 if x == 0 else w - ink[0]) != math.ceil(min(w, h / 2)):
-            err("P", f"U+{cp:04X} middle row {row(g(cp), h // 2)} does not reach {min(w, h / 2)}")
+        if not all(tip[y] for y in tip_rows) or cp in (0xE0B1, 0xE0B3) and tip[0]:
+            err("P", f"U+{cp:04X} tip does not reach column {w - 1 - x} or its top pixel has ink {tip}")
+    for cp, x in ((0xE0B4, 0), (0xE0B6, w - 1), (0xE0B5, 0), (0xE0B7, w - 1)):
+        edge, mid = col(g(cp), x), row(g(cp), h // 2)
+        if not (edge[0] and edge[-1]) if cp in (0xE0B5, 0xE0B7) else any(v != 255 for v in edge):
+            err("P", f"U+{cp:04X} edge column {x} has a gap: {edge}")
+        ink = [i for i, v in enumerate(mid) if v]
+        if not ink or (ink[-1] + 1 if x == 0 else w - ink[0]) != math.ceil(min(w, h / 2)):
+            err("P", f"U+{cp:04X} middle row {mid} does not reach {min(w, h / 2)}")
+        if cp in (0xE0B5, 0xE0B7) and abs(sum(mid) / 255 - t) > WIDTH_TOL:
+            err("P", f"U+{cp:04X} middle row {mid} is not {t} px wide")
+    for cp, arms in ((0xE0B1, [((0, 0), (w, h / 2)), ((w, h / 2), (0, h))]),
+                     (0xE0B3, [((w, 0), (0, h / 2)), ((0, h / 2), (w, h))])):
+        for i in range(2):
+            if abs((d := stroke_width(g(cp), w, h, arms, i)) - t) > WIDTH_TOL:
+                err("P", f"U+{cp:04X} arm {arms[i]} is {d:.2f} px wide, not {t}")
+    for cp, full, empty in ((0xE0B8, (0, h - 1), (w - 1, 0)), (0xE0BA, (w - 1, h - 1), (0, 0)),
+                            (0xE0BC, (0, 0), (w - 1, h - 1)), (0xE0BE, (w - 1, 0), (0, h - 1))):
+        if g(cp)[full[1] * w + full[0]] != 255 or g(cp)[empty[1] * w + empty[0]]:
+            err("P", f"U+{cp:04X} corner {full} not full or {empty} not empty")
     gap = sum(255 - v for v in col(g(0xE0D2), 0)) / 255
     if abs(gap - t) > 0.5 or sum(col(g(0xE0D2), 0)) <= sum(col(g(0xE0D2), w - 1)):
         err("P", f"U+E0D2 column 0 {col(g(0xE0D2), 0)} misses {gap:.2f} px, not {t}, or the right column has more ink")
