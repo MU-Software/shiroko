@@ -195,7 +195,6 @@ static void lines_cut(shr__lines *l, int32_t c0, int32_t c1) {
 
 /* Clears [*c0, *c1) of row r widened to the wide cells reaching into it. */
 static void clear_cells(shr__tilemap *t, int32_t r, int32_t *c0, int32_t *c1) {
-    if (*c0 >= *c1) return;
     shr__cell *row = row_at(t, r);
     if (row[*c0].kind == CELL_CONT) *c0 -= row[*c0].span;
     int32_t last = *c1 - 1;
@@ -285,7 +284,7 @@ static shr_status build_row(shr__tilemap *t, int32_t r) {
         covered += fill ? e->span : 0;
         k[0] = (uint64_t)e->fg << 32 | e->bg;
         k[1] = (uint64_t)e->glyph << 32 | (uint32_t)c << 17 | (uint32_t)(e->span - 1) << 9 | (uint32_t)e->flags << 1 |
-               e->has_glyph,
+               e->has_glyph;
         k += 2;
         n += e->has_glyph && (e->fg >> 24);
     }
@@ -502,48 +501,35 @@ static shr_status cell_new(shr__tilemap *t, const char *utf8, size_t len, uint32
     return st == SHR_OK ? cell_make(t, utf8, len, span, s, cps, n, &cls, out) : st;
 }
 
-/* The head a valid cluster within the cell limits makes at (r, c), from the memo when it holds the text; an empty
- * cell when the grid holds it already. */
-static shr_status cell_for(shr__tilemap *t, int32_t r, int32_t c, const char *utf8, size_t len, uint32_t span,
-                           shr_text_style s, shr__cell *out) {
-    uint64_t key = len && len <= 8 ? text_key(utf8, len) : 0;
-    if (cell_same(t, r, c, utf8, len, key, span, s)) return *out = (shr__cell){0}, SHR_OK;
-    shr__memo *m = len && len <= 8 ? memo_slot(t, key) : NULL;
-    if (m && m->len == len && m->key == key) {
-        *out = head(s, m->glyph, len, span, m->has_glyph);
-        memcpy(out->text, &key, sizeof(key));
-        return SHR_OK;
-    }
-    shr_status st = cell_new(t, utf8, len, span, s, out);
-    if (st == SHR_OK && m) *m = (shr__memo){key, out->glyph, (uint8_t)len, out->has_glyph};
-    return st;
-}
-
 static void cell_put(shr__tilemap *t, int32_t r, int32_t c, const shr__cell *e) {
     if (e->kind != CELL_HEAD) return;
     t->long_text |= e->len > CELL_INLINE;
     *place(t, r, c, e->span) = *e;
 }
 
-/* cell_for() and cell_put(), a head from the memo written in place. Forced inline, as are cell_same() and text_key():
- * clang takes the code after set_cell's checks for cold and inlines next to nothing there. */
+/* The head a valid cluster within the cell limits makes at (r, c), from the memo when it holds the text: into `out`
+ * (an empty cell when the grid holds it already), or with `out` NULL into the grid. Forced inline, as are cell_same()
+ * and text_key(), so that set_cell makes no call for a cell the memo holds. */
 static inline __attribute__((always_inline)) shr_status cell_set(shr__tilemap *t, int32_t r, int32_t c,
                                                                  const char *utf8, size_t len, uint32_t span,
-                                                                 shr_text_style s) {
+                                                                 shr_text_style s, shr__cell *out) {
     uint64_t key = len && len <= 8 ? text_key(utf8, len) : 0;
-    if (cell_same(t, r, c, utf8, len, key, span, s)) return SHR_OK;
+    if (cell_same(t, r, c, utf8, len, key, span, s)) {
+        if (out) *out = (shr__cell){0};
+        return SHR_OK;
+    }
     shr__memo *m = len && len <= 8 ? memo_slot(t, key) : NULL;
     if (m && m->len == len && m->key == key) {
-        shr__cell *e = place(t, r, c, span);
+        shr__cell *e = out ? out : place(t, r, c, span);
         *e = head(s, m->glyph, len, span, m->has_glyph);
         memcpy(e->text, &key, sizeof(key));
         return SHR_OK;
     }
-    shr__cell e;
-    shr_status st = cell_new(t, utf8, len, span, s, &e);
+    shr__cell e, *d = out ? out : &e;
+    shr_status st = cell_new(t, utf8, len, span, s, d);
     if (st != SHR_OK) return st;
-    if (m) *m = (shr__memo){key, e.glyph, (uint8_t)len, e.has_glyph};
-    cell_put(t, r, c, &e);
+    if (m) *m = (shr__memo){key, d->glyph, (uint8_t)len, d->has_glyph};
+    if (!out) cell_put(t, r, c, d);
     return SHR_OK;
 }
 
@@ -563,18 +549,19 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
         if ((st = cluster_decode(utf8, length, cps, &n, &cls)) != SHR_OK) return st;
         utf8 = SHR_REPLACEMENT_UTF8, length = 3;
     }
-    return cell_set(t, row, col, utf8, length, span, style);
+    return cell_set(t, row, col, utf8, length, span, style, NULL);
 }
 
 static shr_status lines_check(const shr__tilemap *t, const shr_text_line *in, size_t n, shr_error_info *err) {
-    if (n && !in) return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "missing lines");
-    if (n > 4 * (size_t)t->cols) return shr__fail(err, SHR_E_LIMIT, 0, SIZE_MAX, "more than 4 lines per column");
+    if (n && !in) return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "missing lines");
+    if (n > 4 * (size_t)t->cols) return shr__fail(err, SHR_E_LIMIT, SIZE_MAX, SIZE_MAX, "more than 4 lines per column");
     for (size_t i = 0; i < n; i++) {
         const shr_text_line *e = &in[i];
-        if (!e->cols || e->col + e->cols > t->cols) return shr__fail(err, SHR_E_INVALID_ARG, 0, i, "line outside the grid");
+        if (!e->cols || e->col + e->cols > t->cols)
+            return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, i, "line outside the grid");
         if (e->kind > SHR_LINE_OVER || e->shape > SHR_LINE_DASHED || (e->flags & ~SHR_TEXT_LINE_BLINK) ||
             !shr__alpha_known(e->color, true))
-            return shr__fail(err, SHR_E_UNKNOWN_STYLE, 0, i, "unknown line kind, shape, flag or colour alpha");
+            return shr__fail(err, SHR_E_UNKNOWN_STYLE, SIZE_MAX, i, "unknown line kind, shape, flag or colour alpha");
     }
     return SHR_OK;
 }
@@ -592,10 +579,11 @@ shr_status shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_t
     shr__err_clear(err);
     shr__tilemap *t;
     shr_status st = tilemap_get(layer, &t);
-    if (st != SHR_OK) return shr__fail(err, st, 0, SIZE_MAX, "not a tilemap layer or context busy");
-    if (row < 0 || row >= t->rows) return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "row outside the grid");
+    if (st != SHR_OK) return shr__fail(err, st, SIZE_MAX, SIZE_MAX, "not a tilemap layer or context busy");
+    if (row < 0 || row >= t->rows) return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "row outside the grid");
     if ((st = lines_check(t, lines, count, err)) != SHR_OK) return st;
-    if (!lines_room(t, row_lines(t, row), count)) return shr__fail(err, SHR_E_NO_MEMORY, 0, SIZE_MAX, "no memory");
+    if (!lines_room(t, row_lines(t, row), count))
+        return shr__fail(err, SHR_E_NO_MEMORY, SIZE_MAX, SIZE_MAX, "no memory");
     lines_set(t, row, lines, count);
     return SHR_OK;
 }
@@ -634,7 +622,7 @@ static shr_status row_cluster(shr__tilemap *t, int32_t r, int32_t c, const shr_r
     shr__placed *d = shr__vec_push(&t->placed, &t->al);
     if (!d) return SHR_E_NO_MEMORY;
     d->row = r, d->col = c;
-    shr_status st = cell_for(t, r, c, u, len, e->span, in->styles[e->style], &d->cell);
+    shr_status st = cell_set(t, r, c, u, len, e->span, in->styles[e->style], &d->cell);
     if (st != SHR_OK) t->placed.len--;
     return st;
 }
@@ -673,7 +661,7 @@ shr_status shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t col, 
     if (st != SHR_OK) {
         for (size_t k = 0; k < t->placed.len; k++) cell_free(&t->al, &SHR_VEC_AT(&t->placed, shr__placed, k)->cell);
         t->placed.len = 0;
-        return shr__fail(err, st, SIZE_MAX, i, "invalid cell");
+        return shr__fail(err, st, SIZE_MAX, i, st == SHR_E_NO_MEMORY ? "no memory" : "invalid cell");
     }
     size_t made = 0;
     c = col;
@@ -686,7 +674,7 @@ shr_status shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t col, 
         } else {
             uint64_t w = 0;
             size_t len = e->scalars ? cp_utf8(e->text, &w) : 0;
-            cell_set(t, row, at, (const char *)&w, len, e->span, in->styles[e->style]);
+            cell_set(t, row, at, (const char *)&w, len, e->span, in->styles[e->style], NULL);
         }
     }
     t->placed.len = 0;
@@ -732,10 +720,11 @@ shr_status shr_pl_lyr_tilemap_set_text(shr_lyr *layer, int32_t row, int32_t col,
     shr__err_clear(err);
     shr__tilemap *t;
     shr_status st = tilemap_get(layer, &t);
-    if (st != SHR_OK) return shr__fail(err, st, 0, SIZE_MAX, "not a tilemap layer or context busy");
+    if (st != SHR_OK) return shr__fail(err, st, SIZE_MAX, SIZE_MAX, "not a tilemap layer or context busy");
     if (row < 0 || row >= t->rows || col < 0 || col >= t->cols)
-        return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "position outside the grid");
-    if (flags & ~(uint32_t)SHR_TEXT_WRAP) return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "unknown text flag");
+        return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "position outside the grid");
+    if (flags & ~(uint32_t)SHR_TEXT_WRAP)
+        return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "unknown text flag");
     if ((st = shr__style_check(&style, err, SIZE_MAX)) != SHR_OK) return st;
     text_sink k = {t, row, col, utf8, style, runs};
     t->placed.len = 0;
@@ -766,6 +755,7 @@ shr_status shr_pl_lyr_tilemap_clear(shr_lyr *layer, int32_t row, int32_t col, in
     if ((st = clear_style(style)) != SHR_OK) return st;
     if (row < 0 || col < 0 || rows < 0 || cols < 0 || (int64_t)row + rows > t->rows || (int64_t)col + cols > t->cols)
         return SHR_E_INVALID_ARG;
+    if (!rows || !cols) return SHR_OK;
     for (int32_t r = row; r < row + rows; r++) {
         shr__lines *l = row_lines(t, r);
         if (!lines_room(t, l, l->n + lines_split(l, col, col + cols))) return SHR_E_NO_MEMORY;

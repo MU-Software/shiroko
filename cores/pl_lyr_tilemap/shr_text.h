@@ -34,7 +34,7 @@ static inline bool shr__alpha_known(shr_color c, bool half) {
 
 static inline shr_status shr__style_check(const shr_text_style *s, shr_error_info *err, size_t item) {
     if ((s->flags & ~SHR_STYLE_KNOWN_FLAGS) || !shr__alpha_known(s->fg, true) || !shr__alpha_known(s->bg, false))
-        return shr__fail(err, SHR_E_UNKNOWN_STYLE, 0, item, "unknown style flag or colour alpha");
+        return shr__fail(err, SHR_E_UNKNOWN_STYLE, SIZE_MAX, item, "unknown style flag or colour alpha");
     return SHR_OK;
 }
 

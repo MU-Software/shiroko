@@ -94,7 +94,7 @@ static shr_status next_scalar(const shr__layout_in *in, size_t *pos, uint32_t *c
 static shr_status runs_check(const shr__layout_in *in, shr_error_info *err) {
     /* Runs are non-empty, so at most one per byte. */
     if (in->run_count && (!in->runs || in->run_count > in->len))
-        return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "invalid style runs");
+        return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "invalid style runs");
     size_t prev_end = 0;
     for (size_t r = 0; r < in->run_count; r++) {
         const shr_style_run *run = &in->runs[r];
@@ -120,8 +120,8 @@ static shr_status edges_reach(const shr__layout_in *in, size_t *edge, size_t off
 }
 
 shr_status shr__layout(const shr__layout_in *in, int32_t *out_rows, int32_t *out_cols, shr_error_info *err) {
-    if (in->len > SHR_MAX_TEXT_BYTES) return shr__fail(err, SHR_E_LIMIT, 0, SIZE_MAX, "text too long");
-    if (in->len && !in->utf8) return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "null text");
+    if (in->len > SHR_MAX_TEXT_BYTES) return shr__fail(err, SHR_E_LIMIT, SIZE_MAX, SIZE_MAX, "text too long");
+    if (in->len && !in->utf8) return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "null text");
     shr_status st = runs_check(in, err);
     if (st != SHR_OK) return st;
     const bool clip = in->avail_rows > 0;
@@ -227,8 +227,10 @@ shr_status shr_pl_lyr_tilemap_measure(const char *utf8, size_t length, int32_t c
                                       shr_error_info *err) {
     shr__err_clear(err);
     if (extent) *extent = (shr_text_extent){0};
-    if (!extent || (capacity && !out) || cols < 0) return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "invalid argument");
-    if (flags & ~(uint32_t)SHR_TEXT_WRAP) return shr__fail(err, SHR_E_INVALID_ARG, 0, SIZE_MAX, "unknown text flag");
+    if (!extent || (capacity && !out) || cols < 0)
+        return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "invalid argument");
+    if (flags & ~(uint32_t)SHR_TEXT_WRAP)
+        return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "unknown text flag");
     measure_sink sink = {out, capacity, 0};
     shr__layout_in in = {utf8, length, NULL, 0, (flags & SHR_TEXT_WRAP) != 0, cols, 0, measure_emit, &sink};
     shr_text_extent e = {0};

@@ -8,8 +8,11 @@
  *     every batch the driver draws
  *     equals the stateless path, with keeps (some evicted for want of bytes) drawn from what the harness drew for
  *     their rows: a stale keep, or one the driver does not hold, shows up here
- *   - a rejected call changes nothing on screen */
+ *   - a rejected call changes nothing on screen
+ *   - an invisible twin layer gets every tilemap call, set_row as set_cell for each cell then set_lines: after an
+ *     accepted set_row both have the same rows, after a refused one the rows did not change */
 #include "fuzz_common.h"
+#include "compositor.h"
 
 static uint64_t now;
 static uint64_t clock_fn(void *user) {
@@ -99,6 +102,51 @@ static void check_layout(const char *utf8, size_t len, int32_t cols, uint32_t fl
     FUZZ_CHECK(memcmp(&ext, &ext2, sizeof(ext)) == 0 && memcmp(pieces, again, half * sizeof(*again)) == 0);
 }
 
+static size_t put_utf8(uint32_t cp, char *o) {
+    if (cp < 0x80) return o[0] = (char)cp, 1;
+    if (cp < 0x800) return o[0] = (char)(0xC0 | cp >> 6), o[1] = (char)(0x80 | (cp & 63)), 2;
+    if (cp < 0x10000)
+        return o[0] = (char)(0xE0 | cp >> 12), o[1] = (char)(0x80 | (cp >> 6 & 63)), o[2] = (char)(0x80 | (cp & 63)), 3;
+    o[0] = (char)(0xF0 | cp >> 18), o[1] = (char)(0x80 | (cp >> 12 & 63)), o[2] = (char)(0x80 | (cp >> 6 & 63));
+    o[3] = (char)(0x80 | (cp & 63));
+    return 4;
+}
+
+/* set_row's contract on the twin: each cell by set_cell, then the lines. */
+static void twin_row(shr_lyr *twin, int32_t row, int32_t col, const shr_row *in) {
+    for (size_t i = 0; i < in->cell_count; i++) {
+        const shr_row_cell *e = &in->cells[i];
+        char u[4 * 255];
+        size_t len = 0;
+        for (size_t k = 0; k < e->scalars; k++)
+            len += put_utf8(e->scalars > 1 ? in->scalars[e->text + k] : e->text, u + len);
+        FUZZ_CHECK(shr_pl_lyr_tilemap_set_cell(twin, row, col, u, len, e->span, in->styles[e->style]) == SHR_OK);
+        col += e->span;
+    }
+    if (in->lines) FUZZ_CHECK(shr_pl_lyr_tilemap_set_lines(twin, row, in->lines, in->line_count, NULL) == SHR_OK);
+}
+
+/* The row groups of two tilemap layers hold the same commands. */
+static bool same_rows(shr_lyr *a, shr_lyr *b) {
+    if (!a->flush || !b->flush) return a->flush == b->flush;
+    if (a->flush(a->state) != SHR_OK || b->flush(b->state) != SHR_OK || a->groups.len != b->groups.len) return false;
+    for (size_t i = 0; i < a->groups.len; i++) {
+        const shr__group *x = SHR_VEC_AT(&a->groups, shr__group, i), *y = NULL;
+        for (size_t j = 0; j < b->groups.len && !y; j++)
+            if (SHR_VEC_AT(&b->groups, shr__group, j)->id == x->id) y = SHR_VEC_AT(&b->groups, shr__group, j);
+        if (!y || x->n != y->n) return false;
+        for (size_t k = 0; k < x->n; k++) {
+            shr__lcmd p = shr__group_cmd(x, k), q = shr__group_cmd(y, k);
+            bool drawn = p.kind == SHR__LCMD_GLYPH || p.kind == SHR__LCMD_LINE;
+            if (p.kind != q.kind || p.flags != q.flags || p.color != q.color || memcmp(&p.dst, &q.dst, sizeof(p.dst)) ||
+                (drawn && (p.id != q.id || p.bg != q.bg || p.res != q.res)) ||
+                (p.kind == SHR__LCMD_CACHE_BEGIN && memcmp(p.key, q.key, sizeof(p.key))))
+                return false;
+        }
+    }
+    return true;
+}
+
 static fuzz_output out;
 static uint8_t shown[sizeof(out.pixels)], before[sizeof(out.pixels)], direct[sizeof(out.pixels)];
 
@@ -179,8 +227,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     shr_pl_res_bitmap_font *fonts[2], *font = NULL;
     FUZZ_CHECK(shr_pl_res_bitmap_font_create(ctx, &fd, &fonts[0]) == SHR_OK);
     FUZZ_CHECK(shr_pl_res_bitmap_font_create(ctx, &fd, &fonts[1]) == SHR_OK);
-    shr_lyr *layer;
+    shr_lyr *layer, *twin;
     FUZZ_CHECK(shr_lyr_create(ctx, 0, (shr_rect){0, 0, FUZZ_W, FUZZ_H}, &layer) == SHR_OK);
+    FUZZ_CHECK(shr_lyr_create(ctx, 0, (shr_rect){0, 0, FUZZ_W, FUZZ_H}, &twin) == SHR_OK);
+    FUZZ_CHECK(shr_lyr_set_visible(twin, false) == SHR_OK);
     int32_t rows = 0, cols = 0;
     FUZZ_CHECK(shr_pl_lyr_tilemap_set_cell(layer, 0, 0, "a", 1, 1, (shr_text_style){0}) == SHR_E_STATE);
 
@@ -198,6 +248,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             size_t len;
             const char *s = fr_bytes(&r, fr_u8(&r) % 160, &len);
             st = shr_pl_lyr_tilemap_set_cell(layer, row, col, s, len, span, style);
+            FUZZ_CHECK(shr_pl_lyr_tilemap_set_cell(twin, row, col, s, len, span, style) == st);
             if (st == SHR_OK) FUZZ_CHECK(row >= 0 && row < rows && col >= 0 && (int64_t)col + span <= cols);
             break;
         }
@@ -216,6 +267,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             st = shr_pl_lyr_tilemap_set_text(layer, row, col, s, len, style, with_run ? &run : NULL, with_run, flags,
                                              &err);
             FUZZ_CHECK(err.status == st);
+            FUZZ_CHECK(shr_pl_lyr_tilemap_set_text(twin, row, col, s, len, style, with_run ? &run : NULL, with_run,
+                                                   flags, NULL) == st);
             if (st != SHR_OK) FUZZ_CHECK(err.reason != NULL);
             if (!with_run && !(flags & ~(uint32_t)SHR_TEXT_WRAP) && style_known(style) && row >= 0 &&
                 row < rows && col >= 0 && col < cols) {
@@ -227,12 +280,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
         case 2: {
             int32_t row = fr_i8(&r), col = fr_i8(&r), nr = fr_i8(&r), nc = fr_i8(&r);
+            shr_text_style style = fr_style(&r);
             if (op & 8) { /* rows [row, col) by nr */
-                st = shr_pl_lyr_tilemap_scroll(layer, row, col, nr, fr_style(&r));
+                st = shr_pl_lyr_tilemap_scroll(layer, row, col, nr, style);
+                FUZZ_CHECK(shr_pl_lyr_tilemap_scroll(twin, row, col, nr, style) == st);
                 if (st == SHR_OK) FUZZ_CHECK(row >= 0 && row <= col && col <= rows);
                 break;
             }
-            st = shr_pl_lyr_tilemap_clear(layer, row, col, nr, nc, fr_style(&r));
+            st = shr_pl_lyr_tilemap_clear(layer, row, col, nr, nc, style);
+            FUZZ_CHECK(shr_pl_lyr_tilemap_clear(twin, row, col, nr, nc, style) == st);
             break;
         }
         case 3: {
@@ -241,6 +297,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             const shr_color bg = SHR_RGB(nr, nc, 7);
             st = shr_pl_lyr_tilemap_resize(layer, font, nr, nc, (op & 16) ? &bg : NULL);
             FUZZ_CHECK(st == SHR_OK);
+            FUZZ_CHECK(shr_pl_lyr_tilemap_resize(twin, font, nr, nc, (op & 16) ? &bg : NULL) == SHR_OK);
             rows = nr, cols = nc;
             break;
         }
@@ -271,6 +328,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             shr_error_info err;
             st = shr_pl_lyr_tilemap_set_lines(layer, row, lines, n, &err);
             FUZZ_CHECK(err.status == st);
+            FUZZ_CHECK(shr_pl_lyr_tilemap_set_lines(twin, row, lines, n, NULL) == st);
             if (st != SHR_OK) break;
             FUZZ_CHECK(row >= 0 && row < rows && n <= 4 * (size_t)cols);
             for (size_t i = 0; i < n; i++)
@@ -301,9 +359,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             shr_error_info err;
             st = shr_pl_lyr_tilemap_set_row(layer, row, col, &in, &err);
             FUZZ_CHECK(err.status == st);
-            if (st == SHR_OK)
+            if (st == SHR_OK) {
                 FUZZ_CHECK(row >= 0 && row < rows && col >= 0 && end <= cols && style_known(styles[0]) &&
                            style_known(styles[1]));
+                twin_row(twin, row, col, &in);
+            }
+            FUZZ_CHECK(same_rows(layer, twin));
             break;
         }
         case 15: mutates = false; break;
@@ -328,6 +389,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     if (font) FUZZ_CHECK(shr_pl_res_bitmap_font_destroy(font) == SHR_E_STATE);
     FUZZ_CHECK(shr_lyr_destroy(layer) == SHR_OK);
+    FUZZ_CHECK(shr_lyr_destroy(twin) == SHR_OK);
     for (int i = 0; i < 2; i++) FUZZ_CHECK(shr_pl_res_bitmap_font_destroy(fonts[i]) == SHR_OK);
     FUZZ_CHECK(shr_begin_shutdown(ctx) == SHR_OK);
     shr_pump(ctx);

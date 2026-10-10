@@ -294,6 +294,7 @@ TEST measure_rejects_bad_arguments(void) {
     shr_error_info err;
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_measure("A", 1, 1, 0, cl, 1, NULL, &err), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(err.status, SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(err.byte_offset, SIZE_MAX);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_measure("A", 1, 1, 0, NULL, 1, &ext, NULL), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_measure("A", 1, -1, 0, cl, 1, &ext, NULL), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_measure("A", 1, 1, 1u << 1, cl, 1, &ext, NULL), SHR_E_INVALID_ARG);
@@ -787,6 +788,7 @@ TEST set_text_errors_change_nothing(void) {
     ASSERT_EQ_LL(set_text(l, 0, 0, "ab", plain, 1u << 1, &err), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(set_text(l, 0, 0, "ab", (shr_text_style){WHITE, 0, 1u << 8}, 0, &err), SHR_E_UNKNOWN_STYLE);
     ASSERT_EQ_LL(err.item_index, SIZE_MAX);
+    ASSERT_EQ_LL(err.byte_offset, SIZE_MAX);
     ASSERT_EQ_LL(set_text(l, -1, 0, "ab", plain, 0, &err), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(set_text(l, 3, 0, "ab", plain, 0, &err), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(set_text(l, 0, -1, "ab", plain, 0, &err), SHR_E_INVALID_ARG);
@@ -1114,6 +1116,7 @@ TEST set_lines_validates_and_keeps_equal_lists(void) {
         const shr_text_line two[2] = {ok[0], bad[i].e};
         ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 1, two, 2, &err), bad[i].want);
         ASSERT_EQ_LL(err.item_index, 1);
+        ASSERT_EQ_LL(err.byte_offset, SIZE_MAX);
         ASSERT(group_of(l, 1)->rows == p); /* nothing changed */
     }
     shr_text_line many[33];
@@ -1770,6 +1773,7 @@ TEST set_row_equals_set_cell_and_errors_change_nothing(void) {
     shr_row in3 = {bad, 2, odd, 2, NULL, 0, NULL, 0};
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 1, &in3, &err), SHR_E_UNKNOWN_STYLE);
     ASSERT_EQ_LL(err.item_index, 1);
+    ASSERT_EQ_LL(err.byte_offset, SIZE_MAX);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 2, 0, &in3, &err), SHR_E_INVALID_ARG);
     assert_same_rows(a, b);
     ASSERT_EQ_LL(shr_lyr_destroy(b), SHR_OK);
@@ -1893,6 +1897,39 @@ TEST out_of_memory_is_recoverable(void) {
     PASS();
 }
 
+/* A clear of no columns or no rows changes nothing: it splits no line and needs no memory. */
+TEST empty_clears_change_nothing(void) {
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(2, 8, use_fail_alloc);
+    const shr_text_line dotted = {0, 8, SHR_LINE_UNDER, SHR_LINE_DOTTED, 0, RED};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 0, &dotted, 1, NULL), SHR_OK);
+    g_fa.budget = 0;
+    for (int32_t c = 0; c <= 8; c++) ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, 0, c, 2, 0, plain), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, 0, 2, 0, 3, plain), SHR_OK);
+    g_fa.budget = -1;
+    ASSERT_EQ_LL(set_cell(l, 0, 4, "x", 1, plain), SHR_OK); /* the row is built again */
+    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_LINE), 1);
+    close_grid(l);
+    PASS();
+}
+
+TEST set_row_out_of_memory_says_so(void) {
+    static const uint32_t family[] = {0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467};
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(1, 8, use_fail_alloc);
+    const shr_row_cell cells[2] = {{'a', 0, 1, 1}, {0, 0, 2, 5}};
+    const shr_row in = {cells, 2, &plain, 1, family, 5, NULL, 0};
+    shr_error_info err;
+    g_fa.budget = 0;
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(l, 0, 0, &in, &err), SHR_E_NO_MEMORY);
+    g_fa.budget = -1;
+    ASSERT_EQ_LL(err.item_index, 1);
+    ASSERT_STR_EQ(err.reason, "no memory");
+    ASSERT_STR_EQ(row_text(l, 0), "........");
+    close_grid(l);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -1952,5 +1989,7 @@ int main(int argc, char **argv) {
     RUN_TEST(set_row_places_cells_and_lines);
     RUN_TEST(set_row_long_clusters_equal_set_cell);
     RUN_TEST(out_of_memory_is_recoverable);
+    RUN_TEST(empty_clears_change_nothing);
+    RUN_TEST(set_row_out_of_memory_says_so);
     GREATEST_MAIN_END();
 }
