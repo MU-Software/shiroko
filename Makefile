@@ -235,6 +235,7 @@ desktop-run: $(FETCHED)
 # IDF_ARGS runs any idf.py command on the same build (e.g. make tab5-idf IDF_ARGS=size-components); TAB5_DEFS passes
 # the example's build options (e.g. TAB5_DEFS="-D TAB5_REPLAY=1 -D TAB5_LOADS=0xff"; CMake keeps them until changed).
 # TAB5_BOARD=headless builds for an ESP32-P4 board without a panel into build/tab5-headless (sdkconfig.defaults.headless).
+# The build folder's sdkconfig is made anew when the defaults or the Kconfig change (menuconfig edits are lost).
 TAB5_HOST := build/tab5-host
 TAB5_ZSTD ?= ON
 IDF_IMAGE ?= espressif/idf:v6.1
@@ -246,6 +247,11 @@ TAB5_IDF := $(DOCKER_RUN) -w /src/examples/tab5 -e IDF_TARGET=esp32p4 $(IDF_IMAG
     $(if $(filter headless,$(TAB5_BOARD)),-D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.headless') \
     -D SHIROKO_CELL_WIDTH=$(CELL_WIDTH) -D SHIROKO_CELL_HEIGHT=$(CELL_HEIGHT) -D SHIROKO_PIXEL_FORMAT=RGB565 \
     -D SHIROKO_TAB5_ZSTD=$(TAB5_ZSTD) $(TAB5_DEFS)
+TAB5_DEFAULTS := examples/tab5/sdkconfig.defaults $(if $(filter headless,$(TAB5_BOARD)),examples/tab5/sdkconfig.defaults.headless) \
+    examples/tab5/main/Kconfig.projbuild
+
+$(TAB5_BUILD)/sdkconfig: $(TAB5_DEFAULTS)
+	rm -f $@
 
 tab5-host: $(FETCHED)
 	cmake -S . -B $(TAB5_HOST) $(CMAKE_HOST) -DCMAKE_BUILD_TYPE=Release -DSHIROKO_ZSTD=OFF \
@@ -255,10 +261,10 @@ tab5-host: $(FETCHED)
 	$(UV) tools/fontpack/fontpack.py build --cell $(CELL) --out $(TAB5_HOST)/fonts --method $(if $(filter ON,$(TAB5_ZSTD)),zstd,stored) \
 	    --page-atlas 64x512 latin cjk-ko symbols emoji nerd
 
-tab5-build: tab5-host
+tab5-build: tab5-host $(TAB5_BUILD)/sdkconfig
 	$(TAB5_IDF) build
 
-tab5-idf: tab5-host
+tab5-idf: tab5-host $(TAB5_BUILD)/sdkconfig
 	$(TAB5_IDF) $(IDF_ARGS)
 
 tab5-flash: tab5-build

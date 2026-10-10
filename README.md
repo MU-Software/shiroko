@@ -74,6 +74,7 @@ make render-export # every scene as PNG into build/render (RENDER_ARGS='--frames
 make headless-run  # render examples/headless into a PPM image
 make desktop-run   # SDL3 window, software and ANGLE drivers (DESKTOP_ARGS='--load scroll --frames 300 --quit')
 make tab5-build    # M5Stack Tab5 firmware (examples/tab5) into build/tab5; tab5-flash, tab5-monitor (PORT=...)
+                   #   (newer sdkconfig.defaults or Kconfig remake build/tab5/sdkconfig, losing menuconfig edits)
 make bench         # per-part throughput (BENCH=software|compositor|tilemap|font|image|terminal filters;
                    #   SHR_BENCH_SECONDS=5 lengthens one case for a profiler)
 make replay        # the Tab5 scenes recorded, then replayed into the software driver and the compositor alone
