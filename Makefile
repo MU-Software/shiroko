@@ -6,7 +6,8 @@
         tools-env fontpack-fetch fontpack fontpack-locales \
         test-asan test-ubsan test-tsan sanitizer-image test-asan-linux test-lsan-linux test-msan-linux \
         test-tsan-linux test-ubsan-linux test-hwasan-linux test-rtsan-linux test-sanitizers \
-        fuzz fuzz-msan desktop-run tab5-host tab5-build tab5-idf tab5-flash tab5-monitor coverage test-gcc gcc-image clean
+        fuzz fuzz-msan desktop-run tab5-host tab5-build tab5-idf tab5-flash tab5-monitor coverage test-gcc gcc-image \
+        check-inline check-inline-host check-inline-gcc check-inline-tab5 clean
 
 COMMA := ,
 NPROC := $(shell getconf _NPROCESSORS_ONLN)
@@ -286,6 +287,24 @@ test-gcc: $(FETCHED)
 	    set -- $$cfg; d=build/linux-gcc-$$1; cmake -S . -B $$d -G Ninja $(CMAKE_CELL) -DCMAKE_BUILD_TYPE=$$2 $$3 -DSHIROKO_BUILD_EXAMPLES=OFF >/dev/null && \
 	    cmake --build $$d && (cd $$d && ctest --output-on-failure -j$$(nproc)); done'
 	@printf "  ✓ gcc x86_64 [O0, O2, asan+ubsan]\n"
+
+# The hot functions call only what tools/inline/<toolchain>.txt allows: a helper that stops being inlined fails here
+# instead of in a benchmark. INLINE_ARGS=--record rewrites the lists from the build (review the diff).
+INLINE_PARTS := shiroko_pl_lyr_tilemap shiroko_compositor shiroko_port_software
+check-inline: check-inline-host check-inline-gcc check-inline-tab5
+
+check-inline-host: $(FETCHED)
+	cmake --preset release $(CMAKE_HOST)
+	cmake --build --preset release --target $(INLINE_PARTS)
+	$(UV) tools/inline/check_inline.py $(INLINE_ARGS) tools/inline/clang.txt build/release
+
+check-inline-gcc: $(FETCHED)
+	$(GCC_DOCKER) bash -c 'set -e; d=build/linux-gcc-O2; cmake -S . -B $$d -G Ninja $(CMAKE_CELL) -DCMAKE_BUILD_TYPE=Release -DSHIROKO_BUILD_EXAMPLES=OFF >/dev/null && \
+	    cmake --build $$d --target $(INLINE_PARTS) && python3 tools/inline/check_inline.py $(INLINE_ARGS) tools/inline/gcc.txt $$d'
+
+check-inline-tab5: tab5-build
+	$(DOCKER_RUN) $(IDF_IMAGE) python3 tools/inline/check_inline.py --objdump riscv32-esp-elf-objdump $(INLINE_ARGS) \
+	    tools/inline/riscv.txt $(TAB5_BUILD)
 
 clean:
 	rm -rf build

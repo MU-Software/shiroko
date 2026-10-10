@@ -1,0 +1,13 @@
+# GCC x86_64, build/linux-gcc-O2 (Release, -O3); make check-inline, tools/inline/check_inline.py. Default cell and format (8x16 RGB565).
+# ~draw: draw() out of line since 1bb107e (clang cost 320 > 250), until the frame +3.6 % TODO inlines it again.
+cores/pl_lyr_tilemap/tilemap.c shr_pl_lyr_tilemap_set_cell cell_new cluster_decode memcmp place shr__ctx_refused shr__lyr_state
+cores/pl_lyr_tilemap/tilemap.c shr_pl_lyr_tilemap_set_row cell_new cp_utf8 lines_check lines_room lines_set memcmp memcpy place shr__ctx_refused shr__lyr_state shr__vec_push
+cores/pl_lyr_tilemap/tilemap.c build_rows inlined
+cores/pl_lyr_tilemap/tilemap.c build_row XXH3_hashLong_128b_default XXH3_len_129to240_128b shr__bitmap_font_res shr__lyr_group_set shr__lyr_row_begin shr__lyr_row_commit shr__vec_reserve
+cores/compositor/frame.c emit_rect shr__hides shr__lru_oldest shr__lru_push shr__lru_remove shr__vec_push shr__vec_reserve shr_format_row_bytes
+cores/compositor/frame.c emit_group inlined
+ports/software/software_driver.c sw_execute copy keep_free shr__raster_buffer_check shr__raster_check shr__raster_prep shr__raster_reads_dst shr__synth_drop trim_cmds ~draw
+ports/software/software_driver.c draw image shr__raster_draw shr__raster_line shr__synth_draw
+ports/software/raster.c shr__raster_draw do_fill do_glyph do_image_scaled memcpy memmove shr__raster_line
+ports/software/raster.c do_glyph shr__raster_lut
+ports/software/raster.c do_fill

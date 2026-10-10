@@ -84,6 +84,9 @@ make test-asan test-ubsan test-tsan   # host sanitizers (Apple Clang or the host
 make test-sanitizers fuzz fuzz-msan   # adds the Linux container sanitizers; HWASan needs an arm64 host
 make test-gcc      # x86_64 GCC 13 at -O0, -O2 and ASan+UBSan
 make coverage      # clang source-based coverage; fails below COV_MIN (default 100); LLVM_PROFDATA, LLVM_COV
+make check-inline  # hot functions (set_cell, set_row, flush, frame commands, software drawing) call only what
+                   #   tools/inline/{clang,gcc,riscv}.txt allows, in the release, GCC and Tab5 builds;
+                   #   check-inline-host|gcc|tab5 one by one; INLINE_ARGS=--record rewrites the lists
 ```
 
 `-DSHIROKO_WERROR=ON` turns warnings in the library and the tests into errors. Every test has a 300 s timeout.
