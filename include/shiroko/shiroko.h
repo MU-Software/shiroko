@@ -267,7 +267,8 @@ typedef struct shr_image_source {
     size_t stride;
 } shr_image_source;
 
-/* Converted while copied; desc.image_bytes is checked before the pixels are read. */
+/* Converted while copied; desc.image_bytes is checked before the pixels are read, at 2 bytes a pixel where the image
+ * may be kept as RGB565: a translucent image that needs 4 is refused once its alpha is read. */
 shr_status shr_pl_res_image_create_from(shr_context *ctx, const shr_image_source *source, shr_pl_res_image **out);
 /* shr_pl_res_image_create_from() of RGBA8888 rows. */
 shr_status shr_pl_res_image_create(shr_context *ctx, int32_t width, int32_t height, const void *rgba,
@@ -293,7 +294,8 @@ shr_status shr_pl_res_image_create_scaled(shr_context *ctx, const shr_image_sour
 enum { SHR_SCALE_COPY = 1u << 4, SHR_SCALE_DRIVER = 1u << 5 };
 /* A width x height image showing `src` of `image` scaled, drawn and released like an image. A view the driver scales
  * holds no pixels of its own, keeps `image` until the view is freed and shows its updates; a copy does neither and
- * takes updates itself. Either scales an image kept as RGB565 from its RGB565 levels. */
+ * takes updates itself. A view the driver scales takes no update() and no view() (SHR_E_INVALID_ARG): pass
+ * SHR_SCALE_COPY for an image that must. Either scales an image kept as RGB565 from its RGB565 levels. */
 shr_status shr_pl_res_image_view(shr_pl_res_image *image, shr_rect src, int32_t width, int32_t height, uint32_t flags,
                                  shr_pl_res_image **out);
 
@@ -427,8 +429,9 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
                                      const shr_color *background);
 /* One cluster as the VT engine placed it: never re-segmented, re-measured or combined. It occupies
  * `span` cells from (row, col); cells it overlaps are cleared. Empty UTF-8 draws the background only, and the row's
- * lines stay as they are. A cluster past the profile's limits (shr_text_limits) draws U+FFFD; past max_cell_bytes the
- * cell keeps only U+FFFD. */
+ * lines stay as they are. A cluster past the profile's limits (shr_text_limits) draws U+FFFD, or nothing when its first
+ * max_cell_scalars scalars are zero-width; past max_cell_bytes the cell keeps only U+FFFD and draws it either way
+ * (set_text and measure keep such a zero-width cluster invisible). */
 shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col, const char *utf8, size_t length,
                                        uint32_t span, shr_text_style style);
 /* Replaces the lines of `row` with `lines` (drawn in this order); an equal list changes nothing. Each lies inside the
@@ -476,8 +479,8 @@ shr_status shr_pl_lyr_tilemap_set_text(shr_lyr *layer, int32_t row, int32_t col,
                                        shr_text_style style, const shr_style_run *runs, size_t run_count,
                                        uint32_t flags, shr_error_info *err);
 /* Clears rows x cols cells from (row, col), and the wide cells reaching into them, to style.bg (alpha 0: blank, the
- * tilemap background or transparent), and the lines over them. Other style fields are ignored. SHR_E_NO_MEMORY: a
- * line the cleared columns split in two found no room; nothing changed. */
+ * tilemap background or transparent), and the lines over all those cells. Other style fields are ignored.
+ * SHR_E_NO_MEMORY: a line the cleared columns split in two found no room; nothing changed. */
 shr_status shr_pl_lyr_tilemap_clear(shr_lyr *layer, int32_t row, int32_t col, int32_t rows, int32_t cols,
                                     shr_text_style style);
 

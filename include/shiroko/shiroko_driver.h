@@ -165,7 +165,7 @@ typedef enum shr_cmd_kind {
     SHR_CMD_LINE             /* dst <- color through the coverage of a line pattern repeated along x */
 } shr_cmd_kind;
 
-/* DIM: GLYPH coverage, or a FILL, at half strength. BOLD, ITALIC: GLYPH style synthesized from the coverage.
+/* DIM: GLYPH coverage, or a FILL or LINE, at half strength. BOLD, ITALIC: GLYPH style synthesized from the coverage.
  * ON_FILL: hint that the GLYPH's `dst` holds the FILL colour `bg` (shr_draw_cmd). */
 enum { SHR_GLYPH_DIM = 1u << 0, SHR_GLYPH_BOLD = 1u << 1, SHR_GLYPH_ITALIC = 1u << 2, SHR_GLYPH_ON_FILL = 1u << 3 };
 /* COPY onto its own destination: the pixels of the destination outside `dst` become unspecified (shr_draw_cmd). */

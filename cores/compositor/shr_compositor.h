@@ -133,7 +133,7 @@ typedef enum shr__lcmd_kind {
 } shr__lcmd_kind;
 
 enum {
-    SHR__LCMD_DIM = SHR_GLYPH_DIM, /* GLYPH or FILL at half strength */
+    SHR__LCMD_DIM = SHR_GLYPH_DIM, /* GLYPH, FILL or LINE at half strength */
     SHR__LCMD_BOLD = SHR_GLYPH_BOLD, /* GLYPH styles, synthesized where the resource allows */
     SHR__LCMD_ITALIC = SHR_GLYPH_ITALIC,
     /* GLYPH: an earlier FILL of the group, without DIM or BLINK, of colour `bg` covers `dst`, and no command
