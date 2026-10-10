@@ -97,7 +97,8 @@ typedef struct fake {
     uint8_t cov[8 * 16 * 4];
     shr__buf buf;
     shr__resolved px;
-    shr_status st;
+    const shr__resolved *spare; /* fallback(): these pixels, else fb_st */
+    shr_status st, fb_st;
     bool changed, work;
     uint64_t deadline;
     int resolves, ends, frees, shutdowns, io_n;
@@ -133,7 +134,17 @@ static void fk_free(shr__res *r) {
     shr__buf_free(r->ctx, &((fake *)r)->buf);
 }
 
+static shr_status fk_fallback(shr__res *r, uint64_t id, uint64_t frame, const shr__resolved **out) {
+    fake *f = (fake *)r;
+    (void)id, (void)frame;
+    if (f->fb_st != SHR_OK) return f->fb_st;
+    *out = f->spare;
+    return SHR_OK;
+}
+
 static const shr__res_ops fk_ops = {fk_resolve, NULL, fk_end, fk_pump, fk_work, fk_deadline, fk_io, fk_shutdown, fk_free};
+static const shr__res_ops fb_ops = {fk_resolve, fk_fallback, fk_end, fk_pump, fk_work, fk_deadline, fk_io, fk_shutdown,
+                                    fk_free};
 static const shr__res_ops bare_ops = {.resolve = fk_resolve, .free = fk_free};
 
 static void fake_wrap(fake *f, shr_pixel_format format, shr_memory_domain domain) {
@@ -2321,7 +2332,8 @@ TEST test_buffer_alloc(void) {
         shr_pixel_format f;
         int32_t w, h;
         shr_status st;
-    } bad[] = {{SHR_FORMAT_RGB565, 1, 1, SHR_E_INVALID_ARG}, {SHR_FORMAT_A8, 0, 1, SHR_E_INVALID_ARG},
+    } bad[] = {{SHR_FORMAT_RGB565, 1, 1, SHR_E_INVALID_ARG}, {SHR_FORMAT_RGBX8888, 1, 1, SHR_E_INVALID_ARG},
+               {SHR_FORMAT_A8, 0, 1, SHR_E_INVALID_ARG},
                {SHR_FORMAT_A8, 1, 0, SHR_E_INVALID_ARG},     {SHR_FORMAT_A8, 65, 1, SHR_E_UNSUPPORTED},
                {SHR_FORMAT_A8, 1, 33, SHR_E_UNSUPPORTED}};
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
@@ -2693,6 +2705,65 @@ TEST test_buffer_eviction_by_ids(void) {
     PASS();
 }
 
+/* A buffer that gets no id draws its resource's fallback in its place: the fallback's pixels, nothing when there are
+ * none (SHR_E_NOT_FOUND), or the frame fails with the fallback's error. */
+TEST test_fallback_when_ids_run_short(void) {
+    const shr_status fb[3] = {SHR_OK, SHR_E_NOT_FOUND, SHR_E_LIMIT};
+    limit_ids = 2, limit_flags = SHR_BUFFER_COPIES, limit_bytes = 0;
+    for (int i = 0; i < 3; i++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, PRESERVED, tweak_limits);
+        fake a, b, c;
+        fake_attach(&a, ctx, &fk_ops), fake_attach(&b, ctx, &fk_ops), fake_attach(&c, ctx, &fb_ops);
+        shr__resolved spare = a.px; /* a's pixels, provisional as fallbacks are */
+        spare.provisional = true;
+        c.spare = &spare, c.fb_st = fb[i];
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+        draw_fakes(l, 3, (fake *[]){&a, &b, &c});
+        frame(ctx);
+        shr_event ev;
+        ASSERT_EQ_LL(count_events(ctx, SHR_EVENT_PRESENT_FAILED, &ev), i == 2);
+        if (i == 2) {
+            ASSERT_EQ_LL(ev.status, SHR_E_LIMIT);
+        } else {
+            ASSERT(h.out.presents == 1 && rec.short_bufs == 1 && c.buf.id == 0 && px(h.out.shown, 9, 1) == WHITE);
+            ASSERT_EQ_LL(px(h.out.shown, 17, 1) == WHITE, i == 0);
+        }
+        destroy_layers(&l, 1);
+        a.res.dead = b.res.dead = c.res.dead = true;
+        harness_close(&h);
+    }
+    PASS();
+}
+
+/* What got no id is drawn again at once while each frame leaves fewer buffers out: 3, then 1, then none. */
+TEST test_short_ids_redrawn_while_fewer_go_without(void) {
+    limit_ids = 2, limit_flags = SHR_BUFFER_COPIES, limit_bytes = 0;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_limits);
+    fake f[5];
+    for (int i = 0; i < 5; i++) fake_attach(&f[i], ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    draw_fakes(l, 5, (fake *[]){&f[0], &f[1], &f[2], &f[3], &f[4]});
+    frame(ctx);
+    ASSERT(rec.short_bufs == 3 && px(h.out.shown, 9, 1) == WHITE && px(h.out.shown, 17, 1) != WHITE);
+    const uint64_t left[2] = {1, 0};
+    for (int k = 0; k < 2; k++) {
+        ASSERT_EQ_LL(deadline(ctx), SHR_DEADLINE_NOW);
+        shr_pump(ctx);
+        ASSERT_EQ_LL(rec.short_bufs, left[k]);
+    }
+    ASSERT_EQ_LL(deadline(ctx), SHR_DEADLINE_NONE);
+    ASSERT_EQ_LL(h.out.presents, 3);
+    for (int i = 0; i < 5; i++) ASSERT_EQ_LL(px(h.out.shown, 8 * i + 1, 1), WHITE);
+    destroy_layers(&l, 1);
+    for (int i = 0; i < 5; i++) f[i].res.dead = true;
+    harness_close(&h);
+    PASS();
+}
+
 static void limited(long *budget, shr_status (*call)(shr_context *), shr_context *ctx) {
     oom.budget = *budget;
     call(ctx);
@@ -2787,6 +2858,38 @@ TEST test_frame_out_of_memory(void) {
                 ASSERT_EQ_LL(presents, mode == 2 ? 3 : 2);
                 break;
             }
+        }
+    }
+    PASS();
+}
+
+/* A row group's LINE commands may find no memory to be listed: the frame fails with SHR_E_NO_MEMORY and nothing
+ * leaks; with the memory there the lines are drawn. */
+TEST test_lines_out_of_memory(void) {
+    for (long budget = 0;; budget++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, PRESERVED, tweak_oom);
+        shr_lyr *l;
+        ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+        shr__rcmd c[16]; /* more than the first command list holds */
+        for (int i = 0; i < 16; i++)
+            c[i] = (shr__rcmd){(uint16_t)(i % 8), (uint16_t)(i % 8 + 1), (uint8_t)(i / 8 * 4), (uint8_t)(i / 8 * 4 + 1),
+                               SHR__LCMD_LINE, 0, RED, SHR_LINE_SINGLE, 0};
+        ASSERT_EQ_LL(rows_set(l, 0, 0, NULL, c, 16), SHR_OK);
+        long left = budget;
+        limited(&left, shr_submit, ctx);
+        limited(&left, shr_pump, ctx);
+        int presents = h.out.presents;
+        bool drawn = px(h.out.shown, 0, 0) == RED && px(h.out.shown, HW - 1, 4) == RED && px(h.out.shown, 0, 1) == 0;
+        shr_event ev;
+        while (shr_poll_event(ctx, &ev) == SHR_OK)
+            if (ev.kind == SHR_EVENT_PRESENT_FAILED) ASSERT_EQ_LL(ev.status, SHR_E_NO_MEMORY);
+        destroy_layers(&l, 1);
+        harness_close(&h);
+        ASSERT_EQ_LL(oom.live, 0);
+        if (left) {
+            ASSERT(presents == 1 && drawn);
+            break;
         }
     }
     PASS();
@@ -5737,9 +5840,12 @@ int main(int argc, char **argv) {
     RUN_TEST(test_buffer_registered_again);
     RUN_TEST(test_buffer_eviction_by_bytes);
     RUN_TEST(test_buffer_eviction_by_ids);
+    RUN_TEST(test_fallback_when_ids_run_short);
+    RUN_TEST(test_short_ids_redrawn_while_fewer_go_without);
     RUN_TEST(test_buffer_lost_batch_released);
     RUN_TEST(test_buffer_plan_out_of_memory);
     RUN_TEST(test_frame_out_of_memory);
+    RUN_TEST(test_lines_out_of_memory);
     RUN_TEST(test_scattered_damage);
     RUN_TEST(test_damage_out_of_memory_redraws_all);
     RUN_TEST(test_async_frames_keep_presenting);

@@ -1101,6 +1101,35 @@ TEST lines_take_the_bands_of_their_shapes(void) {
     PASS();
 }
 
+/* At every cell size the build takes and any baseline, each band lies in the cell, at most SHR_LINE_MAX_BAND rows, over
+ * its line: the wave's amplitude is min(cw / pi, rows below the baseline - 1), 1 to SHR_LINE_MAX_BAND - 1. */
+TEST line_bands_fit_every_cell_size(void) {
+    static const int32_t cws[] = {6, 8, 12, 25, 26, 64}, chs[] = {8, 16, 24, 127};
+    for (size_t i = 0; i < 6; i++)
+        for (size_t j = 0; j < 4; j++)
+            for (int32_t base = 0, cw = cws[i], ch = chs[j]; base < ch; base++) {
+                const shr__line_metrics lm = {base, base + 1 < ch ? base + 1 : ch - 1, base * 2 / 3};
+                uint8_t band[3][5][2];
+                shr__line_bands(band, cw, ch, &lm);
+                int32_t amp = cw * 113 / 355 < ch - base - 1 ? cw * 113 / 355 : ch - base - 1;
+                amp = amp < 1 ? 1 : amp > SHR_LINE_MAX_BAND - 1 ? SHR_LINE_MAX_BAND - 1 : amp;
+                for (int kind = SHR_LINE_UNDER; kind <= SHR_LINE_OVER; kind++)
+                    for (int shape = SHR_LINE_SINGLE; shape <= SHR_LINE_DASHED; shape++) {
+                        int32_t y = kind == SHR_LINE_UNDER ? lm.underline_y : kind == SHR_LINE_STRIKE ? lm.strike_y : 0;
+                        int32_t y0 = band[kind][shape][0], y1 = band[kind][shape][1];
+                        int32_t h = shape == SHR_LINE_SINGLE || shape == SHR_LINE_DASHED ? 1
+                                    : shape == SHR_LINE_CURLY                            ? amp + 1
+                                                                                         : 3;
+                        ASSERT(y0 >= 0 && y1 <= ch && y1 - y0 == h && h <= SHR_LINE_MAX_BAND);
+                        if (shape == SHR_LINE_CURLY && kind == SHR_LINE_UNDER)
+                            ASSERT_EQ_LL(y0, y < ch - h ? y : ch - h);
+                        else
+                            ASSERT(y0 <= y && y < y1);
+                    }
+            }
+    PASS();
+}
+
 TEST set_lines_validates_and_keeps_equal_lists(void) {
     g_fa = (fail_alloc){-1, 0};
     shr_lyr *l = open_grid(2, 8, use_fail_alloc), *other = new_layer();
@@ -1138,6 +1167,7 @@ TEST set_lines_validates_and_keeps_equal_lists(void) {
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 1, many, 33, NULL), SHR_E_LIMIT); /* 4 per column */
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 1, many, 32, NULL), SHR_OK);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 2, ok, 1, NULL), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, -1, ok, 1, NULL), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 0, NULL, 1, NULL), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(other, 0, ok, 1, NULL), SHR_E_STATE);
     const shr_text_line hidden = {0, 8, SHR_LINE_UNDER, SHR_LINE_SINGLE, 0, NONE(RED)};
@@ -1146,6 +1176,29 @@ TEST set_lines_validates_and_keeps_equal_lists(void) {
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 1, NULL, 0, NULL), SHR_OK);
     ASSERT_EQ_LL(shr_lyr_destroy(other), SHR_OK);
     close_grid(l);
+    PASS();
+}
+
+/* A row needing more line room takes the smallest that rows emptied of lines keep, so larger room stays for others. */
+TEST emptied_rows_lend_the_smallest_line_room(void) {
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(4, 8, use_fail_alloc);
+    shr_text_line many[12];
+    for (int i = 0; i < 12; i++) many[i] = (shr_text_line){0, 8, SHR_LINE_UNDER, SHR_LINE_SINGLE, 0, RED};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 0, many, 12, NULL), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 1, many, 6, NULL), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 0, NULL, 0, NULL), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 1, NULL, 0, NULL), SHR_OK);
+    g_fa.budget = 0;
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 2, many, 5, NULL), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 3, many, 12, NULL), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 0, many, 5, NULL), SHR_E_NO_MEMORY); /* no empty room left */
+    g_fa.budget = -1;
+    ASSERT_EQ_LL(count_kind(l, 2, SHR__LCMD_LINE), 5);
+    ASSERT_EQ_LL(count_kind(l, 3, SHR__LCMD_LINE), 12);
+    ASSERT_EQ_LL(ncmds(l, 0), 0);
+    close_grid(l);
+    ASSERT_EQ_LL(g_fa.live, 0);
     PASS();
 }
 
@@ -1809,6 +1862,34 @@ TEST set_row_equals_set_cell_and_errors_change_nothing(void) {
     ASSERT_EQ_LL(err.item_index, 1);
     ASSERT_EQ_LL(err.byte_offset, SIZE_MAX);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 2, 0, &in3, &err), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, -1, 0, &in3, &err), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, -1, &in3, &err), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 13, &in3, &err), SHR_E_INVALID_ARG);
+    ASSERT_STR_EQ(err.reason, "position outside the grid");
+    const shr_row none = {0};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 12, &none, &err), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &none, &err), SHR_OK);
+    shr_row missing[3] = {{NULL, 1, styles, 2, sc, 1, NULL, 0},
+                          {bad, 1, NULL, 1, sc, 1, NULL, 0},
+                          {bad, 1, styles, 2, NULL, 1, NULL, 0}};
+    for (size_t i = 0; i < 4; i++) {
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, i < 3 ? &missing[i] : NULL, &err), SHR_E_INVALID_ARG);
+        ASSERT_STR_EQ(err.reason, "missing array");
+    }
+    shr_lyr *other = new_layer();
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(other, 0, 0, &none, &err), SHR_E_STATE);
+    ASSERT_EQ_LL(shr_lyr_destroy(other), SHR_OK);
+    const uint32_t sur[2] = {'e', 0xD800};
+    shr_row_cell bad2[2] = {{0x110000, 0, 1, 1}, {'x', 0, 1, 1}};
+    shr_row in4 = {bad2, 2, styles, 2, sur, 2, NULL, 0};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in4, &err), SHR_E_INVALID_UTF8);
+    ASSERT_EQ_LL(err.item_index, 0);
+    bad2[0] = (shr_row_cell){'x', 0, 1, 1}, bad2[1] = (shr_row_cell){0, 0, 1, 2}; /* a surrogate in a cluster */
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in4, &err), SHR_E_INVALID_UTF8);
+    ASSERT_EQ_LL(err.item_index, 1);
+    bad2[1] = (shr_row_cell){3, 0, 1, 2}; /* code points starting past the array */
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in4, &err), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(err.item_index, 1);
     assert_same_rows(a, b);
     ASSERT_EQ_LL(shr_lyr_destroy(b), SHR_OK);
     close_grid(a);
@@ -2045,7 +2126,9 @@ int main(int argc, char **argv) {
     RUN_TEST(background_paints_cells_without_their_own);
     RUN_TEST(row_commands_follow_cell_styles);
     RUN_TEST(lines_take_the_bands_of_their_shapes);
+    RUN_TEST(line_bands_fit_every_cell_size);
     RUN_TEST(set_lines_validates_and_keeps_equal_lists);
+    RUN_TEST(emptied_rows_lend_the_smallest_line_room);
     RUN_TEST(style_alpha_selects_dim_conceal_and_background);
     RUN_TEST(lines_move_with_rows_and_clears_cut_them);
     RUN_TEST(clears_cut_lines_over_the_wide_cells_they_reach);

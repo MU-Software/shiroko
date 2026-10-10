@@ -280,8 +280,7 @@ shr_status shr_lyr_cmd_image(shr_lyr *layer, shr_pl_res_image *img, shr_rect src
 static shr_status view_resolve(shr__res *res, uint64_t id, uint64_t frame, const shr__resolved **out) {
     shr_pl_res_image *v = (shr_pl_res_image *)res;
     const shr__resolved *b;
-    shr_status st = img_resolve(&v->base->res, id, frame, &b);
-    if (st != SHR_OK) return st;
+    img_resolve(&v->base->res, id, frame, &b); /* cannot fail */
     v->resolved = (shr__resolved){.buf = b->buf, .rect = v->src, .scale_w = v->w, .scale_h = v->h};
     *out = &v->resolved;
     return SHR_OK;

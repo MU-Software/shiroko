@@ -34,10 +34,10 @@ void shr__bilin_start(shr__bilin *b, const shr__scale *s, int32_t x0, int32_t n,
     uint64_t num = ((uint64_t)(2 * x0 + 1) * (uint32_t)sw + den) << 15;
     uint32_t t = (uint32_t)(num / den), r = (uint32_t)(num % den);
     int32_t k0 = s->src.x0 + (int32_t)(t >> 16) - 1;
-    b->x = k0 < 0 ? 0 : k0 > last ? last : k0; /* the taps' columns grow by less than 2^15 over the span */
+    b->x = k0 < 0 ? 0 : k0; /* the taps' columns grow by less than 2^15 over the span */
     for (int32_t i = 0; i < n; i++) {
         int32_t k = s->src.x0 + (int32_t)(t >> 16) - 1;
-        int32_t xa = k < 0 ? 0 : k > last ? last : k, xb = k + 1 > last ? last : k + 1;
+        int32_t xa = k < 0 ? 0 : k, xb = k + 1 > last ? last : k + 1;
         b->tap[i] = (uint32_t)(xa - b->x) << 9 | (uint32_t)(xb - xa) << 8 | (t >> 8 & 255);
         t += dq, r += dr;
         if (r >= den) r -= den, t++;
@@ -91,7 +91,7 @@ static void bilin_fill(const shr__bilin *b, int32_t y, uint32_t *restrict h) {
 const uint32_t *shr__bilin_rows(shr__bilin *b, const uint32_t **bot, uint32_t *fy) {
     const shr__scale *s = b->s;
     int32_t k = s->src.y0 + (int32_t)(b->t >> 16) - 1, last = s->h - 1;
-    int32_t ya = k < 0 ? 0 : k > last ? last : k, yb = k + 1 > last ? last : k + 1;
+    int32_t ya = k < 0 ? 0 : k, yb = k + 1 > last ? last : k + 1;
     *fy = b->t >> 8 & 255;
     b->t += b->dq, b->r += b->dr;
     if (b->r >= (uint32_t)s->dh) b->r -= (uint32_t)s->dh, b->t++;
@@ -127,7 +127,7 @@ static inline void scale_taps(int32_t s0, int32_t s, int32_t d, int32_t n, int32
                               uint32_t *f) {
     uint32_t t = (uint32_t)((((uint64_t)(2 * i + 1) * (uint32_t)s + (uint32_t)d) << 15) / (uint32_t)d);
     int32_t k = s0 + (int32_t)(t >> 16) - 1;
-    *a = k < 0 ? 0 : k >= n ? n - 1 : k, *b = k + 1 < 0 ? 0 : k + 1 >= n ? n - 1 : k + 1;
+    *a = k < 0 ? 0 : k, *b = k + 1 >= n ? n - 1 : k + 1;
     *f = t >> 8 & 255;
 }
 

@@ -8,6 +8,7 @@ _Static_assert(SHR_MAX_GRID <= 1 << 15 && SHR_MAX_SPAN <= 256 && SHR_STYLE_KNOWN
                "a row key packs column, span - 1, flags and has_glyph into 32 bits");
 _Static_assert(SHR_MAX_GRID <= UINT16_MAX, "row commands and lines hold columns");
 _Static_assert(SHR_CELL_WIDTH <= SHR_LINE_MAX_PERIOD && sizeof(shr_text_line) == 12, "line patterns are a cell wide");
+_Static_assert(SHR_LINE_MAX_BAND <= SHR_CELL_HEIGHT, "line bands fit the cell");
 
 enum { CELL_EMPTY = 0, CELL_HEAD, CELL_CONT };
 #define CELL_INLINE 12
@@ -231,24 +232,23 @@ static void put(shr__rcmd *c, uint8_t kind, uint32_t flags, int32_t c0, int32_t 
     *c = (shr__rcmd){(uint16_t)c0, (uint16_t)c1, (uint8_t)y0, (uint8_t)y1, kind, (uint8_t)flags, color, 0, 0};
 }
 
-/* The band of each kind and shape in the cell: SINGLE and DASHED one row at the line, DOUBLE and DOTTED three around
- * it, CURLY a wave of amplitude min(w / pi, rows below the baseline - 1) below an underline, around the others; moved
- * inside the cell. */
-static void line_bands(shr__tilemap *t) {
-    const shr__line_metrics lm = shr__bitmap_font_line_metrics();
-    int32_t amp = SHR_CELL_WIDTH * 113 / 355, below = SHR_CELL_HEIGHT - lm.baseline - 1;
+/* The band of each kind and shape in a cw x ch cell: SINGLE and DASHED one row at the line, DOUBLE and DOTTED three
+ * around it, CURLY a wave of amplitude min(cw / pi, rows below the baseline - 1) below an underline, around the
+ * others; moved inside the cell. */
+void shr__line_bands(uint8_t band[3][5][2], int32_t cw, int32_t ch, const shr__line_metrics *lm) {
+    int32_t amp = cw * 113 / 355, below = ch - lm->baseline - 1;
     amp = amp < below ? amp : below;
     amp = amp < 1 ? 1 : amp > SHR_LINE_MAX_BAND - 1 ? SHR_LINE_MAX_BAND - 1 : amp;
     for (int kind = SHR_LINE_UNDER; kind <= SHR_LINE_OVER; kind++)
         for (int shape = SHR_LINE_SINGLE; shape <= SHR_LINE_DASHED; shape++) {
-            int32_t y = kind == SHR_LINE_UNDER ? lm.underline_y : kind == SHR_LINE_STRIKE ? lm.strike_y : 0;
+            int32_t y = kind == SHR_LINE_UNDER ? lm->underline_y : kind == SHR_LINE_STRIKE ? lm->strike_y : 0;
             bool thin = shape == SHR_LINE_SINGLE || shape == SHR_LINE_DASHED, curly = shape == SHR_LINE_CURLY;
             int32_t h = thin ? 1 : curly ? amp + 1 : 3;
             int32_t top = thin || (curly && kind == SHR_LINE_UNDER) ? y : y - (h - 1) / 2;
-            top = top > SHR_CELL_HEIGHT - h ? SHR_CELL_HEIGHT - h : top;
+            top = top > ch - h ? ch - h : top;
             top = top < 0 ? 0 : top;
-            t->band[kind][shape][0] = (uint8_t)top;
-            t->band[kind][shape][1] = (uint8_t)(top + (h < SHR_CELL_HEIGHT ? h : SHR_CELL_HEIGHT));
+            band[kind][shape][0] = (uint8_t)top;
+            band[kind][shape][1] = (uint8_t)(top + h);
         }
 }
 
@@ -419,7 +419,8 @@ shr_status shr_pl_lyr_tilemap_resize(shr_lyr *layer, shr_pl_res_bitmap_font *fon
             *t = (shr__tilemap){.al = *al, .layer = layer, .ctx = ctx, .font = font};
             SHR_VEC_INIT_HOT(&t->keys, uint64_t);
             SHR_VEC_INIT(&t->placed, shr__placed);
-            line_bands(t);
+            const shr__line_metrics lm = shr__bitmap_font_line_metrics();
+            shr__line_bands(t->band, SHR_CELL_WIDTH, SHR_CELL_HEIGHT, &lm);
             if ((st = shr__lyr_attach(layer, &tilemap_kind, t, tilemap_destroy, flush)) != SHR_OK)
                 shr__free(al, t, sizeof(*t), SHR_ALIGNOF(shr__tilemap), TILEMAP_KIND), t = NULL;
             else

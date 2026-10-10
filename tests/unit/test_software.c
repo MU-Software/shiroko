@@ -1173,6 +1173,35 @@ TEST buffer_regions_are_validated(void) {
     PASS();
 }
 
+/* A SCALED image's source and scaled sides are 1..32767 each. */
+TEST scaled_image_sides_are_validated(void) {
+    static uint8_t line[2 * 32768];
+    uint8_t px[4] = {0}, zero[sizeof(px)] = {0};
+    shr_surface s = packed(px, SHR_FORMAT_RGBX8888, 1, 1);
+    shr_image t[2] = {{line, 32768, 1, sizeof(line), sizeof(line), SHR_FORMAT_RGB565, 0},
+                      {line, 1, 32768, 2, sizeof(line), SHR_FORMAT_RGB565, 0}};
+    const struct {
+        uint32_t id;
+        shr_rect r;
+        int32_t w, h;
+        shr_status want;
+    } cases[] = {
+        {1, {1, 0, 32768, 1}, 1, 1, SHR_OK},           {1, {0, 0, 32768, 1}, 1, 1, SHR_E_INVALID_ARG},
+        {2, {0, 1, 1, 32768}, 1, 1, SHR_OK},           {2, {0, 0, 1, 32768}, 1, 1, SHR_E_INVALID_ARG},
+        {1, {0, 0, 1, 1}, 1, 32767, SHR_OK},           {1, {0, 0, 1, 1}, 1, 0, SHR_E_INVALID_ARG},
+        {1, {0, 0, 1, 1}, 1, 32768, SHR_E_INVALID_ARG},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        shr_draw_cmd c = cmd(SHR_CMD_IMAGE, (shr_rect){0, 0, 1, 1});
+        c.flags = SHR_IMAGE_SCALED, c.buffer = cases[i].id, c.src_rect = cases[i].r;
+        c.scale_w = cases[i].w, c.scale_h = cases[i].h;
+        memset(px, 0, sizeof(px));
+        ASSERT_EQ_LL(shr_software_execute(&s, &c, 1, t, 2), cases[i].want);
+        if (cases[i].want != SHR_OK) ASSERT_MEM_EQ(zero, px, sizeof(px));
+    }
+    PASS();
+}
+
 TEST execute_rejects_bad_batches_without_drawing(void) {
     uint8_t buf[4 * 4 * 4] = {0}, zero[sizeof(buf)] = {0};
     shr_surface s = packed(buf, SHR_FORMAT_RGBX8888, 4, 4);
@@ -2835,6 +2864,7 @@ int main(int argc, char **argv) {
     RUN_TEST(buffers_register_replace_and_release);
     RUN_TEST(buffer_commands_are_validated);
     RUN_TEST(buffer_regions_are_validated);
+    RUN_TEST(scaled_image_sides_are_validated);
     RUN_TEST(execute_rejects_bad_batches_without_drawing);
     RUN_TEST(keep_commands_are_validated);
     RUN_TEST(keeps_draw_what_groups_draw);

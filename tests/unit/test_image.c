@@ -99,6 +99,9 @@ TEST test_image_budget(void) {
     ASSERT_EQ_LL(shr_pl_res_image_release(a), SHR_OK); /* nothing used it: freed at once */
     ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &used, NULL), SHR_OK);
     ASSERT_EQ_LL(used, 32);
+    limit = 0;
+    ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, NULL, &limit), SHR_OK);
+    ASSERT_EQ_LL(limit, 64);
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 4, px, 8, &c), SHR_OK);
     long live = oom.live;
     ASSERT_EQ_LL(shr_pl_res_image_release(b), SHR_OK);
@@ -159,6 +162,9 @@ TEST test_image_needs_plugin_slot(void) {
     for (int i = 0; i < 8; i++) ASSERT(shr__ctx_plugin_slot(ctx, &kinds[i]) != NULL);
     shr_pl_res_image *img;
     ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &img), SHR_E_LIMIT);
+    uint64_t used = 1;
+    ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &used, NULL), SHR_OK);
+    ASSERT_EQ_LL(used, 0);
     harness_close(&h);
     PASS();
 }
@@ -346,6 +352,7 @@ TEST test_image_budget_before_reading(void) {
 TEST test_image_sources_and_storage(void) {
     static const uint8_t g[2][8] = {{0, 77, 128, 0}, {200, 255, 9, 0}};
     static const uint8_t ga[2][8] = {{0, 255, 77, 255, 128, 40}, {200, 255, 255, 0, 9, 255}};
+    static const uint8_t gao[2][8] = {{0, 255, 77, 255, 128, 255}, {200, 255, 255, 255, 9, 255}};
     static const uint8_t rgb[2][12] = {{255, 0, 0, 1, 2, 3, 40, 80, 120}, {9, 99, 199, 0, 255, 0, 250, 251, 252}};
     uint8_t opaque[2][16], alpha[2][16];
     for (int y = 0; y < 2; y++)
@@ -359,7 +366,7 @@ TEST test_image_sources_and_storage(void) {
     } cases[] = {
         {{3, 2, SHR_IMAGE_SRC_RGBA8888, opaque, 16}, 1}, {{3, 2, SHR_IMAGE_SRC_RGBA8888, alpha, 16}, 0},
         {{3, 2, SHR_IMAGE_SRC_RGB888, rgb, 12}, 1},      {{3, 2, SHR_IMAGE_SRC_GRAY8, g, 8}, 1},
-        {{3, 2, SHR_IMAGE_SRC_GRAY_ALPHA88, ga, 8}, 0},
+        {{3, 2, SHR_IMAGE_SRC_GRAY_ALPHA88, ga, 8}, 0},  {{3, 2, SHR_IMAGE_SRC_GRAY_ALPHA88, gao, 8}, 1},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         for (int able = 0; able < 2; able++) {
@@ -707,6 +714,60 @@ TEST test_image_second_buffer_out_of_memory(void) {
     PASS();
 }
 
+/* A driver view of base columns 3..4, rows 1..2 scaled 2 -> 6 reads base columns 2..5 and rows 0..3: updates beside
+ * those damage nothing, one in them redraws the view. */
+TEST test_view_damage_follows_its_source(void) {
+    harness h;
+    caps_flags = SHR_DRIVER_SCALE;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak);
+    caps_flags = 0;
+    uint8_t blue[8 * 4 * 4];
+    for (size_t i = 0; i < sizeof(blue); i += 4) blue[i] = 0, blue[i + 1] = 0, blue[i + 2] = 255, blue[i + 3] = 255;
+    static const uint8_t green[4] = {0, 255, 0, 255};
+    shr_pl_res_image *base, *v;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 8, 4, blue, 32, &base), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_view(base, (shr_rect){3, 1, 5, 3}, 6, 6, SHR_SCALE_DRIVER, &v), SHR_OK);
+    shr_lyr *l = image_layer(ctx, 0, v, (shr_rect){0, 0, 6, 6}, (shr_point){0, 0});
+    frame(ctx);
+    static const shr_rect beside[] = {{0, 0, 1, 1}, {7, 3, 8, 4}};
+    for (size_t i = 0; i < sizeof(beside) / sizeof(beside[0]); i++) {
+        int frames = rec.frames;
+        ASSERT_EQ_LL(shr_pl_res_image_update(base, beside[i], green, 4), SHR_OK);
+        frame(ctx);
+        ASSERT_EQ_LL(rec.frames, frames);
+    }
+    ASSERT_EQ_LL(px(h.out.shown, 2, 2), BLUE);
+    ASSERT_EQ_LL(shr_pl_res_image_update(base, (shr_rect){3, 1, 4, 2}, green, 4), SHR_OK);
+    frame(ctx);
+    ASSERT(rec.damaged > 0 && px(h.out.shown, 2, 2) != BLUE);
+    ASSERT_EQ_LL(shr_lyr_destroy(l), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(v), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(base), SHR_OK);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
+/* A driver view the allocator cannot make holds nothing: its base is freed at once on release. */
+TEST test_view_out_of_memory(void) {
+    harness h;
+    caps_flags = SHR_DRIVER_SCALE;
+    shr_context *ctx = harness_open(&h, 0, tweak);
+    caps_flags = 0;
+    shr_pl_res_image *base, *v = (shr_pl_res_image *)&h;
+    ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &base), SHR_OK);
+    long live = oom.live;
+    oom.budget = 0;
+    ASSERT_EQ_LL(shr_pl_res_image_view(base, (shr_rect){0, 0, 2, 2}, 4, 4, SHR_SCALE_DRIVER, &v), SHR_E_NO_MEMORY);
+    oom.budget = -1;
+    ASSERT(v == NULL && oom.live == live);
+    ASSERT_EQ_LL(shr_pl_res_image_release(base), SHR_OK);
+    ASSERT(oom.live < live);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
 GREATEST_MAIN_DEFS();
 
 int main(int argc, char **argv) {
@@ -729,5 +790,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_image_pinned_across_bands);
     RUN_TEST(test_image_id_freed_while_a_frame_is_built);
     RUN_TEST(test_image_second_buffer_out_of_memory);
+    RUN_TEST(test_view_damage_follows_its_source);
+    RUN_TEST(test_view_out_of_memory);
     GREATEST_MAIN_END();
 }

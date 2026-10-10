@@ -486,11 +486,14 @@ TEST views_follow_updates(void) {
     PASS();
 }
 
-/* An opaque image kept as RGB565 (half the budget bytes) is scaled by the driver, and copied, from its widened
- * pixels: the frame equals the reference on them, onto RGB565 or RGBX8888 screens. */
+/* An opaque image kept as RGB565 (half the budget bytes) is scaled by the driver, and copied (also shrunk by BOX), from
+ * its widened pixels: the frame equals the reference on them, onto RGB565 or RGBX8888 screens. */
 TEST opaque_images_scale_widened(void) {
     static const kase c = {37, 23, 3, 2, 30, 19, 50, 41};
-    static const uint32_t modes[2] = {SHR_SCALE_DRIVER, SHR_SCALE_COPY};
+    static const struct {
+        uint32_t flags;
+        int32_t dw, dh;
+    } modes[] = {{SHR_SCALE_DRIVER, 50, 41}, {SHR_SCALE_COPY, 50, 41}, {SHR_SCALE_COPY | SHR_SCALE_BOX, 20, 11}};
     bool kept = SHR_PIXEL_FORMAT == SHR_FORMAT_RGB565;
     uint8_t *p = image(&c, true), *wide = malloc((size_t)c.w * (size_t)c.h * 4);
     uint16_t *q = malloc((size_t)c.w * (size_t)c.h * 2);
@@ -500,8 +503,9 @@ TEST opaque_images_scale_widened(void) {
     }
     if (kept) shr_rgb565_widen(q, (size_t)c.w * 2, c.w, c.h, wide);
     else memcpy(wide, p, (size_t)c.w * (size_t)c.h * 4);
-    shr_scale_src m = {wide, (size_t)c.w * 4, c.w, c.h, c.sx, c.sy, c.sw, c.sh, c.dw, c.dh};
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < 3; k++) {
+        int32_t dw = modes[k].dw, dh = modes[k].dh;
+        shr_scale_src m = {wide, (size_t)c.w * 4, c.w, c.h, c.sx, c.sy, c.sw, c.sh, dw, dh};
         harness h;
         scale_driver = true, budget = 0;
         shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak);
@@ -510,17 +514,17 @@ TEST opaque_images_scale_widened(void) {
         uint64_t used;
         ASSERT_EQ_LL(shr_pl_res_image_budget(ctx, &used, NULL), SHR_OK);
         ASSERT_EQ_LL(used, (uint64_t)c.w * (uint64_t)c.h * (kept ? 2 : 4));
-        ASSERT_EQ_LL(shr_pl_res_image_view(base, src_of(&c), c.dw, c.dh, modes[k], &v), SHR_OK);
+        ASSERT_EQ_LL(shr_pl_res_image_view(base, src_of(&c), dw, dh, modes[k].flags, &v), SHR_OK);
         shr_lyr *l;
         ASSERT_EQ_LL(shr_lyr_create(ctx, 0, (shr_rect){0, 0, HW, HH}, &l), SHR_OK);
         ASSERT_EQ_LL(shr_lyr_cmd_begin(l), SHR_OK);
-        ASSERT_EQ_LL(shr_lyr_cmd_image(l, v, (shr_rect){0, 0, c.dw, c.dh}, (shr_point){5, 3}), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_cmd_image(l, v, (shr_rect){0, 0, dw, dh}, (shr_point){5, 3}), SHR_OK);
         ASSERT_EQ_LL(shr_lyr_cmd_commit(l), SHR_OK);
         frame(ctx);
-        for (int32_t y = 0; y < c.dh; y++)
-            for (int32_t x = 0; x < c.dw; x++) {
+        for (int32_t y = 0; y < dh; y++)
+            for (int32_t x = 0; x < dw; x++) {
                 uint8_t want[4];
-                shr_scale_px(&m, SHR_FILTER_BILINEAR, x, y, want);
+                shr_scale_px(&m, modes[k].flags & SHR_SCALE_BOX ? SHR_FILTER_BOX : SHR_FILTER_BILINEAR, x, y, want);
                 const uint8_t *got = h.out.shown + ((size_t)(y + 3) * HW + (size_t)(x + 5)) * SCREEN_BPP;
                 uint16_t g16;
                 memcpy(&g16, got, 2);
@@ -640,6 +644,7 @@ TEST scale_arguments(void) {
     ASSERT_EQ_LL(shr_pl_res_image_view(img, (shr_rect){0, 0, 2, 2}, 4, 4, SHR_SCALE_COPY | SHR_SCALE_DRIVER, &v),
                  SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_pl_res_image_view(NULL, (shr_rect){0, 0, 2, 2}, 4, 4, 0, &v), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_image_view(img, (shr_rect){0, 0, 2, 2}, 4, 4, 0, NULL), SHR_E_INVALID_ARG);
     shr_image_source s = {2, 2, SHR_IMAGE_SRC_RGBA8888, px, 4}; /* stride below a row */
     ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &s, (shr_rect){0, 0, 2, 2}, 4, 4, 0, &v), SHR_E_INVALID_ARG);
     s.stride = 8, s.format = (shr_image_source_format)4;
@@ -647,6 +652,26 @@ TEST scale_arguments(void) {
     s.format = SHR_IMAGE_SRC_GRAY_ALPHA88, s.stride = 4;
     ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &s, (shr_rect){0, 0, 2, 2}, 4, 4, 2, &v), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, NULL, (shr_rect){0, 0, 2, 2}, 4, 4, 0, &v), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_image_create_scaled(NULL, &s, (shr_rect){0, 0, 2, 2}, 4, 4, 0, &v), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &s, (shr_rect){0, 0, 2, 2}, 4, 4, 0, NULL), SHR_E_INVALID_ARG);
+    static const shr_rect bad[] = {{2, 0, 1, 2}, {0, -1, 2, 2}, {0, 0, 2, 3}, {0, 1, 2, 1}};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &s, bad[i], 4, 4, 0, &v), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &s, (shr_rect){0, 0, 2, 2}, 4, 0, 0, &v), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &s, (shr_rect){0, 0, 2, 2}, 4, 32768, 0, &v), SHR_E_INVALID_ARG);
+    ASSERT(!v);
+    uint8_t *line = calloc(32768, 1); /* src sides up to 32767 */
+    const shr_image_source wide = {32768, 1, SHR_IMAGE_SRC_GRAY8, line, 32768};
+    const shr_image_source tall = {1, 32768, SHR_IMAGE_SRC_GRAY8, line, 1};
+    ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &wide, (shr_rect){0, 0, 32768, 1}, 4, 1, 0, &v),
+                 SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &tall, (shr_rect){0, 0, 1, 32768}, 1, 4, 0, &v),
+                 SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &wide, (shr_rect){1, 0, 32768, 1}, 4, 1, 0, &v), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(v), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &tall, (shr_rect){0, 1, 1, 32768}, 1, 4, 0, &v), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_image_release(v), SHR_OK);
+    free(line);
     ASSERT_EQ_LL(shr_pl_res_image_create_scaled(ctx, &s, (shr_rect){0, 0, 2, 2}, 4, 4, SHR_SCALE_BOX, &v), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_release(v), SHR_OK);
     ASSERT_EQ_LL(shr_pl_res_image_view(img, (shr_rect){0, 1, 2, 2}, 5, 3, 0, &v), SHR_OK); /* no SCALE: a copy */

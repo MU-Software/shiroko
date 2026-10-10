@@ -63,4 +63,8 @@ typedef struct shr__layout_in {
 /* Validates the whole text and emits its pieces in text order; an emit() error ends the layout. */
 shr_status shr__layout(const shr__layout_in *in, int32_t *rows, int32_t *cols, shr_error_info *err);
 
+struct shr__line_metrics;
+/* Pixel rows [y0, y1) of the lines by kind and shape in a cw x ch cell, ch >= SHR_LINE_MAX_BAND. */
+void shr__line_bands(uint8_t band[3][5][2], int32_t cw, int32_t ch, const struct shr__line_metrics *lm);
+
 #endif
