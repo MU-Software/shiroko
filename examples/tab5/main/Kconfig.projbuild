@@ -71,6 +71,6 @@ menu "shiroko Tab5 example"
             Memory the renderer uses every frame (SHR_ALLOC_HOT: rows of commands, the band command list, per-frame
             state) goes to internal RAM while it fits in this many KiB, the rest of it and all other renderer memory
             to PSRAM; the rest of internal RAM stays with the application. 64 (default) leaves the app about
-            360 KiB free at the end of each scene on Tab5, 165 KiB more than 216, for frames about 5 % longer
-            uncapped (p50 summed over the scenes; Hangul scenes 4-5 ms). 0 puts it all in PSRAM.
+            360 KiB free at the end of each scene on Tab5, about 150 KiB more than 216, for frames about 4 % longer
+            uncapped (p50 summed over the scenes; Hangul scenes 3-4 ms). 0 puts it all in PSRAM.
 endmenu

@@ -310,13 +310,13 @@ MacBook Pro M4 Max (software driver, without the rotation). On the ST7121 board 
   of the serial output (a round of the seven scenes takes ~1.5 min) as tab5.log, and `make replay-cost > desktop.log`;
   `uv run tools/bench/benchlog.py cost tab5.log desktop.log` prints the table.
 
-The renderer and the app also share the internal RAM (about 400 KiB of heap on the P4 once IDF has started). Shiroko
-allocates while it warms up (the first frames of a screen, rows longer than any before, font pages first used, the
-driver's caches growing) and then nothing per frame: `tests/unit/test_alloczero.c` refuses every allocation after each
-scene of the example has run once, and the example built with `TAB5_DEFS="-D TAB5_SOAK=1"` prints a `Z` line per scene
-with the allocations of its last 10 frames (a `FAIL` line if any; the heap count needs `CONFIG_HEAP_USE_HOOKS=y`). What
-still allocates after warm-up: cells holding a cluster of over 12 bytes (each new one, and `shr_pl_lyr_tilemap_set_text`
-even when unchanged) and glyph pages loaded later.
+The renderer and the app also share the internal RAM (on Tab5 the example has about 400 KiB of it free once its bands,
+panel and driver are set up). Shiroko allocates while it warms up (the first frames of a screen, rows longer than any
+before, font pages first used, the driver's caches growing) and then nothing per frame: `tests/unit/test_alloczero.c`
+refuses every allocation after each scene of the example has run once, and the example built with
+`TAB5_DEFS="-D TAB5_SOAK=1"` prints a `Z` line per scene with the allocations of its last 10 frames (a `FAIL` line if
+any; the heap count needs `CONFIG_HEAP_USE_HOOKS=y`). What still allocates after warm-up: cells holding a cluster of
+over 12 bytes (each new one, and `shr_pl_lyr_tilemap_set_text` even when unchanged) and glyph pages loaded later.
 
 - Allocate what must be internal RAM (task stacks, DMA buffers and descriptors, Wi-Fi and LWIP buffers, anything
   used while the flash cache is off) before creating the renderer, or statically: once a scene has warmed up, the
@@ -332,9 +332,9 @@ even when unchanged) and glyph pages loaded later.
   (rows of commands, a band's command list, per-frame state of the compositor, tilemap and driver), the memory most
   worth the fast RAM; with `flags` 0 the allocator never sees it. The example's `place_alloc` puts hot memory in
   internal RAM while it fits in 64 KiB (Kconfig `SHIROKO_TAB5_INTERNAL_BUDGET_KB`) and the rest of it and all other
-  memory in PSRAM: about 360 KiB of internal RAM stays with the app while a scene runs. 216 KiB leaves the app about
-  165 KiB less and draws the example's scenes about 5 % faster on Tab5 (uncapped, ST7121, p50 summed over the
-  scenes; the Hangul scenes 4-5 ms a frame).
+  memory in PSRAM: at the end of each scene about 360 KiB of internal RAM is free, and the least since boot is about
+  330 KiB. 216 KiB leaves the app about 150 KiB less and draws the example's scenes about 4 % faster on Tab5
+  (uncapped, ST7121, p50 summed over the scenes; the Hangul scenes 3-4 ms a frame).
 - Draw with two bands (Kconfig `SHIROKO_TAB5_BANDS`, default 2: 2 x 40 KiB of internal RAM) so the CPU draws one
   while the PPA turns the other. One band leaves the app 40 KiB more, but on Tab5 (uncapped, ST7121, 216 KiB budget) the
   scenes took about 14 % longer (p50 summed) and a scrolling screen fell into periodic 60 ms frames.

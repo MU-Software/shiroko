@@ -983,7 +983,7 @@ static void frame(bool submit) {
 
 static void heap_line(const char *when) {
     printf("  heap %s: free internal %u KiB (largest %u KiB), PSRAM %u KiB, budget %u/%u/%u KiB used/peak/cap, hot in"
-           " PSRAM %u KiB, least free internal %u KiB\n", when,
+           " PSRAM %u KiB, least free internal since boot %u KiB\n", when,
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >> 10),
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >> 10),
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >> 10), (unsigned)(budget.used >> 10),
@@ -1427,7 +1427,7 @@ void app_main(void) {
         .timeout_ms = CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000,
         .idle_core_mask = ((1u << portNUM_PROCESSORS) - 1) & ~(1u << xPortGetCoreID())});
 #endif
-    /* Mid-scene the largest free internal block is a few KiB: the bands are taken first. */
+    /* The bands are taken first, while internal RAM is still in one piece. */
     size_t band_bytes = (size_t)BSP_LCD_V_RES * 2 * BAND_H;
     uint8_t *band_px =
         heap_caps_aligned_alloc(CONFIG_CACHE_L2_CACHE_LINE_SIZE, BANDS * band_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
