@@ -276,7 +276,7 @@ static shr_status styles(stage *s) {
 /* Sprites, emoji and icons are drawn as they are, whatever BOLD and ITALIC say. */
 static shr_status styled_exempt_with(stage *s, uint32_t flags) {
     shr_lyr *l = stage_grid(s, 1, cells(1, 1, 14, 1), NULL);
-    stage_text(s, l, 0, 0, "─│┼█▒\U0001FB00 \U0001F600 \uE0B0", STYLE(FG, 0, flags), 0);
+    stage_text(s, l, 0, 0, "─│┼█▒\U0001FB00⣿\uF5D1\U0001CDE5 \U0001F600 \uE0B0", STYLE(FG, 0, flags), 0);
     return s->st;
 }
 

@@ -14,8 +14,8 @@ emoji-sequences-8x16-rgb565 3fb205d74959c67191cb5bfc2c582af8
 styles-8x16-rgb565 2509031f9f2af66353589f582fd8a737
 styles-blink-off-8x16-rgb565 9f7d1b4f635e41815f45762610841ac9
 styles-rot90cw-8x16-rgb565 d60a348757551f22be4fbcdd0c93a7cd
-styled-exempt-8x16-rgb565 55596e3d9e8910795eb897a2dfcf2339
-styled-exempt-ref-8x16-rgb565 55596e3d9e8910795eb897a2dfcf2339
+styled-exempt-8x16-rgb565 c0e93e86ad57f468b150aafd7821d70f
+styled-exempt-ref-8x16-rgb565 c0e93e86ad57f468b150aafd7821d70f
 tilemap-over-image-8x16-rgb565 6a99389cbbc2b04a8e749c3d33fc0e0c
 tm-background-8x16-rgb565 338059a9f15971b03e90ed845cbf98da
 tm-background-ref-8x16-rgb565 338059a9f15971b03e90ed845cbf98da
@@ -94,8 +94,8 @@ emoji-sequences-8x16-rgbx8888 94a7f26c3820c4be5250d4ca52078c35
 styles-8x16-rgbx8888 7cc5760dd8d60b4beeccbb0b1ca590df
 styles-blink-off-8x16-rgbx8888 1db63253b9444e30545e465d24e5403b
 styles-rot90cw-8x16-rgbx8888 8b8b84fa439cfa9c262abb348a8b4b10
-styled-exempt-8x16-rgbx8888 b1a1bfa290421a5a327b67fc6e1cd44c
-styled-exempt-ref-8x16-rgbx8888 b1a1bfa290421a5a327b67fc6e1cd44c
+styled-exempt-8x16-rgbx8888 5641835bc850f5864e643340df914133
+styled-exempt-ref-8x16-rgbx8888 5641835bc850f5864e643340df914133
 tilemap-over-image-8x16-rgbx8888 abea979453175b8e2864f49df413b021
 tm-background-8x16-rgbx8888 8f7cfd783d4bda78a4af4bafd52ab772
 tm-background-ref-8x16-rgbx8888 8f7cfd783d4bda78a4af4bafd52ab772

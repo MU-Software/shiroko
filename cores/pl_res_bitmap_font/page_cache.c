@@ -417,9 +417,11 @@ shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t fr
     out->buf = &p->slot->buf;
     out->rect = (shr_rect){x, y, x + e[4], y + e[5]};
     out->offset = (shr_point){(int8_t)e[6], h.pkg->baseline - (int8_t)e[7]};
-    /* Emoji and Nerd glyphs, and box drawing and block characters (which join their neighbours), stay as drawn. */
+    /* Emoji and Nerd glyphs, and the glyphs that join their neighbours (box drawing, blocks, Braille, legacy
+       computing, branch drawing), stay as drawn. */
     bool plain = h.pkg->role == ROLE_EMOJI || h.pkg->role == ROLE_NERD || (base >= 0x2500 && base < 0x25A0) ||
-                 (base >= 0x1FB00 && base < 0x1FC00);
+                 (base >= 0x2800 && base < 0x2900) || (base >= 0xF5D0 && base < 0xF60E) ||
+                 (base >= 0x1CC00 && base < 0x1CEC0) || (base >= 0x1FB00 && base < 0x1FC00);
     out->synth = plain ? 0 : SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC;
     out->slant_axis = SHR_CELL_HEIGHT - 2 * out->offset.y;
     return SHR_OK;
