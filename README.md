@@ -80,6 +80,8 @@ make bench         # per-part throughput (BENCH=software|compositor|tilemap|font
 make replay        # the Tab5 scenes recorded, then replayed into the software driver and the compositor alone
                    #   (REPLAY_ARGS='scroll,code 60'; replay-tab5 with the Tab5's packages; replay-cost: the
                    #   app cost table's scenes)
+make replay-dma    # the same with the Tab5 example's keep copier (SHR_REPLAY_COPIER=tab5) for 8x16 10x20 12x24
+                   #   16x32 (DMA_CELLS=...): fails when a copy the DMA2D could take, or a band rotation, goes to the CPU
 make test-asan test-ubsan test-tsan   # host sanitizers (Apple Clang or the host compiler)
 make test-sanitizers fuzz fuzz-msan   # adds the Linux container sanitizers; HWASan needs an arm64 host
 make test-gcc      # x86_64 GCC 13 at -O0, -O2 and ASan+UBSan

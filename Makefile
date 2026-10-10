@@ -2,7 +2,7 @@
 # from the sources in FONT_CACHE, which Make fetches first together with the uv tools environment.
 # Run `make fontpack-fetch` once before running targets in parallel with -j.
 
-.PHONY: test test-nozstd core-test render-test render-export headless-run bench replay replay-tab5 replay-cost \
+.PHONY: test test-nozstd core-test render-test render-export headless-run bench replay replay-tab5 replay-cost replay-dma \
         tools-env fontpack-fetch fontpack fontpack-locales \
         test-asan test-ubsan test-tsan sanitizer-image test-asan-linux test-lsan-linux test-msan-linux \
         test-tsan-linux test-ubsan-linux test-hwasan-linux test-rtsan-linux test-sanitizers \
@@ -132,6 +132,20 @@ replay-tab5: tab5-host
 
 replay-cost:
 	$(MAKE) replay-tab5 REPLAY_ARGS=cost
+
+# replay-dma: every scene replayed with the Tab5 example's keep copier (SHR_REPLAY_COPIER=tab5) for each cell size in
+# DMA_CELLS (built-in glyphs; build/replay-dma-WxH); fails when a keep copy the DMA2D could take, or a band rotation,
+# would go to the CPU on the Tab5.
+DMA_CELLS ?= 8x16 10x20 12x24 16x32
+replay-dma: $(FETCHED)
+	@r=0; for c in $(DMA_CELLS); do b=build/replay-dma-$$c; \
+	  cmake -S . -B $$b -DCMAKE_BUILD_TYPE=Release -DSHIROKO_BUILD_EXAMPLES=OFF -DSHIROKO_PIXEL_FORMAT=RGB565 \
+	    -DSHIROKO_CELL_WIDTH=$${c%x*} -DSHIROKO_CELL_HEIGHT=$${c#*x} -DSHIROKO_FONT_CACHE=$(abspath $(FONT_CACHE)) \
+	    -DSHIROKO_UCD_CACHE=$(abspath $(UCD_CACHE)) >$$b.log 2>&1 && cmake --build $$b --target shiroko_replay -j$(NPROC) >>$$b.log 2>&1 \
+	    || { echo "replay-dma $$c: build failed, $$b.log"; r=1; continue; }; \
+	  SHR_REPLAY_COPIER=tab5 SHR_REPLAY_PART=driver-sw SHR_REPLAY_REPS=1 $$b/tests/shiroko_replay $$b/no-fonts all >>$$b.log 2>&1 \
+	    || r=1; grep -E '^  DP |^DMA-PATHS' $$b.log | tail -18; \
+	done; exit $$r
 
 # Apple Clang on purpose: on macOS 26+ Homebrew LLVM's ASan runtime deadlocks
 # in __asan_init. LSan/MSan/HWASan/RTSan run in the Linux container.

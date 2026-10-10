@@ -10,7 +10,10 @@
  * DIR/<scene>.calls.shrr instead of recording. SHR_REPLAY_KEEPS: the driver's keep slots in screens of rows,
  * SHR_REPLAY_BANDS: the bands (1 or 2) and SHR_REPLAY_ROTATION: cw or ccw; 4, 2 and ccw by default, the Tab5 example's
  * defaults, so the hashes match the device's (set them as its CONFIG_SHIROKO_TAB5_KEEP_SCREENS, BANDS and ROTATION);
- * recordings loaded must have been made with the same settings. */
+ * recordings loaded must have been made with the same settings. SHR_REPLAY_COPIER=tab5 gives the drivers the Tab5
+ * example's keep copier as tab5_copy.h decides (copies by memcpy, the same pixels): a DP line per scene counts its
+ * recording's keep copies by who takes them, and the rotations the PPA would refuse (off 16 pixels); any keep copy the
+ * DMA2D could take left to the CPU (rule), or such a rotation, ends the run with DMA-PATHS FAIL and exit status 1. */
 #include <shiroko/port_software.h>
 #include <shiroko/shiroko.h>
 
@@ -21,6 +24,7 @@
 
 #include "rec.h"
 #include "rec_api.h"
+#include "tab5_copy.h"
 #include "tab5_scenes.h"
 
 /* The Tab5: a 720 x 1280 portrait panel, the screen drawn in landscape by bands of 1280 x 16 the PPA turns. */
@@ -37,6 +41,10 @@ static struct {
     shr_surface targets[3];
     rec_package packages[T5_N(t5_packages)];
     t5_scene s;
+    bool copier;
+    uint64_t ticket, dma, cpu[3], rot_cpu; /* the keep bytes each way, since the last DP line */
+    bool lost;
+    shr_status (*execute)(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t count, shr_fence fence);
 } g;
 
 static void check(shr_status st, const char *what) {
@@ -140,11 +148,80 @@ static uint32_t record(int load, int32_t frames, shr_framebuffer_driver *sw, rec
     return sum;
 }
 
+/* The Tab5 copier (SHR_REPLAY_COPIER=tab5): keep_copy and keep_copy_trim of examples/tab5, by memcpy. */
+static uint64_t rows_copy(void *dst, size_t dst_stride, const void *src, size_t src_stride, size_t bytes,
+                          int32_t rows) {
+    for (int32_t y = 0; y < rows; y++)
+        memcpy((uint8_t *)dst + (size_t)y * dst_stride, (const uint8_t *)src + (size_t)y * src_stride, bytes);
+    g.dma += bytes * (size_t)rows;
+    return ++g.ticket;
+}
+
+static uint64_t tab5_copy(void *user, void *dst, size_t dst_stride, const void *src, size_t src_stride, size_t bytes,
+                          int32_t rows) {
+    (void)user;
+    unsigned why =
+        tab5_copy_why((uintptr_t)dst, dst_stride, (uintptr_t)src, bytes, bytes * (size_t)rows, TAB5_COPY_LEN, true);
+    if (why) {
+        g.cpu[why & TAB5_COPY_SMALL ? 0 : why & TAB5_COPY_LINE_START ? 1 : 2] += bytes * (size_t)rows;
+        return 0;
+    }
+    return rows_copy(dst, dst_stride, src, src_stride, bytes, rows);
+}
+
+static void tab5_wait(void *user, uint64_t ticket) { (void)user, (void)ticket; }
+
+static bool in_band(const void *p) {
+    for (uint32_t k = 1; k < g.ntargets; k++)
+        if ((const uint8_t *)p >= (const uint8_t *)g.targets[k].pixels &&
+            (const uint8_t *)p < (const uint8_t *)g.targets[k].pixels + g.targets[k].byte_length)
+            return true;
+    return false;
+}
+
+static uint64_t tab5_copy_trim(void *user, void *dst, size_t dst_stride, const void *src, size_t src_stride,
+                               size_t bytes, int32_t rows, const shr_software_trim *t) {
+    size_t all = bytes + t->lo + t->hi;
+    if (!in_band(dst) ||
+        tab5_copy_why((uintptr_t)dst, dst_stride, (uintptr_t)src, bytes, all * (size_t)rows, TAB5_COPY_LEN, false))
+        return tab5_copy(user, (uint8_t *)dst - t->lo, dst_stride, (const uint8_t *)src - t->lo, src_stride, all, rows);
+    shr_software_trim_fill(dst, dst_stride, bytes, rows, t);
+    return rows_copy(dst, dst_stride, src, src_stride, bytes, rows);
+}
+
+static const shr_software_copier tab5_copier = {NULL, tab5_copy, tab5_wait, tab5_copy_trim, TAB5_COPY_LINE};
+
+/* A band's ROTATE the PPA would refuse (examples/tab5 ppa_band) is counted. */
+static shr_status tab5_execute(void *user, const shr_surface *dst, const shr_draw_cmd *cmds, size_t count,
+                               shr_fence fence) {
+    for (size_t i = 0; i < count; i++)
+        g.rot_cpu += cmds[i].kind == SHR_CMD_ROTATE && in_band(cmds[i].src.pixels) &&
+                     (cmds[i].dst.x0 | cmds[i].dst.y0) % BAND_ALIGN;
+    return g.execute(user, dst, cmds, count, fence);
+}
+
+static void tab5_line(const char *scene) {
+    printf("  DP rec=%s keep KiB dma %llu cpu small %llu line %llu rule %llu, rotations the PPA would refuse %llu\n",
+           scene, (unsigned long long)(g.dma >> 10), (unsigned long long)(g.cpu[0] >> 10),
+           (unsigned long long)(g.cpu[1] >> 10), (unsigned long long)(g.cpu[2] >> 10), (unsigned long long)g.rot_cpu);
+    g.lost |= g.cpu[2] || g.rot_cpu;
+    g.dma = g.cpu[0] = g.cpu[1] = g.cpu[2] = g.rot_cpu = 0;
+}
+
+static void drop_driver(shr_framebuffer_driver *d) {
+    if (d->execute == tab5_execute) d->execute = g.execute;
+    check(shr_software_driver_destroy(d), "driver");
+}
+
 static shr_framebuffer_driver new_driver(void) {
     shr_framebuffer_driver d;
     check(shr_software_driver_create(NULL, g.keeps * (OUT_H * SHR_CELL_HEIGHT * 2ull), g.keeps, 256, &d), "driver");
     check(shr_software_driver_image_planes(&d, 2u << 20), "planes"); /* as examples/tab5 */
     d.caps.flags |= SHR_DRIVER_CHEAP_STORE; /* as the Tab5's, whose keeps copy by DMA2D */
+    if (g.copier) {
+        check(shr_software_driver_set_copier(&d, &tab5_copier), "copier");
+        g.execute = d.execute, d.execute = tab5_execute;
+    }
     return d;
 }
 
@@ -177,8 +254,10 @@ static void replay_driver(int load, int32_t frames, bool drive, int reps, bool p
         w.cap = 512u << 20, w.buf = buf = malloc(w.cap);
         if (!buf) check(SHR_E_NO_MEMORY, "recording");
         shr_framebuffer_driver sw = new_driver();
+        g.dma = g.cpu[0] = g.cpu[1] = g.cpu[2] = g.rot_cpu = 0;
         pass = record(load, frames, &sw, &w, NULL);
-        check(shr_software_driver_destroy(&sw), "driver");
+        if (g.copier) tab5_line(load_names[load]);
+        drop_driver(&sw);
         len = w.len;
     }
     rec_info in;
@@ -202,7 +281,7 @@ static void replay_driver(int load, int32_t frames, bool drive, int reps, bool p
         uint32_t sum = 0;
         int32_t b = -2;
         check(rec_play(buf, len, &h, rep < 0, t, &sum, &b), "rec_play");
-        check(shr_software_driver_destroy(&d), "driver");
+        drop_driver(&d);
         same &= sum == record_sum && b == -2;
         if (rep < 0) bad = b, rec_print_diff(&in, "driver-sw", t);
         if (rep >= 0)
@@ -233,7 +312,7 @@ static void replay_calls(int load, int32_t frames, int reps, bool per_frame, con
         if (!(c.w.buf = buf = malloc(c.w.cap))) check(SHR_E_NO_MEMORY, "recording");
         shr_framebuffer_driver sw = new_driver();
         uint32_t pass = record(load, frames, &sw, &v, &c);
-        check(shr_software_driver_destroy(&sw), "driver");
+        drop_driver(&sw);
         rec_info in;
         check(rec_scan(buf, c.w.len, &in), "rec_scan");
         pass2 = v.hash, len = c.w.len;
@@ -277,7 +356,7 @@ static void replay_calls(int load, int32_t frames, int reps, bool per_frame, con
     if (!load_dir) printf(" pass %08lx", (unsigned long)pass2);
     printf(" replay %08lx first-bad %d peak %zu KiB -> %s\n", (unsigned long)hash, (int)bad, peak >> 10,
            same && (load_dir || pass2 == hash) ? "EQUAL" : "DIFFER");
-    check(shr_software_driver_destroy(&sw), "driver");
+    drop_driver(&sw);
     free(scratch), free(st), free(t), free(buf);
 }
 
@@ -305,12 +384,17 @@ int main(int argc, char **argv) {
     const char *profile = getenv("SHR_REPLAY_PROFILE"), *part = getenv("SHR_REPLAY_PART");
     const char *reps_env = getenv("SHR_REPLAY_REPS"), *frames_env = getenv("SHR_REPLAY_FRAMES");
     const char *keeps_env = getenv("SHR_REPLAY_KEEPS"), *bands_env = getenv("SHR_REPLAY_BANDS");
-    const char *rot_env = getenv("SHR_REPLAY_ROTATION");
+    const char *rot_env = getenv("SHR_REPLAY_ROTATION"), *copier = getenv("SHR_REPLAY_COPIER");
     int bands = bands_env ? atoi(bands_env) : 2;
     if ((profile && strcmp(profile, "tab5")) || (part && strcmp(part, "driver-sw") && strcmp(part, "compositor"))) {
         fprintf(stderr, "only SHR_REPLAY_PROFILE=tab5 and SHR_REPLAY_PART=driver-sw or compositor so far\n");
         return 2;
     }
+    if (copier && strcmp(copier, "tab5")) {
+        fprintf(stderr, "only SHR_REPLAY_COPIER=tab5 so far\n");
+        return 2;
+    }
+    g.copier = copier;
     if (bands < 1 || bands > 2) {
         fprintf(stderr, "SHR_REPLAY_BANDS must be 1 or 2\n");
         return 2;
@@ -350,5 +434,6 @@ int main(int argc, char **argv) {
         free(ref);
     }
     for (uint32_t k = 0; k < g.ntargets; k++) free(g.targets[k].pixels);
-    return 0;
+    if (g.copier) printf("DMA-PATHS %dx%d %s\n", SHR_CELL_WIDTH, SHR_CELL_HEIGHT, g.lost ? "FAIL" : "ok");
+    return g.lost;
 }

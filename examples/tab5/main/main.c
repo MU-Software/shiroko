@@ -4,14 +4,17 @@
  * a PSRAM spare instead. CONFIG_SHIROKO_TAB5_BANDS internal bands are taken (2 by default), and only their mode runs
  * (C, or B with one) unless CONFIG_SHIROKO_TAB5_ALL_MODES (also A). A worker task on the main task's core starts the
  * queued DMA2D copies (keeps; in B and C also scrolled rows moved inside the frame buffer, once a boot self-test proved
- * the moves right) and PPA rotations in order, so the work of a frame runs on while the next one is built: a frame is
- * presented once the work of the frame before it is done; its tail runs until its own is.
+ * the moves right; keeps of rows of any length once another proved those copies right, else of 32-byte multiples) and
+ * PPA rotations in order, so the work of a frame runs on while the next one is built: a frame is presented once the
+ * work of the frame before it is done; its tail runs until its own is.
  * Per scene: an R line with set_cell, build, draw (software), rotate (queueing the hardware work and waiting for it),
  * present (cache write-back), frame and busy (frame less the hardware waits and the cap's sleep) p50/p95/max after WARM,
  * the largest frame of all loop frames, max1 (loop frame 0 left out, as frames are judged), settle, transitions, flash
- * reads and traffic per frame; an M line (move waits, tail, PSRAM traffic); a frame buffer checksum every mode and rep
- * must agree on. A round ends with each scene's median and largest over its reps. Loop frames run back to back unless
- * CONFIG_SHIROKO_TAB5_FPS_CAP (or TAB5_FPS_CAP) caps them (0 = uncapped).
+ * reads and traffic per frame; an M line (move waits, tail, PSRAM traffic); a P line (keep copies by the DMA2D and by
+ * the CPU, small, off a cache line or by rule (tests/bench/tab5_copy.h), and ROTATEs the CPU ran); a frame buffer
+ * checksum every mode and rep must agree on. A round ends with each scene's median and largest over its reps and a
+ * DMA-PATHS line, FAIL naming the scenes with keep copies the CPU took by rule or ROTATEs it ran. Loop frames run back
+ * to back unless CONFIG_SHIROKO_TAB5_FPS_CAP (or TAB5_FPS_CAP) caps them (0 = uncapped).
  * Build options: TAB5_LOADS=<mask> (bit n: load n), TAB5_MOVES=0 (draw moved rows again), TAB5_DMA_MBPS (DMA2D rate
  * cap), TAB5_MOVE_CHUNKS (runs of rows per move), TAB5_STEPS (scroll steps per frame), TAB5_REPLAY=1 (each scene's
  * batches and calls replayed; TAB5_REPLAY_PARTS bits driver-sw, driver-p4, compositor; TAB5_REPLAY_FRAMES=1 adds BF
@@ -61,6 +64,7 @@
 #if TAB5_REPLAY
 #include "rec_api.h"
 #endif
+#include "tab5_copy.h"
 #include "tab5_scenes.h"
 
 #define N(a) (sizeof(a) / sizeof((a)[0]))
@@ -89,7 +93,6 @@
 /* Quarter turns to output x offsets of 2 mod 4 can hang the PPA (esp-idf#19096): 16-pixel edges avoid them. */
 #define PPA_ALIGN 16
 #define DMA_QUEUE 16
-#define DMA_MIN_BYTES 8192 /* smaller copies cost the CPU less than a DMA2D submission */
 #define DMA_BURST 128      /* bytes per DMA2D burst (16..128): smaller ones hold PSRAM in shorter turns, slower */
 #define CHAIN 64           /* queued copies, and rotations */
 #define SPARES 3           /* PSRAM bands drawn into while an internal band still waits for the hardware */
@@ -135,9 +138,10 @@ static const char *const mode_names[MODES] = {"A compose", "B 1 band", "C 2 band
 #endif
 #define MODE1 (MODE_BANDS + 1) /* past the last mode run */
 
-/* Bytes of keep copies by DMA and by the CPU, PPA rotations and moves (read and written). */
+/* Bytes of keep copies by DMA and by the CPU, PPA rotations and moves (read and written); the CPU's copies by reason
+ * (tab5_copy.h: small, line, rule) and the ROTATEs the CPU ran. */
 typedef struct traffic {
-    uint64_t copied[2], rotated, moved;
+    uint64_t copied[2], rotated, moved, cpu[3], rot_cpu;
 } traffic;
 
 typedef struct scene_stats {
@@ -524,6 +528,12 @@ static int band_of(const void *p) {
     return -1;
 }
 
+/* Row and source alignment of the copies the DMA2D takes: TAB5_COPY_LEN once the boot self-test proved it. */
+static size_t copy_len = TAB5_COPY_LEN_SAFE;
+
+_Static_assert(CONFIG_CACHE_L2_CACHE_LINE_SIZE == TAB5_COPY_LINE, "tab5_copy.h's cache line");
+_Static_assert(BSP_LCD_V_RES * 2 % TAB5_COPY_LINE == 0, "band rows start cache lines");
+
 /* The software driver's copier. The DMA writes whole cache lines from dst on: dst starts one, and its rows do too or
  * are contiguous (a keep). A copy into a slot starts once the copies and rotations before it touching the slot are
  * done (a keep-only batch does not wait for the batches before it); one left to the CPU waits for its slots. */
@@ -531,9 +541,10 @@ static uint64_t keep_copy(void *user, void *dst, size_t dst_stride, const void *
                           int32_t rows) {
     (void)user;
     int sd = slot_of(dst), ss = slot_of(src), s = sd >= 0 ? sd : ss;
+    unsigned why = tab5_copy_why((uintptr_t)dst, dst_stride, (uintptr_t)src, bytes, bytes * rows, copy_len, true);
     a.bytes.copied[1] += bytes * rows;
-    if (bytes * rows < DMA_MIN_BYTES || (uintptr_t)dst % CONFIG_CACHE_L2_CACHE_LINE_SIZE ||
-        ((uintptr_t)src | bytes) % 32 || (dst_stride % CONFIG_CACHE_L2_CACHE_LINE_SIZE && dst_stride != bytes)) {
+    if (why) {
+        a.bytes.cpu[why & TAB5_COPY_SMALL ? 0 : why & TAB5_COPY_LINE_START ? 1 : 2] += bytes * rows;
         slot_wait(sd), slot_wait(ss);
         return 0;
     }
@@ -559,8 +570,8 @@ static uint64_t keep_copy_trim(void *user, void *dst, size_t dst_stride, const v
                                size_t bytes, int32_t rows, const shr_software_trim *t) {
     int s = slot_of(dst);
     size_t all = bytes + t->lo + t->hi;
-    if (s < 0 || s >= BANDS || all * rows < DMA_MIN_BYTES || (uintptr_t)dst % CONFIG_CACHE_L2_CACHE_LINE_SIZE ||
-        ((uintptr_t)src | bytes) % 32 || dst_stride % CONFIG_CACHE_L2_CACHE_LINE_SIZE)
+    if (s < 0 || s >= BANDS ||
+        tab5_copy_why((uintptr_t)dst, dst_stride, (uintptr_t)src, bytes, all * rows, copy_len, false))
         return keep_copy(user, (uint8_t *)dst - t->lo, dst_stride, (const uint8_t *)src - t->lo, src_stride, all, rows);
     a.bytes.copied[0] += bytes * rows;
     hw.dma_last[s] = hw.dma_wr[s] =
@@ -689,6 +700,52 @@ static void move_setup(void) {
     printf(" -> one copy up to +%ld px, moves %s\n", (long)mv.up_max, mv.ok ? "on in B and C" : "off");
 }
 
+/* ===== Keep copies of rows of any length: a boot self-test ===== */
+
+#define COPY_TRY 65536
+
+/* The DMA2D copies rows whose length or source is off 32 bytes (keeps of cells not 16 pixels wide) right as far as
+ * measured, not as documented: copy_len allows them once copies of this build's rows and of others, both ways between
+ * a PSRAM block `k` and band 0 while the CPU writes PSRAM past the block, change exactly the bytes they copy. */
+static bool copy_try(uint8_t *k, size_t koff, size_t boff, size_t bytes, int32_t rows, bool store) {
+    uint8_t *b = a.bands[0].pixels;
+    size_t bs = a.bands[0].stride, bn = a.bands[0].byte_length;
+    for (size_t i = 0; i < bn; i++) b[i] = (uint8_t)(i * 7 + 1);
+    for (size_t i = 0; i < COPY_TRY; i++) k[i] = (uint8_t)(i * 13 + 5);
+    if (store) dma_copy(k + koff, bytes, b + boff, bs, (int32_t)(bytes / 2), rows, 0, 0, NULL);
+    else dma_copy(b + boff, bs, k + koff, bytes, (int32_t)(bytes / 2), rows, 0, 0, NULL);
+    memset(k + COPY_TRY, 0x5A, COPY_TRY);
+    hw_drain();
+    bool bad = false;
+    for (size_t i = 0; i < COPY_TRY; i++) {
+        size_t o = i - koff;
+        bool in = store && i >= koff && o / bytes < (size_t)rows;
+        bad |= k[i] != (uint8_t)(in ? (boff + o / bytes * bs + o % bytes) * 7 + 1 : i * 13 + 5);
+    }
+    for (size_t i = 0; i < bn; i++) {
+        size_t o = i - boff;
+        bool in = !store && i >= boff && o / bs < (size_t)rows && o % bs < bytes;
+        bad |= b[i] != (uint8_t)(in ? (koff + o / bs * bytes + o % bs) * 13 + 5 : i * 7 + 1);
+    }
+    return !bad;
+}
+
+static void copy_setup(void) {
+    const size_t row = (size_t)(BSP_LCD_V_RES / CW * CW * 2);
+    const size_t lengths[] = {row, 2544, 2550, 2530, 2546, 2556, 650}, offsets[] = {0, 2, 16, row};
+    uint8_t *k = heap_caps_aligned_alloc(TAB5_COPY_LINE, 2 * COPY_TRY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int wrong = 0, tries = 0;
+    for (size_t l = 0; k && l < N(lengths); l++)
+        for (size_t o = 0; o < N(offsets); o++)
+            for (int t = 0; t < 4; t++, tries++)
+                wrong += !copy_try(k, offsets[o], t & 2 ? TAB5_COPY_LINE : 0, lengths[l], BAND_H - (t >> 1), t & 1);
+    free(k);
+    copy_len = k && !wrong ? TAB5_COPY_LEN : TAB5_COPY_LEN_SAFE;
+    printf("copy self-test (rows of %zu B and %zu other lengths, %zu source offsets, both ways, CPU writing PSRAM):"
+           " %d of %d wrong -> keep copies of rows %s\n", row, N(lengths) - 1, N(offsets), wrong, tries,
+           copy_len == TAB5_COPY_LEN ? "of any length" : "of 32-byte multiples only");
+}
+
 /* (B, C) A batch rotating parts of one band from the slot it was drawn into: queued, not waited for. In C, two whole
  * bands of keeps next to each other, band 0's above, turn as one block of the two internal bands (adjacent in memory):
  * band 0's rotation is held until band 1's comes. */
@@ -774,6 +831,7 @@ static shr_status p4_execute(void *user, const shr_surface *d, const shr_draw_cm
                             : (shr_rect){r.x0 < u->x0 ? r.x0 : u->x0, r.y0 < u->y0 ? r.y0 : u->y0,
                                          r.x1 > u->x1 ? r.x1 : u->x1, r.y1 > u->y1 ? r.y1 : u->y1};
     }
+    for (size_t i = 0; i < n; i++) a.bytes.rot_cpu += c[i].kind == SHR_CMD_ROTATE;
     shr_status st = a.sw.execute(a.sw.user, &ds, c, n, f);
     if (d->pixels == a.fb.pixels) fb_sync(ESP_CACHE_MSYNC_FLAG_DIR_C2M); /* rotations only invalidate */
     a.draw_us += esp_timer_get_time() - t0;
@@ -1145,6 +1203,18 @@ static void print_moves(int rep) {
            mb * fps, fps, mb * (fps < 30 ? fps : 30), TAB5_STEPS);
 }
 
+/* The CPU's keep copies by reason and the ROTATEs it ran: a rule copy or a ROTATE is a DMA2D or PPA path lost. */
+static bool paths_lost[LOADS];
+
+static void print_paths(int rep) {
+    const int n = a.s.frames - WARM;
+    const traffic *b = &a.loop;
+    paths_lost[a.s.load] |= b->cpu[2] || b->rot_cpu;
+    printf("  P rep=%d load=%s mode=%c keep KB/frame dma %.0f cpu small %.0f line %.0f rule %.0f, CPU rotations %llu\n",
+           rep, load_names[a.s.load], 'A' + a.mode, (double)b->copied[0] / n / 1024, (double)b->cpu[0] / n / 1024,
+           (double)b->cpu[1] / n / 1024, (double)b->cpu[2] / n / 1024, (unsigned long long)b->rot_cpu);
+}
+
 static void run_scene(int rep, int load, int mode) {
     scene_open(load, mode, NULL, NULL, NULL);
 #if TAB5_SOAK
@@ -1191,6 +1261,7 @@ static void run_scene(int rep, int load, int mode) {
     a.sums[rep][load][mode] = sum;
     print_moves(rep);
     print_stats(rep, sum, settle);
+    print_paths(rep);
     printf("  loop page loads %ld\n", page_loads);
     heap_line("at the last frame");
 #if TAB5_SOAK
@@ -1483,6 +1554,7 @@ void app_main(void) {
            TAB5_ROTATION == SHR_ROTATE_90_CW ? "clockwise" : "counterclockwise");
     heap_line("at boot");
     move_setup();
+    copy_setup();
     map_packages();
 #if TAB5_REPLAY
     replay_setup();
@@ -1510,5 +1582,10 @@ void app_main(void) {
                 }
         }
         printf(" -> %s\n", same ? "ALL EQUAL" : "DIFFER");
+        printf("DMA-PATHS round %ld:", round);
+        bool kept = true;
+        for (int load = 0; load < LOADS; load++)
+            if (paths_lost[load]) printf(" %s", load_names[load]), kept = false;
+        printf(" -> %s\n", kept ? "ok" : "FAIL (keep copies the DMA2D could take, or rotations, on the CPU)");
     }
 }
