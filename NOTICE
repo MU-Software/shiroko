@@ -87,3 +87,12 @@ Generated glyph rules (tools/fontpack/sprite, build-time tool)
   Ghostty's sprite code (src/font/sprite, commit 8f0dd3709050), reimplemented.
   Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors. MIT
   (LICENSES/Ghostty-MIT.txt).
+
+Nerd glyph placement (tools/fontpack/nerd_rules.py, build-time tool)
+  The code that sizes and places the Nerd glyphs fontpack.py bakes ports
+  Ghostty's glyph constraint code (src/font/Glyph.zig, Metrics.zig) and the
+  rule extraction of src/font/nerd_font_codegen.py. Copyright (c) 2024
+  Mitchell Hashimoto, Ghostty contributors. MIT (LICENSES/Ghostty-MIT.txt).
+  The rules are read at build time from nerd-fonts font-patcher v3.4.0
+  (fonts/fonts.lock.json "nerd_rules"; not stored in this repository).
+  Copyright (c) 2014 Ryan L McIntyre. MIT (LICENSES/Nerd-Fonts-LICENSE.md).

@@ -52,6 +52,30 @@
       "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.4.0/license-audit.md",
       "sha256": "22c490a48e08adcabab0b06d317fe6c6310a420e081d8ebff7f44d0210096cd1"
     },
+    "nerd-fonts-v3.4.0/font-patcher": {
+      "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/fa7b859994228a9c8759f99c55a8d31ee92a1b5e/font-patcher",
+      "sha256": "994fbbf6be2330bde2bdcd1498a01e6efe751f479eceef00e56bb442d2194c3b"
+    },
+    "nerd-fonts-v3.4.0/src/glyphs/original-source.otf": {
+      "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/fa7b859994228a9c8759f99c55a8d31ee92a1b5e/src/glyphs/original-source.otf",
+      "sha256": "3fed9b17232a907588d8abf27ba44a00f443c1d48786c4e61d6e12e52270cba2"
+    },
+    "nerd-fonts-v3.4.0/src/glyphs/devicons/devicons.otf": {
+      "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/fa7b859994228a9c8759f99c55a8d31ee92a1b5e/src/glyphs/devicons/devicons.otf",
+      "sha256": "5d25c4140c64dde78b4ab273e537ae22f2bc4f5a6f21482bdae396fb4a36fb58"
+    },
+    "nerd-fonts-v3.4.0/src/glyphs/font-awesome-extension.ttf": {
+      "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/fa7b859994228a9c8759f99c55a8d31ee92a1b5e/src/glyphs/font-awesome-extension.ttf",
+      "sha256": "b3c40985a8f23bbe450926e87b55fb3937b0aee742805ea4a6443242e224ea33"
+    },
+    "nerd-fonts-v3.4.0/src/glyphs/weather-icons/weathericons-regular-webfont.ttf": {
+      "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/fa7b859994228a9c8759f99c55a8d31ee92a1b5e/src/glyphs/weather-icons/weathericons-regular-webfont.ttf",
+      "sha256": "176bda6661f213dde47c2114d76e476ec8ca9aae07dd54f9550d2d28fe02b4fd"
+    },
+    "nerd-fonts-v3.4.0/src/glyphs/octicons/octicons.otf": {
+      "url": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/fa7b859994228a9c8759f99c55a8d31ee92a1b5e/src/glyphs/octicons/octicons.otf",
+      "sha256": "65549010f09586c48eccd00e4c32b381834ef537a4a5b6c2ef7dcd6b3911acea"
+    },
     "IVD_Sequences-2026-08-03.txt": {
       "url": "https://www.unicode.org/ivd/data/2026-08-03/IVD_Sequences.txt",
       "sha256": "2b466659c2bfde1c52e60bd9fc883ab14dfa5c583df024b80352420265d2cd87"
@@ -181,6 +205,11 @@
       "file": "NerdFontsSymbolsOnly-v3.4.0.zip",
       "member": "SymbolsNerdFontMono-Regular.ttf",
       "sha256": "f0f624d9b474bea1662cf7e862d44aebe1ae1f6c7f9cb7a0ca5d0e5ac9561c60"
+    },
+    "nerd-regular": {
+      "file": "NerdFontsSymbolsOnly-v3.4.0.zip",
+      "member": "SymbolsNerdFont-Regular.ttf",
+      "sha256": "71db104aa66567d0efe0b98758f9dfc1895573a453fe85fb53d1c38544a55106"
     },
     "noto-cjk-jp-regular": {
       "file": "NotoSansCJKjp-Regular.otf",
@@ -352,5 +381,10 @@
       ]
     }
   },
-  "ivd": "IVD_Sequences-2026-08-03.txt"
+  "ivd": "IVD_Sequences-2026-08-03.txt",
+  "nerd_rules": {
+    "version": "3.4.0",
+    "patcher": "nerd-fonts-v3.4.0/font-patcher",
+    "glyphs": "nerd-fonts-v3.4.0/src/glyphs/"
+  }
 }

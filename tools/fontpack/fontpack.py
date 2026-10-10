@@ -45,8 +45,9 @@ from fontTools.varLib import instancer
 from PIL import Image
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "tools" / "unicode"))
+sys.path[:0] = [str(ROOT / "tools" / "unicode"), str(ROOT / "tools" / "fontpack")]
 import gen_unicode_tables as ucd  # noqa: E402
+import nerd_rules  # noqa: E402
 import sprite  # noqa: E402
 
 FONTS = ROOT / "fonts"
@@ -494,6 +495,69 @@ def fit_ppem(face, role, size, baseline):
     return min(width_fit, baseline * face.upem / face.ascent, (lh - baseline) * face.upem / face.descent)
 
 
+def pinned_input(name):
+    path = SRC / name
+    data = path.read_bytes() if path.exists() else b""
+    if name not in LOCK["files"] or sha256(data) != LOCK["files"][name]["sha256"]:
+        sys.exit(f"missing or modified input {path}; run `make fontpack-fetch`")
+    return data
+
+
+@functools.cache
+def icon_rules(face):
+    """{Nerd scalar: constraint} from the pinned font-patcher (fonts.lock.json "nerd_rules") for the Symbols face."""
+    pin = LOCK["nerd_rules"]
+    sources = functools.cache(lambda f: TTFont(io.BytesIO(pinned_input(pin["glyphs"] + f)), lazy=True).getBestCmap())
+    rules, version = nerd_rules.rules(pinned_input(pin["patcher"]).decode(), face.tt, sources)
+    if version != pin["version"]:
+        sys.exit(f"font-patcher version {version} != {pin['version']}")
+    return rules
+
+
+def icon_metrics(latin_face, size, baseline, em):
+    """The cell as the constraints see it: the face fills the cell, y up from its bottom; icons are two cap heights
+    and the cell height averaged."""
+    lh, cw = size["line_height"], size["cell_width"]
+    cap = latin_face.tt["OS/2"].sCapHeight * em / latin_face.upem
+    return {"cell_width": cw, "cell_height": lh, "cell_baseline": lh - baseline, "face_width": float(cw),
+            "face_height": float(lh), "face_y": 0.0, "icon_height": (2 * cap + lh) / 3}
+
+
+def raster_icon(face, gid, rule, m, em):
+    """The unhinted outline at the latin em, scaled and moved where the constraint puts it in the cell."""
+    ft = face.ft
+    ft.set_char_size(face.upem * 64, face.upem * 64, 72, 72)  # one font unit per pixel: exact 26.6 points
+    ft.load_glyph(gid, freetype.FT_LOAD_NO_HINTING)
+    b = ft.glyph.outline.get_bbox()
+    s = em / face.upem / 64
+    glyph = ((b.xMax - b.xMin) * s, (b.yMax - b.yMin) * s, b.xMin * s, b.yMin * s + m["cell_baseline"])
+    if glyph[0] < 0.25 or glyph[1] < 0.25:
+        return None, 0, 0
+    w, h, x, y = nerd_rules.place(rule, glyph, m)
+    sx, sy = w / glyph[0], h / glyph[1]
+    o = ft.glyph.outline._FT_Outline
+    for i in range(o.n_points):
+        px = (o.points[i].x - b.xMin) * s * sx + x
+        py = (o.points[i].y - b.yMin) * s * sy + y - m["cell_baseline"]
+        o.points[i].x, o.points[i].y = round(px * 64), round(py * 64)
+    ft.glyph.render(RENDER_MODES[CONFIG["raster"]["render"]])
+    bm = ft.glyph.bitmap
+    rows = [bytes(bm.buffer[r * bm.pitch:r * bm.pitch + bm.width]) for r in range(bm.rows)]
+    if not any(any(r) for r in rows):
+        return None, 0, 0
+    return rows, ft.glyph.bitmap_left, ft.glyph.bitmap_top
+
+
+def crop(rows, bx, top, width, lh, baseline):
+    """The part of a bitmap inside its cells."""
+    y0, x0 = max(0, top - baseline), max(0, -bx)
+    y1, x1 = min(len(rows), lh - (baseline - top)), min(len(rows[0]), width - bx)
+    rows = [r[x0:x1] for r in rows[y0:y1]]
+    if not rows or not rows[0] or not any(any(r) for r in rows):
+        return None, 0, 0
+    return rows, bx + x0, top - y0
+
+
 CJK_CORE = ((0x3040, 0x30FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7A3))  # kana, Han, Hangul syllables
 
 
@@ -862,8 +926,9 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
     em = fit_ppem(latin_face, "latin", size, baseline)
     inst_ppem, lift = (cjk_ppem(regular, scalars, size, baseline, em) if role == "cjk"
                        else (fit_ppem(regular, role, size, baseline), 0))
+    rules, icons = (icon_rules(regular), icon_metrics(latin_face, size, baseline, em)) if role == "nerd" else ({}, None)
     glyph_records, bitmaps, record_of = [], [], []
-    clipped = notdef = drawn = 0
+    clipped = notdef = drawn = cropped = cropped_ink = 0
     m = sprite.Metrics.from_face(latin_face, size["cell_width"], size["line_height"])
     for key in slot_keys:
         kind, v = key
@@ -890,8 +955,24 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
             notdef += 1
         cells = key_cells(profile, role, key)
         cp = v if kind == "cp" else -1
-        box = (regular.cell_box if 0x2500 <= cp <= 0x259F or 0x1FB00 <= cp <= 0x1FBFF
-               else regular.bounds(gid) if 0xE0B0 <= cp <= 0xE0D7 and gid else None)
+        if icons and gid:  # sized by the Nerd Fonts rules, then cut to the cell
+            if cells != 1:
+                sys.exit(f"{name}: glyph {key} is not one cell wide")
+            rows, bx, top = raster_icon(regular, gid, rules.get(cp, nerd_rules.FIT), icons, em)
+            if rows and (bx < 0 or bx + len(rows[0]) > cw or baseline - top < 0 or baseline - top + len(rows) > lh):
+                ink = sum(a >= 9 for r in rows for a in r)
+                rows, bx, top = crop(rows, bx, top, cw, lh, baseline)
+                cropped += 1
+                cropped_ink += ink - sum(a >= 9 for r in rows or () for a in r)
+            if rows is None:
+                record_of.append(None)
+                continue
+            packed = pack_rows(rows, fmt)
+            record_of.append(len(glyph_records))
+            glyph_records.append((len(rows[0]), len(rows), bx, top, fmt | (cells << 2), gid, packed))
+            bitmaps.append(sum(map(len, packed)))
+            continue
+        box = regular.cell_box if 0x2500 <= cp <= 0x259F or 0x1FB00 <= cp <= 0x1FBFF else None
         ppem, own = inst_ppem, role == "symbols" and gid and not box
         fit = own or (role == "cjk" and gid and not box)  # shrunk or moved into its cells where it would be cut
         if own:  # each symbol scaled on its own: the latin em, shrunk until its ink fits its cells
@@ -922,6 +1003,8 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
         bitmaps.append(sum(map(len, packed)))
     report.update(slots=len(slot_keys), blank=len(slot_keys) - len(glyph_records), clipped=clipped, notdef=notdef,
                   bitmap_bytes=sum(bitmaps), generated=sum(1 for cp in cmap if cp in generated), generated_ink=drawn)
+    if icons:
+        report.update(cropped=cropped, cropped_ink=cropped_ink)
     if not glyph_records:
         sys.exit(f"{name}: the build has no glyphs")
 
@@ -1347,6 +1430,16 @@ def write_licenses(out, names, reports):
     (lic_dir / "Unicode-3.0.txt").write_bytes((ROOT / "LICENSES/Unicode-3.0.txt").read_bytes())
     used = sorted({n for r in reports.values() for n in r["order_inputs"] if n in LOCK["order"]})
     inventory["order_inputs"] = {n: {k: v for k, v in LOCK["order"][n].items() if k != "cache"} for n in used}
+    if any(CONFIG["packages"][n]["role"] == "nerd" for n in names):
+        pin = LOCK["nerd_rules"]
+        inventory["nerd_rules"] = {"version": pin["version"], "use": "parsed for the Nerd glyph sizes, not packaged",
+                                   "files": [{"path": f, "url": v["url"], "sha256": v["sha256"]}
+                                             for f, v in LOCK["files"].items()
+                                             if f == pin["patcher"] or f.startswith(pin["glyphs"])]}
+    if "nerd_rules" in inventory:
+        notice += ["", "Nerd glyph sizes follow the rules of nerd-fonts font-patcher v3.4.0 (MIT, Copyright (c) 2014 Ryan L "
+                   "McIntyre; LICENSES/nerd/nerd-fonts-LICENSE), placed as Ghostty (MIT, "
+                   "https://github.com/ghostty-org/ghostty) places them."]
     notice += ["", "Unicode data: Copyright (c) Unicode, Inc. Unicode License v3 (LICENSES/Unicode-3.0.txt)."
                + (" Unihan (Unihan.zip) orders CJK glyphs." if "Unihan.zip" in used else ""), ""]
     if "korean-frequency-2005.zip" in used:
@@ -1781,11 +1874,27 @@ def sprite_selftest():
     print(f"generated glyphs: {len(drawn)} drawn, invariants hold at {len(invariants.SIZES)} cell sizes")
 
 
+def icon_selftest():
+    """Nerd glyph placement against the values of Ghostty's constraint test."""
+    m = {"cell_width": 10, "cell_height": 22, "face_width": 9.6, "face_height": 21.12, "face_y": 0.2,
+         "icon_height": 44.48 / 3}
+    rules = icon_rules(Face(CONFIG["packages"]["nerd"]["faces"]["regular"]))
+    cases = ((nerd_rules.DEFAULT, (6.784, 15.28, 1.408, 4.84), (6.784, 15.28, 1.408, 4.84)),
+             (nerd_rules.FIT, (10.272, 10.272, 2.864, 5.304), (9.6, 9.6, 0, 5.64)),
+             (rules[0xEA61], (9.015625, 13.015625, 3.015625, 3.76525), (7.2125, 10.4125, 0.8125, 5.950695224719102)),
+             (rules[0xE0C0], (16.796875, 16.46875, -0.796875, 1.7109375), (10, 22, 0, 0)))
+    for c, glyph, want in cases:
+        got = nerd_rules.place(c, glyph, m)
+        if any(abs(a - b) > 1e-6 * max(1, abs(b)) for a, b in zip(got, want)):
+            sys.exit(f"selftest: Nerd glyph {glyph} placed at {got}, not {want}")
+
+
 def selftest(packages):
     """Install recovery: a damaged payload is rewritten, the notices follow, activation advances. The reader
-    rejects broken pages. The generated glyphs keep their invariants."""
+    rejects broken pages. The generated glyphs keep their invariants; Nerd glyphs are placed as Ghostty places them."""
     if CONFIG.get("generated"):
         sprite_selftest()
+    icon_selftest()
     src = min(pathlib.Path(packages).glob("shiroko-*.shrf"), key=lambda p: p.stat().st_size, default=None)
     if not src:
         sys.exit(f"{packages}: no packages to test with; run `make fontpack` first")
