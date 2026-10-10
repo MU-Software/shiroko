@@ -423,11 +423,12 @@ static void buf_release(gl_drv *g, uint32_t id) {
     *s = (slot){NULL, 0};
 }
 
-/* A layer of the old shape is reused; on failure the id names nothing. */
+/* A layer of the old shape is reused; on failure the id names nothing. RGB565 buffers are refused (no
+ * SHR_DRIVER_IMAGE_565). */
 static shr_status buf_register(gl_drv *g, uint32_t id, const shr_image *m) {
     shr_image *b = &g->bufs[id - 1];
     slot *s = &g->slots[id - 1];
-    if (m->width > g->max || m->height > g->max ||
+    if (m->format == SHR_FORMAT_RGB565 || m->width > g->max || m->height > g->max ||
         (g->budget && g->bytes - b->byte_length + m->byte_length > g->budget))
         return SHR_E_UNSUPPORTED;
     int kind = tex_kind(m->format);

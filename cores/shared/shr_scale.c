@@ -4,8 +4,20 @@
 
 #define INLINE static inline __attribute__((always_inline))
 
+/* One pixel of `format` as straight RGBA: gray g -> (g, g, g), no alpha -> 255. */
+static inline void src_rgba(uint32_t format, const uint8_t *p, uint8_t out[4]) {
+    if (format == SHR__SRC_RGB565) {
+        uint32_t v = shr__565_rgba((uint32_t)p[0] | (uint32_t)p[1] << 8);
+        out[0] = (uint8_t)v, out[1] = (uint8_t)(v >> 8), out[2] = (uint8_t)(v >> 16), out[3] = 255;
+        return;
+    }
+    bool rgb = format <= SHR_IMAGE_SRC_RGB888;
+    out[0] = p[0], out[1] = rgb ? p[1] : p[0], out[2] = rgb ? p[2] : p[0];
+    out[3] = format == SHR_IMAGE_SRC_RGBA8888 ? p[3] : format == SHR_IMAGE_SRC_GRAY_ALPHA88 ? p[1] : 255;
+}
+
 INLINE void texel(uint32_t f, const uint8_t *row, int32_t x, uint8_t out[4]) {
-    shr__src_rgba(f, row + (size_t)x * shr__src_bytes(f), out);
+    src_rgba(f, row + (size_t)x * shr__src_bytes(f), out);
 }
 
 #define LANES 0x00FF00FFu
@@ -15,10 +27,12 @@ void shr__bilin_start(shr__bilin *b, const shr__scale *s, int32_t x0, int32_t n,
     uint32_t den = (uint32_t)s->dw, step = (uint32_t)sw << 16, dq = step / den, dr = step % den;
     uint64_t num = ((uint64_t)(2 * x0 + 1) * (uint32_t)sw + den) << 15;
     uint32_t t = (uint32_t)(num / den), r = (uint32_t)(num % den);
+    int32_t k0 = s->src.x0 + (int32_t)(t >> 16) - 1;
+    b->x = k0 < 0 ? 0 : k0 > last ? last : k0; /* the taps' columns grow by less than 2^15 over the span */
     for (int32_t i = 0; i < n; i++) {
         int32_t k = s->src.x0 + (int32_t)(t >> 16) - 1;
         int32_t xa = k < 0 ? 0 : k > last ? last : k, xb = k + 1 > last ? last : k + 1;
-        b->tap[i] = (uint32_t)xa << 9 | (uint32_t)(xb - xa) << 8 | (t >> 8 & 255);
+        b->tap[i] = (uint32_t)(xa - b->x) << 9 | (uint32_t)(xb - xa) << 8 | (t >> 8 & 255);
         t += dq, r += dr;
         if (r >= den) r -= den, t++;
     }
@@ -39,7 +53,7 @@ INLINE uint32_t texel_word(uint32_t f, const uint8_t *p) {
         v = shr__565_rgba(u);
     } else {
         uint8_t c[4];
-        shr__src_rgba(f, p, c);
+        src_rgba(f, p, c);
         v = (uint32_t)c[0] | (uint32_t)c[1] << 8 | (uint32_t)c[2] << 16 | (uint32_t)c[3] << 24;
     }
     return v;
@@ -47,6 +61,7 @@ INLINE uint32_t texel_word(uint32_t f, const uint8_t *p) {
 
 INLINE void fill_as(const shr__bilin *b, const uint8_t *row, uint32_t *restrict h, uint32_t f) {
     size_t bpp = shr__src_bytes(f);
+    row += (size_t)b->x * bpp;
     for (int32_t i = 0; i < b->n; i++) {
         uint32_t t = b->tap[i], fx = t & 255, gx = 256 - fx;
         const uint8_t *a = row + (size_t)(t >> 9) * bpp;

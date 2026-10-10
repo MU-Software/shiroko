@@ -22,18 +22,6 @@ static inline uint32_t shr__565_rgba(uint32_t v) {
     return (r << 3 | r >> 2) | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2) << 16 | 0xFF000000u;
 }
 
-/* One pixel of `format` as straight RGBA: gray g -> (g, g, g), no alpha -> 255. */
-static inline void shr__src_rgba(uint32_t format, const uint8_t *p, uint8_t out[4]) {
-    if (format == SHR__SRC_RGB565) {
-        uint32_t v = shr__565_rgba((uint32_t)p[0] | (uint32_t)p[1] << 8);
-        out[0] = (uint8_t)v, out[1] = (uint8_t)(v >> 8), out[2] = (uint8_t)(v >> 16), out[3] = 255;
-        return;
-    }
-    bool rgb = format <= SHR_IMAGE_SRC_RGB888;
-    out[0] = p[0], out[1] = rgb ? p[1] : p[0], out[2] = rgb ? p[2] : p[0];
-    out[3] = format == SHR_IMAGE_SRC_RGBA8888 ? p[3] : format == SHR_IMAGE_SRC_GRAY_ALPHA88 ? p[1] : 255;
-}
-
 /* The source format of a driver buffer: RGBA8888 or RGB565. */
 static inline uint32_t shr__src_of(shr_pixel_format f) {
     return f == SHR_FORMAT_RGB565 ? SHR__SRC_RGB565 : SHR_IMAGE_SRC_RGBA8888;
@@ -81,9 +69,9 @@ void shr__scale_rows(const shr__scale *s, uint8_t *out, size_t stride);
  * lanes (R | B << 16 and G | A << 16): a lane's blend is at most 255 * 256. */
 typedef struct shr__bilin {
     const shr__scale *s;
-    int32_t n, held[2];
+    int32_t n, held[2], x; /* x: the first tap's column */
     uint32_t t, r, dq, dr; /* the next row's shr__scale_t(), stepped exactly */
-    uint32_t tap[SHR__SCALE_SPAN]; /* column a << 9 | (b - a) << 8 | weight of b */
+    uint32_t tap[SHR__SCALE_SPAN]; /* column a - x << 9 | (b - a) << 8 | weight of b */
     uint32_t h[2][2 * SHR__SCALE_SPAN];
 } shr__bilin;
 

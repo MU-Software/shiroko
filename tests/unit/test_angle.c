@@ -1221,7 +1221,7 @@ TEST errors_then_registering_again(void) {
         {{.kind = SHR_CMD_BUFFER_REGISTER, .buffer = 0, .src = img_ref(bufs[id - 1])}, good},
         {{.kind = SHR_CMD_BUFFER_REGISTER, .buffer = IDS + 1, .src = img_ref(bufs[id - 1])}, good},
         {{.kind = SHR_CMD_BUFFER_REGISTER, .buffer = id, .src = img_ref(short_stride)}, good},
-        {{.kind = SHR_CMD_BUFFER_REGISTER, .buffer = id, .src = img_ref(rgb)}, good},
+        {{.kind = SHR_CMD_BUFFER_REGISTER, .buffer = id, .src = img_ref(rgb)}, fill}, /* no SHR_DRIVER_IMAGE_565 */
         {fill, reg(id)},
         {buf_cmd(SHR_CMD_BUFFER_UPDATE, IDS - 1, (shr_rect){0, 0, 1, 1}), good},
     };

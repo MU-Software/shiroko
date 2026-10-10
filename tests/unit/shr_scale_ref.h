@@ -1,7 +1,7 @@
-/* Kitty image scaling, the e0r reference (FILTER.md). Source: straight RGBA8888 (bytes R, G, B, A), w x h, `stride`
- * bytes per row; source rect (sx, sy, sw, sh), scaled to dw x dh. Texels are clamped to the image (a rect past it, from
- * Ghostty's placeholder rounding, repeats the edge). shr_scale_px gives scaled pixel (i, j)
- * from (i, j) alone, so every clipped part of a scaled image (bands, damage, cells) has the same pixels. */
+/* Reference image scaling. Source: straight RGBA8888 (bytes R, G, B, A), w x h, `stride` bytes per row; source rect
+ * (sx, sy, sw, sh), scaled to dw x dh. Texels are clamped to the image (a rect past it repeats the edge). shr_scale_px
+ * gives scaled pixel (i, j) from (i, j) alone, so every clipped part of a scaled image (bands, damage, cells) has the
+ * same pixels. */
 #ifndef SHR_SCALE_REF_H
 #define SHR_SCALE_REF_H
 
@@ -9,7 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { SHR_FILTER_BILINEAR, SHR_FILTER_BOX }; /* the e0r reference's nearest left out: not a Shiroko filter */
+enum { SHR_FILTER_BILINEAR, SHR_FILTER_BOX };
 
 typedef struct shr_scale_src {
     const uint8_t *px;
@@ -72,6 +72,13 @@ static inline void shr_scale_px(const shr_scale_src *m, int filter, int32_t i, i
         }
     }
     for (int c = 0; c < 4; c++) out[c] = (uint8_t)((acc[c] + den / 2) / den);
+}
+
+/* A source pixel of `bpp` bytes (4 RGBA, 3 RGB, 1 gray, 2 gray and alpha) as straight RGBA: gray g -> (g, g, g),
+ * no alpha -> 255. */
+static inline void shr_src_widen(const uint8_t *p, size_t bpp, uint8_t out[4]) {
+    size_t rgb = bpp >= 3;
+    out[0] = p[0], out[1] = p[rgb], out[2] = p[2 * rgb], out[3] = bpp == 4 ? p[3] : bpp == 2 ? p[1] : 255;
 }
 
 /* An opaque RGB565 source: each pixel widened to 8 bits per field (x << 3 | x >> 2, g << 2 | g >> 4, alpha 255) into

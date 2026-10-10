@@ -1,4 +1,4 @@
-/* Scaled images: the filters against the e0r reference (shr_scale_ref.h), scaled IMAGE draws of the software driver
+/* Scaled images: the filters against the reference (shr_scale_ref.h), scaled IMAGE draws of the software driver
  * (planes, parts), copies against driver-scaled views through the compositor, views' lifetime and updates. */
 #include "harness.h"
 #include "shr_compositor.h"
@@ -83,7 +83,7 @@ TEST sources_scale_as_rgba(void) {
             for (size_t i = 0; i < stride * (size_t)c.h; i++) src[i] = (uint8_t)rnd();
             for (int32_t y = 0; y < c.h; y++)
                 for (int32_t x = 0; x < c.w; x++)
-                    shr__src_rgba(fmt, src + (size_t)y * stride + (size_t)x * bpp, wide + ((size_t)y * c.w + x) * 4);
+                    shr_src_widen(src + (size_t)y * stride + (size_t)x * bpp, bpp, wide + ((size_t)y * c.w + x) * 4);
             for (uint32_t f = SHR_SCALE_BILINEAR; f <= SHR_SCALE_BOX; f++) {
                 shr__scale s = scale_of(&c, src, stride, fmt, f), r = scale_of(&c, wide, (size_t)c.w * 4, 0, f);
                 for (int32_t y = 0; y < c.dh; y++) {
@@ -95,11 +95,32 @@ TEST sources_scale_as_rgba(void) {
         }
         free(rgba), free(row), free(want);
     }
+    const kase one = {1, 1, 0, 0, 1, 1, 1, 1}; /* 1 x 1 unscaled: the pixel itself */
     uint8_t g[2] = {7, 99}, out[4];
-    shr__src_rgba(SHR_IMAGE_SRC_GRAY_ALPHA88, g, out);
+    shr__scale s = scale_of(&one, g, 2, SHR_IMAGE_SRC_GRAY_ALPHA88, SHR_SCALE_BILINEAR);
+    shr__scale_row(&s, 0, 0, 1, out);
     ASSERT(out[0] == 7 && out[1] == 7 && out[2] == 7 && out[3] == 99);
-    shr__src_rgba(SHR_IMAGE_SRC_GRAY8, g, out);
+    s.format = SHR_IMAGE_SRC_GRAY8;
+    shr__scale_row(&s, 0, 0, 1, out);
     ASSERT(out[0] == 7 && out[2] == 7 && out[3] == 255);
+    PASS();
+}
+
+/* Columns past 2^23 read their own pixels (taps count from the first source column of their span). */
+TEST wide_sources_read_their_columns(void) {
+    enum { FAR = 1 << 23 };
+    const int32_t w = FAR + 100;
+    uint8_t *p = calloc((size_t)w, 1), out[10 * 4];
+    ASSERT(p != NULL);
+    for (int32_t j = 0; j < 100; j++) p[FAR + j] = (uint8_t)(1 + 2 * j);
+    shr__scale s = {.pixels = p, .stride = (size_t)w, .w = w, .h = 1, .format = SHR_IMAGE_SRC_GRAY8,
+                    .src = {FAR + 10, 0, FAR + 20, 1}, .dw = 10, .dh = 1, .filter = SHR_SCALE_BILINEAR};
+    shr__scale_row(&s, 0, 0, 10, out);
+    for (int i = 0; i < 10; i++) ASSERT_EQ_LL(out[4 * i], 21 + 2 * i);
+    memset(out, 0, sizeof(out));
+    shr__scale_rows(&s, out, sizeof(out));
+    for (int i = 0; i < 10; i++) ASSERT_EQ_LL(out[4 * i], 21 + 2 * i);
+    free(p);
     PASS();
 }
 
@@ -114,7 +135,7 @@ TEST copies_match_reference(void) {
             for (int32_t y = 0; y < c.h; y++) {
                 memcpy(src + (size_t)y * stride, rgba + (size_t)y * c.w * bpp, (size_t)c.w * bpp);
                 for (int32_t x = 0; x < c.w; x++)
-                    shr__src_rgba(fmt, src + (size_t)y * stride + (size_t)x * bpp, wide + ((size_t)y * c.w + x) * 4);
+                    shr_src_widen(src + (size_t)y * stride + (size_t)x * bpp, bpp, wide + ((size_t)y * c.w + x) * 4);
             }
             shr_scale_src m = {wide, (size_t)c.w * 4, c.w, c.h, c.sx, c.sy, c.sw, c.sh, c.dw, c.dh};
             for (uint32_t f = SHR_SCALE_BILINEAR; f <= SHR_SCALE_BOX; f++) {
@@ -238,7 +259,6 @@ TEST draws_match_reference_in_parts(void) {
     PASS();
 }
 
-/* Sizes and reads the driver checks. */
 /* An opaque image kept as RGB565: rows, whole copies and scaled draws (in two parts, both screen formats, stateless
  * and through a driver) equal the reference on its widened pixels. */
 TEST rgb565_scales_widened(void) {
@@ -316,6 +336,7 @@ TEST rgb565_scales_widened(void) {
     PASS();
 }
 
+/* Sizes and reads the driver checks. */
 TEST scaled_draws_checked(void) {
     enum { W = 8, H = 8 };
     static uint8_t px[4 * 4 * 4], out[W * H * 4];
@@ -621,6 +642,7 @@ int main(int argc, char **argv) {
     GREATEST_MAIN_BEGIN();
     RUN_TEST(rows_match_reference);
     RUN_TEST(sources_scale_as_rgba);
+    RUN_TEST(wide_sources_read_their_columns);
     RUN_TEST(copies_match_reference);
     RUN_TEST(draws_match_reference_in_parts);
     RUN_TEST(rgb565_scales_widened);
