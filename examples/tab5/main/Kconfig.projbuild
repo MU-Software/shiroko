@@ -35,8 +35,8 @@ menu "shiroko Tab5 example"
         help
             The screen is drawn 16 rows at a time into bands of 40 KiB of internal RAM each, which the PPA turns
             into the frame buffer. 2 (default) draws one band while the PPA turns the other. 1 leaves the app
-            40 KiB more internal RAM, but the CPU waits on the PPA: on the ST7121 Tab5 (uncapped, 216 KiB budget)
-            the scenes took about 14 % longer (p50 summed), and a scrolling screen fell into periodic 60 ms frames.
+            40 KiB more internal RAM, but the CPU waits on the PPA: on the ST7121 Tab5 (uncapped, 64 KiB budget)
+            the scenes took about 12 % longer (p50 summed), and a scrolling screen 34 ms a frame instead of 29.
 
     config SHIROKO_TAB5_ALL_MODES
         bool "Run every drawing mode"

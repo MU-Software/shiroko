@@ -685,9 +685,9 @@ static void move_setup(void) {
     printf(" -> one copy up to +%ld px, moves %s\n", (long)mv.up_max, mv.ok ? "on in B and C" : "off");
 }
 
-/* (B, C) A batch rotating parts of one band from the slot it was drawn into: queued, not waited for. Two whole bands
- * of keeps next to each other, band 0's above, turn as one block of the two internal bands (adjacent in memory): band
- * 0's rotation is held until band 1's comes. */
+/* (B, C) A batch rotating parts of one band from the slot it was drawn into: queued, not waited for. In C, two whole
+ * bands of keeps next to each other, band 0's above, turn as one block of the two internal bands (adjacent in memory):
+ * band 0's rotation is held until band 1's comes. */
 static bool ppa_band(const shr_surface *d, const shr_draw_cmd *c, size_t n) {
     int k = band_of(c->src.pixels);
     for (size_t i = 0; i < n; i++)
@@ -710,7 +710,7 @@ static bool ppa_band(const shr_surface *d, const shr_draw_cmd *c, size_t n) {
         return true;
     }
     held_flush();
-    if (whole && k == 0) {
+    if (whole && k == 0 && a.mode == BAND2) {
         hw.held = true, hw.held_op = ppa_config(d, b->pixels, b->width, b->height, all, c->dst.x0, c->dst.y0, c->rotation);
         return true;
     }

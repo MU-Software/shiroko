@@ -336,9 +336,9 @@ over 12 bytes (each new one, and `shr_pl_lyr_tilemap_set_text` even when unchang
   330 KiB. 216 KiB leaves the app about 150 KiB less and draws the example's scenes about 4 % faster on Tab5
   (uncapped, ST7121, p50 summed over the scenes; the Hangul scenes 3-4 ms a frame).
 - Draw with two bands (Kconfig `SHIROKO_TAB5_BANDS`, default 2: 2 x 40 KiB of internal RAM) so the CPU draws one
-  while the PPA turns the other. One band leaves the app 40 KiB more, but on Tab5 (uncapped, ST7121, 216 KiB budget) the
-  scenes took about 14 % longer (p50 summed) and a scrolling screen fell into periodic 60 ms frames. The replay
-  bench's `SHR_REPLAY_BANDS` sets the same count.
+  while the PPA turns the other. One band leaves the app 40 KiB more, but on Tab5 (uncapped, ST7121, 64 KiB budget) the
+  scenes took about 12 % longer (p50 summed) and a scrolling screen 34 ms a frame instead of 29. The replay bench's
+  `SHR_REPLAY_BANDS` sets the same count.
 - Watch the internal heap: `heap_caps_register_failed_alloc_callback()` reports any failed request with its size and
   caps, `heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)` the lowest free since boot, and
   `heap_caps_monitor_local_minimum_free_size_start()` / `_stop()` the lowest over a stretch, such as one screen of
