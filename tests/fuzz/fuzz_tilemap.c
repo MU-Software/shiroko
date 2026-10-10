@@ -1,5 +1,5 @@
-/* Tilemap under random set_cell / set_text / set_lines / clear / scroll / resize / measure sequences with the built-in
- * font.
+/* Tilemap under random set_cell / set_text / set_lines / set_row / clear / scroll / resize / measure sequences with the
+ * built-in font.
  * Invariants:
  *   - measure layouts partition the text, advance cell by cell and are deterministic
  *   - set_text accepts exactly the texts measure accepts (same columns, no runs); only measure's unbounded
@@ -189,7 +189,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         uint8_t op = fr_u8(&r);
         shr_status st = SHR_OK;
         bool mutates = true;
-        switch (op < 0xC0 ? op % 8 : op < 0xD0 ? 8 : 15) { /* 0xD0 and up: room for more operations */
+        switch (op < 0xC0 ? op % 8 : op < 0xD0 ? 8 : op < 0xE0 ? 9 : 15) { /* 0xE0 and up: room for more operations */
         case 0: {
             int32_t row = fr_i8(&r), col = fr_i8(&r);
             uint8_t sp = fr_u8(&r);
@@ -277,6 +277,33 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 FUZZ_CHECK(lines[i].cols && lines[i].col + lines[i].cols <= cols && lines[i].kind <= SHR_LINE_OVER &&
                            lines[i].shape <= SHR_LINE_DASHED && lines[i].flags <= SHR_TEXT_LINE_BLINK &&
                            lines[i].color >> 24 != 0x40);
+            break;
+        }
+        case 9: { /* set_row; code points from 0x300 (2 bytes) or 0x1D167 (4 bytes) on, clusters of up to 64 */
+            int32_t row = fr_i8(&r), col = fr_i8(&r);
+            shr_text_style styles[2] = {fr_style(&r), fr_style(&r)};
+            shr_row_cell cells[24];
+            uint32_t scalars[72];
+            size_t nc = fr_u8(&r) % 25;
+            uint8_t wide = fr_u8(&r);
+            for (size_t i = 0; i < 72; i++) scalars[i] = (wide >> (i & 7) & 1 ? 0x1D167 : 0x300) + i % 8;
+            int64_t end = col;
+            for (size_t i = 0; i < nc; i++) {
+                uint8_t a = fr_u8(&r), b = fr_u8(&r), k = b >> 3 & 3;
+                cells[i] = (shr_row_cell){a == 0xFF ? 0xD800 : a < 0x20 ? 0x41 + a : 0xAC00 + a, (uint16_t)(b & 3),
+                                          (uint8_t)(1 + (b >> 2 & 1)), (uint8_t)(k < 3 ? k : 17 + a % 48)};
+                if (cells[i].scalars > 1) cells[i].text = b >> 5;
+                end += cells[i].span;
+            }
+            shr_text_line lines[16];
+            size_t nl = fr_lines(&r, lines, 16);
+            shr_row in = {cells, nc, styles, 2, scalars, 72, (op & 1) ? lines : NULL, nl};
+            shr_error_info err;
+            st = shr_pl_lyr_tilemap_set_row(layer, row, col, &in, &err);
+            FUZZ_CHECK(err.status == st);
+            if (st == SHR_OK)
+                FUZZ_CHECK(row >= 0 && row < rows && col >= 0 && end <= cols && style_known(styles[0]) &&
+                           style_known(styles[1]));
             break;
         }
         case 15: mutates = false; break;

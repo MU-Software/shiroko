@@ -7,7 +7,8 @@
  * CELLS layer count + per cell row u16 col u16 style u16 span u8 length u8 UTF-8 (set_cell calls in a row);
  * TEXT layer row col style flags runs length + runs (start end style) + UTF-8; CLEAR layer row col rows cols style;
  * SCROLL layer top bottom n style; LINES layer row count + per line u16 col u16 cols u8 kind u8 shape u16 flags u32
- * colour. */
+ * colour; ROW layer row col cells styles scalars lines (UINT32_MAX: NULL) + u32 style per style, then per cell u32 text
+ * u16 style (into the call's styles) u8 span u8 scalars, u32 code points and lines as in LINES. */
 #define REC_API_IMPL
 #include "rec_api.h"
 
@@ -19,7 +20,7 @@
 enum { C_CLOCK = REC_CALL0, C_CREATE, C_SCREEN, C_SUBMIT, C_PUMP, C_POLL, C_REDRAW, C_LYR_CREATE, C_LYR_RECT, C_LYR_Z,
        C_LYR_VISIBLE, C_LYR_DESTROY, C_CMD_BEGIN, C_CMD_FILL, C_CMD_IMAGE, C_CMD_COMMIT, C_IMG_CREATE, C_IMG_UPDATE,
        C_IMG_RELEASE, C_FONT_CREATE, C_FONT_DESTROY, C_FONT_PRELOAD, C_RESIZE, C_STYLE, C_CELLS, C_TEXT, C_CLEAR,
-       C_SCROLL, C_LINES, C_END };
+       C_SCROLL, C_LINES, C_ROW, C_END };
 enum { K_FRAME, K_API, K_SUBMIT, K_BUILD };
 enum { A_ALL, A_CELLS, A_SCROLL, A_LAYER, A_IMAGE, A_OTHER };
 /* The api column of each call decoded ahead (the rest: A_ALL). */
@@ -32,6 +33,7 @@ static const int8_t kinds[C_END - C_CLOCK] = {
     [C_FONT_CREATE - C_CLOCK] = A_OTHER, [C_FONT_DESTROY - C_CLOCK] = A_OTHER, [C_FONT_PRELOAD - C_CLOCK] = A_OTHER,
     [C_RESIZE - C_CLOCK] = A_OTHER,      [C_CELLS - C_CLOCK] = A_CELLS,       [C_TEXT - C_CLOCK] = A_CELLS,
     [C_CLEAR - C_CLOCK] = A_CELLS,       [C_SCROLL - C_CLOCK] = A_SCROLL,     [C_LINES - C_CLOCK] = A_CELLS,
+    [C_ROW - C_CLOCK] = A_CELLS,
 };
 
 const char *const rec_compositor_cols[REC_COLS] = {"frame", "api", "submit", "build"};
@@ -411,6 +413,15 @@ shr_status rec_shr_pl_lyr_tilemap_scroll(shr_lyr *layer, int32_t top, int32_t bo
     return st;
 }
 
+static void put_lines(uint8_t *p, const shr_text_line *lines, size_t count) {
+    for (size_t i = 0; i < count; i++, p += 12) {
+        const shr_text_line *e = &lines[i];
+        p[0] = (uint8_t)e->col, p[1] = (uint8_t)(e->col >> 8), p[2] = (uint8_t)e->cols, p[3] = (uint8_t)(e->cols >> 8);
+        p[4] = e->kind, p[5] = e->shape, p[6] = (uint8_t)e->flags, p[7] = (uint8_t)(e->flags >> 8);
+        rec_put32(p + 8, e->color);
+    }
+}
+
 shr_status rec_shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_text_line *lines, size_t count,
                                             shr_error_info *err) {
     rec_calls *c = recorder();
@@ -418,12 +429,34 @@ shr_status rec_shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const s
     uint8_t *p = c && (count == 0 || lines)
                      ? call(c, C_LINES, (const uint32_t[]){obj_id(c, layer), (uint32_t)row, (uint32_t)count}, 3, 12 * count)
                      : NULL;
-    for (size_t i = 0; p && i < count; i++, p += 12) {
-        const shr_text_line *e = &lines[i];
-        p[0] = (uint8_t)e->col, p[1] = (uint8_t)(e->col >> 8), p[2] = (uint8_t)e->cols, p[3] = (uint8_t)(e->cols >> 8);
-        p[4] = e->kind, p[5] = e->shape, p[6] = (uint8_t)e->flags, p[7] = (uint8_t)(e->flags >> 8);
-        rec_put32(p + 8, e->color);
+    if (p) put_lines(p, lines, count);
+    return st;
+}
+
+shr_status rec_shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t col, const shr_row *in,
+                                          shr_error_info *err) {
+    rec_calls *c = recorder();
+    shr_status st = shr_pl_lyr_tilemap_set_row(layer, row, col, in, err);
+    if (!c || !in || (in->cell_count && !in->cells) || (in->style_count && !in->styles) ||
+        (in->scalar_count && !in->scalars))
+        return st;
+    uint32_t id = obj_id(c, layer), nl = in->lines ? (uint32_t)in->line_count : UINT32_MAX;
+    uint32_t *ids = in->style_count ? malloc(in->style_count * sizeof(uint32_t)) : NULL;
+    if (in->style_count && !ids) fail(c, SHR_E_NO_MEMORY);
+    for (size_t i = 0; ids && i < in->style_count; i++) ids[i] = style_id(c, in->styles[i]);
+    uint8_t *p = call(c, C_ROW,
+                      (const uint32_t[]){id, (uint32_t)row, (uint32_t)col, (uint32_t)in->cell_count,
+                                         (uint32_t)in->style_count, (uint32_t)in->scalar_count, nl},
+                      7, 4 * (in->style_count + in->scalar_count) + 8 * in->cell_count + 12 * (size_t)(in->lines ? nl : 0));
+    for (size_t i = 0; p && i < in->style_count; i++, p += 4) rec_put32(p, ids ? ids[i] : 0);
+    for (size_t i = 0; p && i < in->cell_count; i++, p += 8) {
+        const shr_row_cell *e = &in->cells[i];
+        rec_put32(p, e->text);
+        p[4] = (uint8_t)e->style, p[5] = (uint8_t)(e->style >> 8), p[6] = e->span, p[7] = e->scalars;
     }
+    for (size_t i = 0; p && i < in->scalar_count; i++, p += 4) rec_put32(p, in->scalars[i]);
+    if (p && in->lines) put_lines(p, in->lines, nl);
+    free(ids);
     return st;
 }
 
@@ -451,6 +484,9 @@ typedef struct player {
     uint32_t nobjs, nstyles, cmds;
     shr_style_run *runs;
     shr_text_line *lines;
+    shr_row_cell *cells;
+    shr_text_style *row_styles;
+    uint32_t *scalars;
     pcall *run;
     uint32_t nrun, cap;
     int col;
@@ -558,6 +594,13 @@ static void exec(player *p, const pcall *c) {
     case C_CLEAR: shr_pl_lyr_tilemap_clear(obj(p, c->a), c->i[0], c->i[1], c->i[2], c->i[3], c->st); break;
     case C_SCROLL: shr_pl_lyr_tilemap_scroll(obj(p, c->a), c->i[0], c->i[1], c->i[2], c->st); break;
     case C_LINES: shr_pl_lyr_tilemap_set_lines(obj(p, c->a), c->i[0], p->lines, c->n, NULL); break;
+    case C_ROW: {
+        const shr_text_line *ls = c->i[5] < 0 ? NULL : p->lines ? p->lines : &(const shr_text_line){0}; /* none: empty */
+        shr_row in = {p->cells, (size_t)c->i[2], p->row_styles, (size_t)c->i[3], p->scalars, (size_t)c->i[4], ls,
+                      ls ? (size_t)c->i[5] : 0};
+        shr_pl_lyr_tilemap_set_row(obj(p, c->a), c->i[0], c->i[1], &in, NULL);
+        break;
+    }
     }
 }
 
@@ -604,6 +647,7 @@ static bool decode(player *p, unsigned type, const uint8_t *r, size_t n, rec_tim
         [C_IMG_RELEASE - C_CLOCK] = 1, [C_FONT_CREATE - C_CLOCK] = 5, [C_FONT_DESTROY - C_CLOCK] = 1,
         [C_FONT_PRELOAD - C_CLOCK] = 10, [C_RESIZE - C_CLOCK] = 6,   [C_TEXT - C_CLOCK] = 7,
         [C_CLEAR - C_CLOCK] = 6,       [C_SCROLL - C_CLOCK] = 5,     [C_LINES - C_CLOCK] = 3,
+        [C_ROW - C_CLOCK] = 7,
     };
     uint32_t v[10] = {0}, w = words[type - C_CLOCK];
     if (n < 4 * (size_t)w) return false;
@@ -665,6 +709,25 @@ static bool decode(player *p, unsigned type, const uint8_t *r, size_t n, rec_tim
         }
         c->i[0] = (int32_t)v[1], c->n = nl;
         flush(p, comp, api); /* the lines are shared */
+        break;
+    }
+    case C_ROW: {
+        uint32_t nc = v[3], nt = v[4], ns = v[5], nl = v[6] == UINT32_MAX ? 0 : v[6];
+        if (n < 28 + 4 * (size_t)nt + 8 * (size_t)nc + 4 * (size_t)ns + 12 * (size_t)nl) return false;
+        shr_row_cell *cs = nc ? realloc(p->cells, nc * sizeof(*cs)) : p->cells;
+        shr_text_style *ts = nt ? realloc(p->row_styles, nt * sizeof(*ts)) : p->row_styles;
+        uint32_t *sc = ns ? realloc(p->scalars, ns * sizeof(*sc)) : p->scalars;
+        shr_text_line *ls = nl ? realloc(p->lines, nl * sizeof(*ls)) : p->lines;
+        if ((nc && !cs) || (nt && !ts) || (ns && !sc) || (nl && !ls)) return false;
+        p->cells = cs, p->row_styles = ts, p->scalars = sc, p->lines = ls;
+        const uint8_t *q = r + 28;
+        for (uint32_t i = 0; i < nt; i++, q += 4) ts[i] = style(p, rec_get32(q));
+        for (uint32_t i = 0; i < nc; i++, q += 8) cs[i] = (shr_row_cell){rec_get32(q), get16(q + 4), q[6], q[7]};
+        for (uint32_t i = 0; i < ns; i++, q += 4) sc[i] = rec_get32(q);
+        for (uint32_t i = 0; i < nl; i++, q += 12)
+            ls[i] = (shr_text_line){get16(q), get16(q + 2), q[4], q[5], get16(q + 6), rec_get32(q + 8)};
+        c->i[2] = (int32_t)nc, c->i[3] = (int32_t)nt, c->i[4] = (int32_t)ns, c->i[5] = v[6] == UINT32_MAX ? -1 : (int32_t)nl;
+        flush(p, comp, api); /* the cells, styles, code points and lines are shared */
         break;
     }
     }
@@ -772,6 +835,7 @@ shr_status rec_calls_play(const uint8_t *rec, size_t len, const rec_calls_host *
     }
     if (verify) rec_frame(verify, hd.frames, p.clock);
     teardown(&p);
-    free(p.objs), free(p.types), free(p.styles), free(p.runs), free(p.lines);
+    free(p.objs), free(p.types), free(p.styles), free(p.runs), free(p.lines), free(p.cells), free(p.row_styles),
+        free(p.scalars);
     return st;
 }

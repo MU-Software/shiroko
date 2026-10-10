@@ -8,6 +8,7 @@
 
 #define SHR_MAX_TEXT_BYTES ((size_t)1 << 20)
 #define SHR_CLUSTER_SCALARS 16u /* buffer size; the generator keeps the profile's cluster limit at most 16 */
+#define SHR_CLUSTER_BYTES 64u   /* buffer size; the generator keeps the profile's byte limit at most 64 */
 #define SHR_MAX_SPAN 256u
 #define SHR_MAX_GRID (1 << 15)
 #define SHR_MAX_LAYOUT_COORD (1 << 20)

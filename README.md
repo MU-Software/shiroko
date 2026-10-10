@@ -143,6 +143,10 @@ committed regression inputs in `tests/fuzz/corpus/<target>`.
   but lines of a row: `shr_pl_lyr_tilemap_set_lines(layer, row, lines, count, err)` sets a row's `shr_text_line` list
   (columns, kind, shape single/double/curly/dotted/dashed, blink, colour), which scrolls with the row and is cut by
   clears; drivers draw each as one `SHR_CMD_LINE` over the glyphs.
+- `shr_pl_lyr_tilemap_set_row(layer, row, col, row_in, err)` takes a row at once as the VT engine holds it: cells by
+  code point (`shr_row_cell`: text, style index, span, code point count), one style array, the code points of longer
+  clusters and optionally the row's lines. It equals set_cell for each cell then set_lines, checks the whole row before
+  changing anything, and skips cells the grid already holds.
 - `shr_pl_lyr_tilemap_resize()` takes an optional background colour for cells without a bg of their own;
   `shr_pl_lyr_tilemap_measure()` lays text out into a caller array of `shr_text_cluster`.
 

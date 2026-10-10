@@ -478,11 +478,44 @@ static bool cell_same(const shr__tilemap *t, int32_t r, int32_t c, const char *u
     return same && (len <= 8 ? was == key : !memcmp(cell_text(old), utf8, len));
 }
 
-/* Places the cluster memo `m` holds. */
-static void cell_memo(shr__tilemap *t, int32_t r, int32_t c, const shr__memo *m, uint32_t span, shr_text_style s) {
-    shr__cell *e = place(t, r, c, span);
-    *e = head(s, m->glyph, m->len, span, m->has_glyph);
-    memcpy(e->text, &m->key, sizeof(m->key));
+/* A text of 1 to 8 bytes zero-padded into a word, without reads past its end: the first 4 bytes and the ones after them
+ * as words, and bytes 0, len / 2 and len - 1 of up to 3 (from 4 bytes on, ones the first word holds). */
+static uint64_t text_key(const char *utf8, size_t len) {
+    static const uint8_t none[4];
+    const uint8_t *u = (const uint8_t *)utf8;
+    size_t h = (len >> 1) & 3, l = (len - 1) & 3;
+    uint32_t lo, hi;
+    memcpy(&lo, len >= 4 ? u : none, 4), memcpy(&hi, len > 4 ? u + len - 4 : none, 4);
+    lo |= u[0] | (uint32_t)u[h] << 8 * h | (uint32_t)u[l] << 8 * l;
+    hi >>= 8 * (8 - len) & 31;
+    return lo | (uint64_t)hi << 32;
+}
+
+/* The head a valid cluster within the cell limits makes at (r, c), from the memo when it holds the text; an empty
+ * cell when the grid holds it already. */
+static shr_status cell_for(shr__tilemap *t, int32_t r, int32_t c, const char *utf8, size_t len, uint32_t span,
+                           shr_text_style s, shr__cell *out) {
+    uint64_t key = len && len <= 8 ? text_key(utf8, len) : 0;
+    if (cell_same(t, r, c, utf8, len, key, span, s)) return *out = (shr__cell){0}, SHR_OK;
+    shr__memo *m = len && len <= 8 ? memo_slot(t, key) : NULL;
+    if (m && m->len == len && m->key == key) {
+        *out = head(s, m->glyph, len, span, m->has_glyph);
+        memcpy(out->text, &key, sizeof(key));
+        return SHR_OK;
+    }
+    uint32_t cps[SHR_CLUSTER_SCALARS];
+    size_t n;
+    shr__cluster_class cls;
+    shr_status st = cluster_decode(utf8, len, cps, &n, &cls);
+    if (st == SHR_OK) st = cell_make(t, utf8, len, span, s, cps, n, &cls, out);
+    if (st == SHR_OK && m) *m = (shr__memo){key, out->glyph, (uint8_t)len, out->has_glyph};
+    return st;
+}
+
+static void cell_put(shr__tilemap *t, int32_t r, int32_t c, const shr__cell *e) {
+    if (e->kind != CELL_HEAD) return;
+    t->long_text |= e->len > CELL_INLINE;
+    *place(t, r, c, e->span) = *e;
 }
 
 shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col, const char *utf8, size_t length,
@@ -494,36 +527,16 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
     if ((st = shr__style_check(&style, NULL, 0)) != SHR_OK) return st;
     if (length > SHR_MAX_TEXT_BYTES || span > SHR_MAX_SPAN) return SHR_E_LIMIT;
     if (row < 0 || row >= t->rows || col < 0 || (int64_t)col + span > t->cols) return SHR_E_INVALID_ARG;
-    uint32_t cps[SHR_CLUSTER_SCALARS];
-    size_t n;
-    shr__cluster_class cls;
     if (length > shr__cluster_max_bytes) { /* past the scalar limit too: the cell keeps U+FFFD */
+        uint32_t cps[SHR_CLUSTER_SCALARS];
+        size_t n;
+        shr__cluster_class cls;
         if ((st = cluster_decode(utf8, length, cps, &n, &cls)) != SHR_OK) return st;
         utf8 = SHR_REPLACEMENT_UTF8, length = 3;
     }
-    uint64_t key = 0;
-    shr__memo *m = NULL;
-    if (length && length <= 8) {
-        /* The text zero-padded in 32-bit halves, without reads past the end: the first 4 bytes and the ones after them
-         * as words, and bytes 0, length / 2 and length - 1 of up to 3 (from 4 bytes on, ones the first word holds). */
-        static const uint8_t none[4];
-        const uint8_t *u = (const uint8_t *)utf8;
-        size_t h = (length >> 1) & 3, l = (length - 1) & 3;
-        uint32_t lo, hi;
-        memcpy(&lo, length >= 4 ? u : none, 4), memcpy(&hi, length > 4 ? u + length - 4 : none, 4);
-        lo |= u[0] | (uint32_t)u[h] << 8 * h | (uint32_t)u[l] << 8 * l;
-        hi >>= 8 * (8 - length) & 31;
-        key = lo | (uint64_t)hi << 32;
-        m = memo_slot(t, key);
-    }
-    if (cell_same(t, row, col, utf8, length, key, span, style)) return SHR_OK;
-    if (m && m->len == length && m->key == key) return cell_memo(t, row, col, m, span, style), SHR_OK;
     shr__cell e;
-    if ((st = cluster_decode(utf8, length, cps, &n, &cls)) != SHR_OK) return st;
-    if ((st = cell_make(t, utf8, length, span, style, cps, n, &cls, &e)) != SHR_OK) return st;
-    if (m) *m = (shr__memo){key, e.glyph, (uint8_t)length, e.has_glyph};
-    t->long_text |= length > CELL_INLINE;
-    *place(t, row, col, span) = e;
+    if ((st = cell_for(t, row, col, utf8, length, span, style, &e)) != SHR_OK) return st;
+    cell_put(t, row, col, &e);
     return SHR_OK;
 }
 
@@ -558,6 +571,102 @@ shr_status shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_t
     if ((st = lines_check(t, lines, count, err)) != SHR_OK) return st;
     if (!lines_room(t, row_lines(t, row), count)) return shr__fail(err, SHR_E_NO_MEMORY, 0, SIZE_MAX, "no memory");
     lines_set(t, row, lines, count);
+    return SHR_OK;
+}
+
+/* The UTF-8 of a code point in the low bytes of a word, and its length. */
+static size_t cp_utf8(uint32_t cp, uint64_t *w) {
+    if (cp < 0x80) return *w = cp, 1;
+    if (cp < 0x800) return *w = (0xC0 | cp >> 6) | (0x80 | (cp & 63)) << 8, 2;
+    if (cp < 0x10000) return *w = (0xE0 | cp >> 12) | (0x80 | (cp >> 6 & 63)) << 8 | (0x80 | (cp & 63)) << 16, 3;
+    *w = (0xF0 | cp >> 18) | (0x80 | (cp >> 12 & 63)) << 8 | (0x80 | (cp >> 6 & 63)) << 16 |
+         (uint64_t)(0x80 | (cp & 63)) << 24;
+    return 4;
+}
+
+static shr_status cp_check(uint32_t cp) {
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return SHR_E_INVALID_UTF8;
+    return shr__is_control(cp) ? SHR_E_CONTROL_CHAR : SHR_OK;
+}
+
+/* A cell of several code points made into `placed` as set_cell makes their UTF-8 (making may fail: the font's cluster
+ * table, long text). */
+static shr_status row_cluster(shr__tilemap *t, int32_t r, int32_t c, const shr_row *in, const shr_row_cell *e) {
+    if (e->text > in->scalar_count || e->scalars > in->scalar_count - e->text) return SHR_E_INVALID_ARG;
+    char u[SHR_CLUSTER_BYTES];
+    size_t len = 0;
+    for (size_t k = 0; k < e->scalars; k++) {
+        uint32_t cp = in->scalars[e->text + k];
+        uint64_t w;
+        shr_status st = cp_check(cp);
+        if (st != SHR_OK) return st;
+        size_t l = cp_utf8(cp, &w);
+        if (len + l <= shr__cluster_max_bytes) memcpy(u + len, &w, l);
+        len += l;
+    }
+    if (len > shr__cluster_max_bytes) memcpy(u, SHR_REPLACEMENT_UTF8, 3), len = 3; /* as set_cell keeps it */
+    shr__placed *d = shr__vec_push(&t->placed, &t->al);
+    if (!d) return SHR_E_NO_MEMORY;
+    d->row = r, d->col = c;
+    shr_status st = cell_for(t, r, c, u, len, e->span, in->styles[e->style], &d->cell);
+    if (st != SHR_OK) t->placed.len--;
+    return st;
+}
+
+shr_status shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t col, const shr_row *in,
+                                      shr_error_info *err) {
+    shr__err_clear(err);
+    shr__tilemap *t;
+    shr_status st = tilemap_get(layer, &t);
+    if (st != SHR_OK) return shr__fail(err, st, SIZE_MAX, SIZE_MAX, "not a tilemap layer or context busy");
+    if (!in || (in->cell_count && !in->cells) || (in->style_count && !in->styles) || (in->scalar_count && !in->scalars))
+        return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "missing array");
+    if (row < 0 || row >= t->rows || col < 0 || col > t->cols)
+        return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "position outside the grid");
+    for (size_t s = 0; s < in->style_count; s++)
+        if ((st = shr__style_check(&in->styles[s], err, s)) != SHR_OK) return st;
+    if (in->lines && (st = lines_check(t, in->lines, in->line_count, err)) != SHR_OK) return st;
+    if (in->lines && !lines_room(t, row_lines(t, row), in->line_count))
+        return shr__fail(err, SHR_E_NO_MEMORY, SIZE_MAX, SIZE_MAX, "no memory");
+    /* Cells of several code points are made first; the others take their glyph from the memo or the font without
+     * allocating, so nothing after this loop fails. */
+    t->placed.len = 0;
+    int64_t c = col;
+    size_t i = 0;
+    for (; i < in->cell_count; i++) {
+        const shr_row_cell *e = &in->cells[i];
+        c += e->span;
+        if (!e->span || e->style >= in->style_count || c > t->cols)
+            st = SHR_E_INVALID_ARG;
+        else if (e->scalars == 1)
+            st = cp_check(e->text);
+        else if (e->scalars > 1)
+            st = row_cluster(t, row, (int32_t)(c - e->span), in, e);
+        if (st != SHR_OK) break;
+    }
+    if (st != SHR_OK) {
+        for (size_t k = 0; k < t->placed.len; k++) cell_free(&t->al, &SHR_VEC_AT(&t->placed, shr__placed, k)->cell);
+        t->placed.len = 0;
+        return shr__fail(err, st, SIZE_MAX, i, "invalid cell");
+    }
+    size_t made = 0;
+    c = col;
+    for (i = 0; i < in->cell_count; i++) {
+        const shr_row_cell *e = &in->cells[i];
+        int32_t at = (int32_t)c;
+        c += e->span;
+        shr__cell m;
+        if (e->scalars > 1) {
+            m = SHR_VEC_AT(&t->placed, shr__placed, made++)->cell;
+        } else {
+            uint64_t w = 0;
+            size_t len = e->scalars ? cp_utf8(e->text, &w) : 0;
+            cell_for(t, row, at, (const char *)&w, len, e->span, in->styles[e->style], &m);
+        }
+        cell_put(t, row, at, &m);
+    }
+    t->placed.len = 0;
+    if (in->lines) lines_set(t, row, in->lines, in->line_count);
     return SHR_OK;
 }
 

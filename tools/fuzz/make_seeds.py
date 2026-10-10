@@ -50,6 +50,12 @@ def lines(row, *ls):
         i8(col, cols) + bytes([kind | shape << 2, c]) for col, cols, kind, shape, c in ls)
 
 
+def row(r, c, cells, styles=((0, 200), (0x80, 0x11)), wide=0, ls=()):
+    """cells: (a, b) as fuzz_tilemap reads them; ls: raw (col, cols, kind | shape << 2 | flags << 5, colour byte)."""
+    return bytes([0xD0 | (1 if ls else 0)]) + i8(r, c) + bytes([*styles[0], *styles[1], len(cells), wide]) + b"".join(
+        bytes(e) for e in cells) + bytes([len(ls)]) + b"".join(bytes(e) for e in ls)
+
+
 def measure(s, cols, wrap=True):
     return bytes([4]) + i8(cols) + bytes([1 if wrap else 0]) + u16(len(s)) + s
 
@@ -189,6 +195,13 @@ R_RENDER = bytes([3])
 
 SEEDS = {
     "fuzz_tilemap": [
+        # rows by code point over set_cell's cells: ASCII, wide, empty, clusters of 2-3 and of 17-64 code points
+        # (past 64 bytes with 4-byte ones), lines with the last row, then the same row again (unchanged) and a bad one
+        bytes([2]) + resize(3, 8) + b"".join(cell(0, c, b"D", flags=0x80, color=0x11) for c in range(8)) + RENDER
+        + row(0, 0, [(0x01, 0x08), (0x80, 0x0C), (0x10, 0x11), (0x05, 0x08), (0x30, 0x38), (0, 0x01)], wide=0xF0,
+              ls=[(0, 7, 0 | 2 << 2, 0x10)]) + RENDER
+        + row(0, 0, [(0x01, 0x08), (0x80, 0x0C), (0x10, 0x11), (0x05, 0x08), (0x30, 0x38), (0, 0x01)], wide=0xF0)
+        + row(1, 1, [(0x2F, 0x18), (0x2F, 0x1C)], wide=0xFF) + RENDER + row(2, 0, [(0x41, 0x08), (0xFF, 0x08)]) + RENDER,
         # kept opaque rows whose inputs change one at a time (catches stale keeps)
         bytes([0x51]) + bytes([3 | 16, 1, 8]) + cell(0, 1, b"A", flags=0x80, color=0x11) + RENDER
         + cell(0, 1, b"A", flags=0x80, color=0x12) + RENDER + cell(0, 1, b"A", flags=0x80, color=0x22) + RENDER

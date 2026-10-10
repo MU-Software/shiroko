@@ -39,8 +39,8 @@ def load_lock():
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
     if lock.get("format") != 1:
         sys.exit(f"{LOCK}: unsupported format {lock.get('format')}")
-    if lock["cluster_max_bytes"] < 4 * lock["cluster_max_scalars"]:
-        sys.exit("cluster_max_bytes must be at least 4 × cluster_max_scalars")
+    if not 4 * lock["cluster_max_scalars"] <= lock["cluster_max_bytes"] <= 64:
+        sys.exit("cluster_max_bytes must be 4 × cluster_max_scalars..64 (runtime buffers)")
     if not 2 <= lock["cluster_max_scalars"] <= 16 or not 1 <= lock["tab_stop"] <= 64:
         sys.exit("cluster_max_scalars must be 2..16 (runtime key buffers) and tab_stop 1..64")
     return lock

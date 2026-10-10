@@ -1545,6 +1545,9 @@ static shr_status oom_op(int op, shr_lyr *l, shr_pl_res_bitmap_font *font) {
                                     {0, 7, SHR_LINE_OVER, SHR_LINE_SINGLE, 0, RED},
                                     {1, 6, SHR_LINE_STRIKE, SHR_LINE_DOTTED, 0, RED},
                                     {0, 6, SHR_LINE_UNDER, SHR_LINE_DASHED, 0, RED}};
+    static const uint32_t man_woman_girl[] = {0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467};
+    const shr_row_cell cells[3] = {{'q', 0, 1, 1}, {0, 0, 2, 5}, {0, 0, 2, 0}};
+    const shr_row row = {cells, 3, &rich, 1, man_woman_girl, 5, lines, 3};
     switch (op) {
     case 0: return shr_pl_lyr_tilemap_resize(l, font, 3, 7, NULL);
     case 1: return shr_pl_lyr_tilemap_set_lines(l, 2, lines, 4, NULL);
@@ -1553,6 +1556,7 @@ static shr_status oom_op(int op, shr_lyr *l, shr_pl_res_bitmap_font *font) {
     case 4: return shr_pl_lyr_tilemap_set_text(l, 0, 1, text, sizeof(text) - 1, rich, &run, 1, SHR_TEXT_WRAP, NULL);
     case 5: return shr_pl_lyr_tilemap_scroll(l, 0, 3, 1, rich); /* builds the changed rows first */
     case 6: return shr_pl_lyr_tilemap_set_lines(l, 0, lines + 1, 3, NULL);
+    case 7: return shr_pl_lyr_tilemap_set_row(l, 2, 0, &row, NULL); /* a cluster on the heap, then lines */
     default: return shr_pl_lyr_tilemap_resize(l, font, 2, 6, &bg);
     }
 }
@@ -1704,11 +1708,157 @@ TEST rows_take_memory_of_their_class(void) {
     PASS();
 }
 
+/* The cells of a row by code point, as set_row takes them: `text` holds one cluster per cell. */
+static shr_row row_of(const char *const *text, const uint32_t *span, size_t n, const shr_text_style *styles,
+                      const uint16_t *style, shr_row_cell *cells, uint32_t *scalars) {
+    size_t sc = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t pos = 0, len = strlen(text[i]), first = sc;
+        uint32_t cp = 0;
+        while (pos < len) shr__utf8_next((const uint8_t *)text[i], len, &pos, &cp), scalars[sc++] = cp;
+        size_t k = sc - first;
+        cells[i] = (shr_row_cell){k == 1 ? cp : (uint32_t)first, style[i], (uint8_t)span[i],
+                                  (uint8_t)(k < 255 ? k : 255)};
+        if (k == 1) sc = first;
+    }
+    return (shr_row){cells, n, styles, 2, scalars, sc, NULL, 0};
+}
+
+TEST set_row_equals_set_cell_and_errors_change_nothing(void) {
+    shr_lyr *a = open_grid(2, 12, NULL), *b = new_layer();
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(b, H.font, 2, 12, NULL), SHR_OK);
+    const char *const text[] = {"a", "\xEA\xB0\x80", "", "e\xCC\x81",
+                                "e\xCC\x81\xCC\x81\xCC\x81\xCC\x81" /* beyond 8 bytes */, "\xF0\x9F\x98\x80"};
+    const uint32_t span[] = {1, 2, 1, 1, 1, 2};
+    const uint16_t style[] = {0, 1, 1, 0, 0, 0};
+    const shr_text_style styles[] = {plain, on_blue};
+    for (size_t i = 0, c = 0; i < 6; c += span[i++])
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(a, 0, (int32_t)c, text[i], strlen(text[i]), span[i], styles[style[i]]),
+                     SHR_OK);
+    shr_row_cell cells[6];
+    uint32_t sc[16];
+    shr_row in = row_of(text, span, 6, styles, style, cells, sc);
+    shr_error_info err;
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in, &err), SHR_OK);
+    assert_same_rows(a, b);
+    ASSERT_STR_EQ(row_text(b, 0), "a*-.***-");
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in, NULL), SHR_OK); /* unchanged: the row stays as built */
+    const shr__rcmd *p = group_of(b, 0)->rows;
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in, NULL), SHR_OK);
+    ASSERT(group_of(b, 0)->rows == p);
+    /* Errors: the first bad cell's index, nothing changes. */
+    shr_row_cell bad[] = {{'x', 0, 1, 1}, {'y', 0, 1, 1}, {0xD800, 0, 1, 1}};
+    shr_row in2 = {bad, 3, styles, 2, sc, in.scalar_count, NULL, 0};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 1, &in2, &err), SHR_E_INVALID_UTF8);
+    ASSERT_EQ_LL(err.item_index, 2);
+    bad[2] = (shr_row_cell){0x1B, 0, 1, 1};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 1, &in2, &err), SHR_E_CONTROL_CHAR);
+    bad[2] = (shr_row_cell){'z', 2, 1, 1};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 1, &in2, &err), SHR_E_INVALID_ARG);
+    bad[2] = (shr_row_cell){0, 0, 1, 2}; /* code points past the array */
+    in2.scalar_count = 1;
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 1, &in2, &err), SHR_E_INVALID_ARG);
+    bad[2] = (shr_row_cell){'z', 0, 10, 1}; /* past the last column */
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 1, &in2, &err), SHR_E_INVALID_ARG);
+    bad[2] = (shr_row_cell){'z', 0, 0, 1};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 1, &in2, &err), SHR_E_INVALID_ARG);
+    bad[1] = (shr_row_cell){0, 0, 2, 5}; /* made before a later cell fails */
+    in2.scalar_count = in.scalar_count;
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 1, &in2, &err), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(err.item_index, 2);
+    const shr_text_style odd[] = {plain, {WHITE, 0x40000000u, 0}};
+    shr_row in3 = {bad, 2, odd, 2, NULL, 0, NULL, 0};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 1, &in3, &err), SHR_E_UNKNOWN_STYLE);
+    ASSERT_EQ_LL(err.item_index, 1);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 2, 0, &in3, &err), SHR_E_INVALID_ARG);
+    assert_same_rows(a, b);
+    ASSERT_EQ_LL(shr_lyr_destroy(b), SHR_OK);
+    close_grid(a);
+    PASS();
+}
+
+TEST set_row_places_cells_and_lines(void) {
+    shr_lyr *l = open_grid(2, 8, NULL);
+    shr_error_info err;
+    const shr_text_style styles[2] = {plain, on_blue};
+    const shr_row_cell cells[3] = {{'a', 0, 1, 1}, {0xAC00, 1, 2, 1}, {0, 1, 1, 0}};
+    const shr_text_line lines[1] = {{0, 4, SHR_LINE_UNDER, SHR_LINE_CURLY, 0, RED}};
+    shr_row row = {cells, 3, styles, 2, NULL, 0, lines, 1};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(l, 1, 2, &row, &err), SHR_OK);
+    ASSERT_STR_EQ(row_text(l, 1), "..a*-...");
+    ASSERT_EQ_LL(count_kind(l, 1, SHR__LCMD_LINE), 1);
+    row.lines = NULL; /* keeps them */
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(l, 1, 0, &row, &err), SHR_OK);
+    ASSERT_EQ_LL(count_kind(l, 1, SHR__LCMD_LINE), 1);
+    const shr_text_line bad = {0, 1, SHR_LINE_UNDER, SHR_LINE_SINGLE, 0, 0x40FF0000u};
+    row.lines = &bad;
+    const shr__rcmd *p = group_of(l, 1)->rows;
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(l, 1, 4, &row, &err), SHR_E_UNKNOWN_STYLE);
+    ASSERT_EQ_LL(err.item_index, 0);
+    ASSERT(group_of(l, 1)->rows == p);
+    row.lines = lines, row.line_count = 0; /* none */
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(l, 1, 0, &row, &err), SHR_OK);
+    ASSERT_EQ_LL(count_kind(l, 1, SHR__LCMD_LINE), 0);
+    close_grid(l);
+    PASS();
+}
+
+/* Clusters past the profile limits through set_row: the same cells as set_cell makes, before and after a font switch. */
+TEST set_row_long_clusters_equal_set_cell(void) {
+    static const struct {
+        const char *base, *mark;
+        int marks;
+    } cases[] = {
+        {"e", "\xCC\x81", 16},                        {"a", "\xE2\x83\x97", 21}, {"e", "\xCC\x81", 32},
+        {"a", "\xE2\x83\x97", 33},                   {"e", "\xCC\x81", 64},
+        {"\xF0\x9D\x90\x80", "\xF0\x9D\x85\xA7", 16}, {"\xF0\x9D\x90\x80", "\xF0\x9D\x85\xA7", 64},
+    };
+    enum { N = sizeof(cases) / sizeof(cases[0]) };
+    const shr_text_style on_red = {WHITE, RED, 0}, styles[2] = {on_red, on_blue};
+    shr_lyr *a = open_grid(2, 2 * N, NULL), *b = new_layer();
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(b, H.font, 2, 2 * N, NULL), SHR_OK);
+    static char buf[N][261];
+    const char *text[N];
+    uint32_t span[N];
+    uint16_t style[N];
+    for (size_t i = 0; i < N; i++) {
+        buf[i][long_cluster(buf[i], cases[i].base, cases[i].mark, cases[i].marks)] = 0;
+        text[i] = buf[i], span[i] = 1 + i % 2, style[i] = 1;
+    }
+    for (int pass = 0; pass < 2; pass++) /* over 'D' on red, then unchanged */
+        for (size_t i = 0, c = 0; i < N; c += span[i++]) {
+            if (!pass) ASSERT_EQ_LL(set_cell(a, 0, (int32_t)c, "D", span[i], on_red), SHR_OK);
+            if (!pass) ASSERT_EQ_LL(set_cell(b, 0, (int32_t)c, "D", span[i], on_red), SHR_OK);
+            ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(a, 0, (int32_t)c, text[i], strlen(text[i]), span[i], on_blue), SHR_OK);
+        }
+    shr_row_cell cells[N];
+    uint32_t sc[N * 65];
+    shr_row in = row_of(text, span, N, styles, style, cells, sc);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in, NULL), SHR_OK);
+    assert_same_rows(a, b);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in, NULL), SHR_OK);
+    assert_same_rows(a, b);
+    shr_pl_res_bitmap_font_desc fd;
+    shr_pl_res_bitmap_font_desc_init(&fd);
+    fd.open = font_dir_open;
+    shr_pl_res_bitmap_font *f2;
+    ASSERT_EQ_LL(shr_pl_res_bitmap_font_create(H.ctx, &fd, &f2), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(a, f2, 2, 2 * N, NULL), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(b, f2, 2, 2 * N, NULL), SHR_OK);
+    assert_same_rows(a, b);
+    for (size_t i = 0, c = 0; i < N; c += span[i++]) ASSERT_EQ_LL(glyph_at(b, 0, (int32_t)c, NULL), 0xFFFD);
+    ASSERT_EQ_LL(shr_lyr_destroy(b), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_res_bitmap_font_destroy(H.font), SHR_OK);
+    H.font = f2;
+    close_grid(a);
+    PASS();
+}
+
 /* Each operation, then the row rebuild at submit, fails at every allocation in turn: it reports
  * SHR_E_NO_MEMORY, repeating a failed operation succeeds and the rows end up as without failures (rows that failed
  * to rebuild stay dirty for the next submit). */
 TEST out_of_memory_is_recoverable(void) {
-    for (int op = 0; op < 8; op++) {
+    for (int op = 0; op < 9; op++) {
         shr_status st = SHR_E_NO_MEMORY;
         for (long budget = 0; st == SHR_E_NO_MEMORY; budget++) {
             g_fa = (fail_alloc){-1, 0};
@@ -1798,6 +1948,9 @@ int main(int argc, char **argv) {
     RUN_TEST(set_text_reuses_its_memory);
     RUN_TEST(rebuilt_rows_reuse_their_memory);
     RUN_TEST(rows_take_memory_of_their_class);
+    RUN_TEST(set_row_equals_set_cell_and_errors_change_nothing);
+    RUN_TEST(set_row_places_cells_and_lines);
+    RUN_TEST(set_row_long_clusters_equal_set_cell);
     RUN_TEST(out_of_memory_is_recoverable);
     GREATEST_MAIN_END();
 }

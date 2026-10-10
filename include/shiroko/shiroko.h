@@ -397,6 +397,30 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
  * flag or a colour alpha other than 0, 128 and 255 (err->item_index: the line). On error nothing changes. */
 shr_status shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_text_line *lines, size_t count,
                                         shr_error_info *err);
+
+/* A cluster of a row as the VT engine placed it, by code point. */
+typedef struct shr_row_cell {
+    uint32_t text;   /* scalars 1: the code point; more: the index of its first code point in shr_row.scalars */
+    uint16_t style;  /* index into shr_row.styles */
+    uint8_t span;    /* cells it occupies, at least 1 */
+    uint8_t scalars; /* code points of the cluster (a longer one may pass its first 255); 0: no text */
+} shr_row_cell;
+
+typedef struct shr_row {
+    const shr_row_cell *cells; /* placed left to right, each `span` cells after the one before */
+    size_t cell_count;
+    const shr_text_style *styles;
+    size_t style_count;
+    const uint32_t *scalars; /* the code points of clusters of more than one */
+    size_t scalar_count;
+    const shr_text_line *lines; /* NULL: the row keeps its lines; else they replace them as set_lines() does */
+    size_t line_count;
+} shr_row;
+
+/* As shr_pl_lyr_tilemap_set_cell() for each cell in turn from (row, col), then set_lines() when `lines` is set; cells
+ * that equal what the grid holds are left as they are. The whole row is validated first: on error nothing changes and
+ * err->item_index is the cell's index (the style's for a bad style, the line's for a bad line). */
+shr_status shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t col, const shr_row *in, shr_error_info *err);
 /* Text laid out by the renderer from (row, col) as shr_pl_lyr_tilemap_measure() lays it out in
  * `cols - col` columns: Unicode clusters and widths, LF/CR/CRLF, TAB stops counted from `col` and,
  * with SHR_TEXT_WRAP, wrapping at the last column; lines continue at column `col`. Only what lies in
