@@ -359,6 +359,15 @@ TEST coordinates_stop_at_the_limit(void) {
 
 static harness H;
 
+static fail_alloc g_fa;
+static shr_allocator g_al;
+
+static void use_fail_alloc(shr_context_desc *d, shr_framebuffer_driver *drv) {
+    (void)drv;
+    g_al = fail_allocator(&g_fa);
+    d->allocator = &g_al;
+}
+
 static shr_lyr *new_layer(void) {
     shr_lyr *l = NULL;
     ASSERT_EQ_LL(shr_lyr_create(H.ctx, 0, (shr_rect){0, 0, HW, HH}, &l), SHR_OK);
@@ -659,7 +668,7 @@ TEST long_clusters_draw_a_replacement(void) {
         {"a", "\xE2\x83\x97", 33},                     /* 34 scalars, 100 bytes */
         {"e", "\xCC\x81", 64},                         /* 65 scalars, 129 bytes */
         {"\xF0\x9D\x90\x80", "\xF0\x9D\x85\xA7", 16},  /* 17 scalars, 68 bytes */
-        {"\xF0\x9D\x90\x80", "\xF0\x9D\x85\xA7", 64},  /* 65 scalars, 260 bytes: Ghostty's longest */
+        {"\xF0\x9D\x90\x80", "\xF0\x9D\x85\xA7", 64},  /* 65 scalars, 260 bytes */
     };
     const shr_text_style on_red = {WHITE, RED, 0};
     shr_lyr *l = open_grid(2, 8, NULL);
@@ -1091,15 +1100,18 @@ TEST lines_take_the_bands_of_their_shapes(void) {
 }
 
 TEST set_lines_validates_and_keeps_equal_lists(void) {
-    shr_lyr *l = open_grid(2, 8, NULL), *other = new_layer();
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(2, 8, use_fail_alloc), *other = new_layer();
     shr_error_info err;
     const shr_text_line ok[2] = {{0, 8, SHR_LINE_UNDER, SHR_LINE_CURLY, 0, RED},
                                  {3, 2, SHR_LINE_OVER, SHR_LINE_DASHED, SHR_TEXT_LINE_BLINK, HALF(BLUE)}};
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 1, ok, 2, &err), SHR_OK);
     ASSERT_EQ_LL(ncmds(l, 1), 2);
     const shr__rcmd *p = group_of(l, 1)->rows;
+    g_fa.budget = 0; /* rebuilding a row built once takes new memory */
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 1, ok, 2, NULL), SHR_OK);
-    ASSERT(group_of(l, 1)->rows == p); /* equal: the row stays clean */
+    ASSERT_EQ_LL(l->flush(l->state), SHR_OK); /* equal: the row stays clean */
+    g_fa.budget = -1;
     const struct {
         shr_text_line e;
         shr_status want;
@@ -1183,6 +1195,30 @@ TEST lines_move_with_rows_and_clears_cut_them(void) {
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_scroll(l, 0, 2, 1, plain), SHR_OK);
     ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_LINE), 1);
     ASSERT(group_of(l, 1) == NULL); /* uncovered: no lines */
+    close_grid(l);
+    PASS();
+}
+
+/* A clear widened to the wide cells reaching into it cuts the lines over those cells too. */
+TEST clears_cut_lines_over_the_wide_cells_they_reach(void) {
+    shr_lyr *l = open_grid(2, 8, NULL);
+    const shr_text_line full = {0, 8, SHR_LINE_UNDER, SHR_LINE_SINGLE, 0, RED};
+    ASSERT_EQ_LL(set_cell(l, 0, 2, "\xEA\xB0\x80", 2, plain), SHR_OK);
+    ASSERT_EQ_LL(set_cell(l, 1, 5, "\xEA\xB0\x80", 2, plain), SHR_OK);
+    for (int32_t r = 0; r < 2; r++) ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, r, &full, 1, NULL), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, 0, 3, 1, 1, plain), SHR_OK); /* the tail */
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_clear(l, 1, 5, 1, 1, plain), SHR_OK); /* the head */
+    static const int32_t want[2][4] = {{0, 2, 4, 8}, {0, 5, 7, 8}};
+    for (int32_t r = 0; r < 2; r++) {
+        ASSERT_STR_EQ(row_text(l, r), "........");
+        ASSERT_EQ_LL(count_kind(l, r, SHR__LCMD_LINE), 2);
+        int32_t got[4], k = 0;
+        for (size_t i = 0; i < ncmds(l, r); i++) {
+            const shr__lcmd *c = cmd(l, r, i);
+            if (c->kind == SHR__LCMD_LINE) got[k] = c->dst.x0 / CW, got[k + 1] = c->dst.x1 / CW, k += 2;
+        }
+        ASSERT_EQ_LL(memcmp(got, want[r], sizeof(got)), 0);
+    }
     close_grid(l);
     PASS();
 }
@@ -1325,18 +1361,21 @@ TEST only_changed_rows_are_rebuilt(void) {
 }
 
 TEST unchanged_cells_leave_their_row_clean(void) {
-    shr_lyr *l = open_grid(1, 8, NULL);
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(1, 8, use_fail_alloc);
     ASSERT_EQ_LL(set_cell(l, 0, 0, "a", 1, plain), SHR_OK);
     ASSERT_EQ_LL(set_cell(l, 0, 2, "\xEA\xB0\x80", 2, on_blue), SHR_OK);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, 4, NULL, 0, 1, plain), SHR_OK);
     const char *marks = "e\xCC\x81\xCC\x81\xCC\x81\xCC\x81"; /* beyond 8 bytes */
     ASSERT_EQ_LL(set_cell(l, 0, 7, marks, 1, plain), SHR_OK);
     const shr__rcmd *p = group_of(l, 0)->rows;
+    g_fa.budget = 0; /* rebuilding a row built once takes new memory */
     ASSERT_EQ_LL(set_cell(l, 0, 0, "a", 1, plain), SHR_OK);
     ASSERT_EQ_LL(set_cell(l, 0, 2, "\xEA\xB0\x80", 2, on_blue), SHR_OK);
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(l, 0, 4, NULL, 0, 1, plain), SHR_OK);
     ASSERT_EQ_LL(set_cell(l, 0, 7, marks, 1, plain), SHR_OK);
-    ASSERT(group_of(l, 0)->rows == p);
+    ASSERT_EQ_LL(l->flush(l->state), SHR_OK);
+    g_fa.budget = -1;
     const struct {
         int32_t col;
         const char *s;
@@ -1526,15 +1565,6 @@ TEST calls_are_refused_while_shutting_down(void) {
     ASSERT_EQ_LL(scroll(l, 0, 1, 1, plain), SHR_E_STATE);
     close_grid(l);
     PASS();
-}
-
-static fail_alloc g_fa;
-static shr_allocator g_al;
-
-static void use_fail_alloc(shr_context_desc *d, shr_framebuffer_driver *drv) {
-    (void)drv;
-    g_al = fail_allocator(&g_fa);
-    d->allocator = &g_al;
 }
 
 static shr_status oom_op(int op, shr_lyr *l, shr_pl_res_bitmap_font *font) {
@@ -1728,7 +1758,8 @@ static shr_row row_of(const char *const *text, const uint32_t *span, size_t n, c
 }
 
 TEST set_row_equals_set_cell_and_errors_change_nothing(void) {
-    shr_lyr *a = open_grid(2, 12, NULL), *b = new_layer();
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *a = open_grid(2, 12, use_fail_alloc), *b = new_layer();
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(b, H.font, 2, 12, NULL), SHR_OK);
     const char *const text[] = {"a", "\xEA\xB0\x80", "", "e\xCC\x81",
                                 "e\xCC\x81\xCC\x81\xCC\x81\xCC\x81" /* beyond 8 bytes */, "\xF0\x9F\x98\x80"};
@@ -1745,10 +1776,11 @@ TEST set_row_equals_set_cell_and_errors_change_nothing(void) {
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in, &err), SHR_OK);
     assert_same_rows(a, b);
     ASSERT_STR_EQ(row_text(b, 0), "a*-.***-");
+    g_fa.budget = 0; /* rebuilding a row built once takes new memory */
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in, NULL), SHR_OK); /* unchanged: the row stays as built */
-    const shr__rcmd *p = group_of(b, 0)->rows;
     ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 0, &in, NULL), SHR_OK);
-    ASSERT(group_of(b, 0)->rows == p);
+    ASSERT_EQ_LL(b->flush(b->state), SHR_OK);
+    g_fa.budget = -1;
     /* Errors: the first bad cell's index, nothing changes. */
     shr_row_cell bad[] = {{'x', 0, 1, 1}, {'y', 0, 1, 1}, {0xD800, 0, 1, 1}};
     shr_row in2 = {bad, 3, styles, 2, sc, in.scalar_count, NULL, 0};
@@ -1855,6 +1887,49 @@ TEST set_row_long_clusters_equal_set_cell(void) {
     ASSERT_EQ_LL(shr_pl_res_bitmap_font_destroy(H.font), SHR_OK);
     H.font = f2;
     close_grid(a);
+    PASS();
+}
+
+/* A cluster past the profile limits whose first scalars take no cell (here U+FE0F only): set_cell and set_row draw
+ * nothing, as for empty text, up to max_cell_bytes and U+FFFD past it; set_text places nothing and measure reports it
+ * zero-width either way. */
+TEST unseen_clusters_past_the_limits(void) {
+    const shr_text_style on_red = {WHITE, RED, 0};
+    shr_lyr *ref = open_grid(2, 8, NULL), *a = new_layer(), *b = new_layer();
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(a, H.font, 2, 8, NULL), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_resize(b, H.font, 2, 8, NULL), SHR_OK);
+    shr_lyr *const all[3] = {ref, a, b};
+    char s[3 * 22];
+    uint32_t sc[22];
+    for (int i = 0; i < 22; i++) memcpy(s + 3 * i, "\xEF\xB8\x8F", 3), sc[i] = 0xFE0F;
+    static const uint8_t n[2] = {17, 22}; /* 51 bytes, 66 bytes */
+    for (int k = 0; k < 2; k++) {
+        size_t len = 3 * (size_t)n[k];
+        for (int i = 0; i < 3; i++) {
+            ASSERT_EQ_LL(set_cell(all[i], 0, 2, "D", 1, on_red), SHR_OK);
+            ASSERT_EQ_LL(set_cell(all[i], 1, 2, "D", 1, on_red), SHR_OK);
+            ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_text(all[i], 1, 2, s, len, on_blue, NULL, 0, 0, NULL), SHR_OK);
+        }
+        if (k)
+            ASSERT_EQ_LL(set_cell(ref, 0, 2, "\xEF\xBF\xBD", 1, on_blue), SHR_OK);
+        else
+            ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(ref, 0, 2, NULL, 0, 1, on_blue), SHR_OK);
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_cell(a, 0, 2, s, len, 1, on_blue), SHR_OK);
+        const shr_row_cell cell = {0, 0, 1, n[k]};
+        const shr_row in = {&cell, 1, &on_blue, 1, sc, n[k], NULL, 0};
+        ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(b, 0, 2, &in, NULL), SHR_OK);
+        assert_same_rows(ref, a);
+        assert_same_rows(ref, b);
+        ASSERT_EQ_LL(glyph_at(a, 0, 2, NULL), k ? 0xFFFD : -1);
+        ASSERT_STR_EQ(row_text(a, 1), "..D.....");
+        ASSERT_EQ_LL(measure_ex(s, len, 8, 0, NULL), SHR_OK);
+        ASSERT_EQ_LL(ext.clusters, 1);
+        ASSERT_EQ_LL(cl[0].cells, 0);
+        ASSERT(cl[0].flags & SHR_CLUSTER_INVISIBLE);
+    }
+    ASSERT_EQ_LL(shr_lyr_destroy(a), SHR_OK);
+    ASSERT_EQ_LL(shr_lyr_destroy(b), SHR_OK);
+    close_grid(ref);
     PASS();
 }
 
@@ -1971,6 +2046,7 @@ int main(int argc, char **argv) {
     RUN_TEST(set_lines_validates_and_keeps_equal_lists);
     RUN_TEST(style_alpha_selects_dim_conceal_and_background);
     RUN_TEST(lines_move_with_rows_and_clears_cut_them);
+    RUN_TEST(clears_cut_lines_over_the_wide_cells_they_reach);
     RUN_TEST(cache_hint_only_for_rows_covered_by_backgrounds);
     RUN_TEST(row_key_follows_every_input);
     RUN_TEST(row_keys_repeat_in_a_new_context);
@@ -1988,6 +2064,7 @@ int main(int argc, char **argv) {
     RUN_TEST(set_row_equals_set_cell_and_errors_change_nothing);
     RUN_TEST(set_row_places_cells_and_lines);
     RUN_TEST(set_row_long_clusters_equal_set_cell);
+    RUN_TEST(unseen_clusters_past_the_limits);
     RUN_TEST(out_of_memory_is_recoverable);
     RUN_TEST(empty_clears_change_nothing);
     RUN_TEST(set_row_out_of_memory_says_so);

@@ -193,15 +193,13 @@ static void lines_cut(shr__lines *l, int32_t c0, int32_t c1) {
     l->n = w;
 }
 
-/* Clears [*c0, *c1) of row r widened to the wide cells reaching into it. */
-static void clear_cells(shr__tilemap *t, int32_t r, int32_t *c0, int32_t *c1) {
-    shr__cell *row = row_at(t, r);
+/* Columns [*c0, *c1) of row r widened to the wide cells reaching into them. */
+static void cells_widen(const shr__tilemap *t, int32_t r, int32_t *c0, int32_t *c1) {
+    const shr__cell *row = row_at(t, r);
     if (row[*c0].kind == CELL_CONT) *c0 -= row[*c0].span;
     int32_t last = *c1 - 1;
     if (row[last].kind == CELL_CONT) last -= row[last].span;
     if (row[last].kind == CELL_HEAD && last + row[last].span > *c1) *c1 = last + row[last].span;
-    for (int32_t c = *c0; c < *c1; c++) cell_free(&t->al, &row[c]);
-    t->line[r] |= DIRTY;
 }
 
 /* Frees what a head of `span` cells at (r, c) covers, empties what it leaves of wide cells it cuts and writes its
@@ -509,7 +507,7 @@ static void cell_put(shr__tilemap *t, int32_t r, int32_t c, const shr__cell *e) 
 
 /* The head a valid cluster within the cell limits makes at (r, c), from the memo when it holds the text: into `out`
  * (an empty cell when the grid holds it already), or with `out` NULL into the grid. Forced inline, as are cell_same()
- * and text_key(), so that set_cell makes no call for a cell the memo holds. */
+ * and text_key(), so that set_cell calls nothing but place() for a cell the memo holds. */
 static inline __attribute__((always_inline)) shr_status cell_set(shr__tilemap *t, int32_t r, int32_t c,
                                                                  const char *utf8, size_t len, uint32_t span,
                                                                  shr_text_style s, shr__cell *out) {
@@ -757,15 +755,20 @@ shr_status shr_pl_lyr_tilemap_clear(shr_lyr *layer, int32_t row, int32_t col, in
         return SHR_E_INVALID_ARG;
     if (!rows || !cols) return SHR_OK;
     for (int32_t r = row; r < row + rows; r++) {
+        int32_t c0 = col, c1 = col + cols;
+        cells_widen(t, r, &c0, &c1);
         shr__lines *l = row_lines(t, r);
-        if (!lines_room(t, l, l->n + lines_split(l, col, col + cols))) return SHR_E_NO_MEMORY;
+        if (!lines_room(t, l, l->n + lines_split(l, c0, c1))) return SHR_E_NO_MEMORY;
     }
     const shr__cell e = blank((shr_text_style){0, style.bg, 0});
     for (int32_t r = row; r < row + rows; r++) {
         int32_t c0 = col, c1 = col + cols;
-        clear_cells(t, r, &c0, &c1);
-        for (int32_t c = c0; (style.bg >> 24) && c < c1; c++) row_at(t, r)[c] = e;
-        lines_cut(row_lines(t, r), col, col + cols);
+        cells_widen(t, r, &c0, &c1);
+        shr__cell *cells = row_at(t, r);
+        for (int32_t c = c0; c < c1; c++) cell_free(&t->al, &cells[c]);
+        for (int32_t c = c0; (style.bg >> 24) && c < c1; c++) cells[c] = e;
+        lines_cut(row_lines(t, r), c0, c1);
+        t->line[r] |= DIRTY;
     }
     return SHR_OK;
 }
