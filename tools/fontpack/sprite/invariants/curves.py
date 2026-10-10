@@ -1,18 +1,25 @@
 """Rounded corners and diagonals, branch drawing, Powerline and the anti-aliased legacy computing shapes.
 
- 9ab F5D0 == 2500, F5D1 == 2502, F5D6..F5D9 == 256D, 256E, 2570, 256F
+ 9ab F5D0 == 2500, F5D1 == 2502, F5D6..F5D9 == 256D, 256E, 2570, 256F; the thin Powerline separators E0B9/E0BF ==
+     2572 (backslash), E0BB/E0BD == 2571 (slash)
  9c  every arm/arc of a branch glyph and every rounded corner meets the cell edge with exactly the light line's edge
      profile; unused edges are empty
- 9d  branch arms reach the node: no empty pixel on the arm axis between the edge and the circle
+ 9d  branch arms reach the node: no empty pixel on the arm axis between the edge and the circle; nodes alternate
+     filled and hollow
+ 9e  F5DA-F5ED are their line and corners drawn over each other: never less than the parts, equal to the brightest
+     part wherever a part is empty or solid
  C   ink of every line-like glyph is one 8-connected piece
  M   mirror pairs equal within one z2d sample row where the geometry is symmetric in the cell
  K   complement pairs (shapes sharing one diagonal) add up to a full cell
  P   Powerline: E0B0/E0B2 edge column full except the corner rows the triangle cannot fill, E0B4/E0B6 edge column
-     full, triangle tips reach the opposite edge
+     full, triangle tips reach the opposite edge, E0B4/E0B6 reach min(w, h / 2) on the middle row; E0D2 has a light
+     line's gap in its full column 0 and opens to the right
  F   fade lines F5D2-F5D5: A4 levels fall away from the bright end, at least min(n, 15) levels
  A   axis-parallel glyphs use only 0/255
 """
+import functools
 import math
+import operator
 
 from .. import box as _box  # noqa: F401  (registers the drawers)
 from .. import branch, legacy, powerline  # noqa: F401
@@ -22,21 +29,23 @@ from ..registry import render
 # sample per sub-scanline and edge (4 samples = 64 per pixel).
 MIRROR_TOL = 64
 U, R, D, L = 1, 2, 4, 8
-CORNER = {"br": D | R, "bl": D | L, "tl": U | L, "tr": U | R}
 ARC_EDGES = {0x256D: D | R, 0x256E: D | L, 0x256F: U | L, 0x2570: U | R}
+# The branch glyphs as kitty (where they come from) defines them, not read from branch.py: F5DA-F5ED a light line
+# and rounded corners, F5EE-F60D nodes with arms to the edges, each filled then hollow.
+BRANCH_PARTS = ("│╰", "│╭", "╰╭", "│╯", "│╮", "╮╯", "─╮", "─╭", "╭╮", "─╯", "─╰", "╰╯",
+                "│╰╯", "│╭╮", "─╮╯", "─╰╭", "│╭╯", "│╮╰", "─╭╯", "─╮╰")
+NODE_ARMS = ("", "r", "l", "lr", "d", "u", "ud", "rd", "ld", "ru", "lu", "udr", "udl", "lrd", "lru", "udlr")
+PART_EDGES = {"│": U | D, "─": L | R, **{chr(cp): e for cp, e in ARC_EDGES.items()}}
 
 
 def branch_edges():
     out = {0xF5D0: L | R, 0xF5D1: U | D}
-    for i, k in enumerate(("br", "bl", "tr", "tl")):
-        out[0xF5D6 + i] = CORNER[k]
-    for i, (line, *corners) in enumerate(branch.COMBOS):
-        e = (U | D) if line == "v" else (L | R) if line == "h" else 0
-        for k in corners:
-            e |= CORNER[k]
-        out[0xF5DA + i] = e
-    for i, n in enumerate(branch.NODES):
-        out[0xF5EE + i] = n & 15
+    for i, k in enumerate("╭╮╰╯"):
+        out[0xF5D6 + i] = PART_EDGES[k]
+    for i, parts in enumerate(BRANCH_PARTS):
+        out[0xF5DA + i] = functools.reduce(operator.or_, (PART_EDGES[p] for p in parts))
+    for i, arms in enumerate(NODE_ARMS):
+        out[0xF5EE + 2 * i] = out[0xF5EF + 2 * i] = sum({"u": U, "r": R, "d": D, "l": L}[a] for a in arms)
     return out
 
 
@@ -113,13 +122,14 @@ def check(m):
         errs.append(f"curves {m.tag} {code} {msg}")
 
     for a, b in ((0xF5D0, 0x2500), (0xF5D1, 0x2502), (0xF5D6, 0x256D), (0xF5D7, 0x256E), (0xF5D8, 0x2570),
-                 (0xF5D9, 0x256F)):
+                 (0xF5D9, 0x256F), (0xE0B9, 0x2572), (0xE0BB, 0x2571), (0xE0BD, 0x2571), (0xE0BF, 0x2572)):
         if g(a) != g(b):
             err("9ab", f"U+{a:04X} != U+{b:04X} ({sum(1 for x, y in zip(g(a), g(b)) if x != y)} px)")
 
     hl, vl = g(0x2500), g(0x2502)
     want = {U: row(vl, 0), D: row(vl, h - 1), L: col(hl, 0), R: col(hl, w - 1)}
-    for cp, e in sorted({**ARC_EDGES, **branch_edges()}.items()):
+    edges = branch_edges()
+    for cp, e in sorted({**ARC_EDGES, **edges}.items()):
         b = g(cp)
         got = {U: row(b, 0), D: row(b, h - 1), L: col(b, 0), R: col(b, w - 1)}
         node = cp >= 0xF5EE
@@ -140,11 +150,18 @@ def check(m):
              D: [(vleft, y) for y in range(math.floor(cy + r) - 1, h)],
              L: [(x, htop) for x in range(0, math.ceil(cx - r) + 1)],
              R: [(x, htop) for x in range(math.floor(cx + r) - 1, w)]}
-    for i, n in enumerate(branch.NODES):
-        b = g(0xF5EE + i)
+    for cp in range(0xF5EE, 0xF60E):
+        b = g(cp)
         for side, pts in spans.items():
-            if n & side and any(b[y * w + x] == 0 for x, y in pts if 0 <= x < w and 0 <= y < h):
-                err("9d", f"U+{0xF5EE + i:04X} gap between arm and node")
+            if edges[cp] & side and any(b[y * w + x] == 0 for x, y in pts if 0 <= x < w and 0 <= y < h):
+                err("9d", f"U+{cp:04X} gap between arm and node")
+        if b[int(cy) * w + int(cx)] != (0 if cp & 1 else 255):
+            err("9d", f"U+{cp:04X} centre {b[int(cy) * w + int(cx)]}, not {'hollow' if cp & 1 else 'filled'}")
+
+    for i, parts in enumerate(BRANCH_PARTS):
+        ps = [g(ord(p)) for p in parts]
+        if any(v < max(q) or v != max(q) and (0 in q or 255 in q) for v, *q in zip(g(0xF5DA + i), *ps)):
+            err("9e", f"U+{0xF5DA + i:04X} is not {parts} drawn over each other")
 
     line_like = [*range(0x256D, 0x2574), *range(0xF5D6, 0xF60E), 0xE0B1, 0xE0B3, 0xE0B5, 0xE0B7,
                  *(cp for cp in range(0x1FBA0, 0x1FBAF) if cp not in (0x1FBA8, 0x1FBA9)), *range(0x1FBD0, 0x1FBE0)]
@@ -154,7 +171,8 @@ def check(m):
 
     pairs = [(0x2571, 0x2572, "h"), (0x2573, 0x2573, "h"), (0x2573, 0x2573, "v"), (0xE0B0, 0xE0B2, "h"),
              (0xE0B0, 0xE0B0, "v"), (0xE0B8, 0xE0BA, "h"), (0xE0BC, 0xE0BE, "h"), (0xE0B8, 0xE0BC, "v"),
-             (0xE0B4, 0xE0B4, "v"), (0xE0B1, 0xE0B1, "v"),
+             (0xE0B4, 0xE0B4, "v"), (0xE0B1, 0xE0B1, "v"), (0xE0B1, 0xE0B3, "h"), (0xE0D2, 0xE0D4, "h"),
+             (0xE0D2, 0xE0D2, "v"),
              (0x1FBD0, 0x1FBD3, "h"), (0x1FBD0, 0x1FBD2, "v"), (0x1FBD4, 0x1FBD6, "h"), (0x1FBD5, 0x1FBD7, "h"),
              (0x1FBE0, 0x1FBE2, "v"), (0x1FBE1, 0x1FBE3, "h"), (0x1FBE8, 0x1FBEA, "v"), (0x1FBE9, 0x1FBEB, "h"),
              (0x1FBEC, 0x1FBEF, "h"), (0x1FBED, 0x1FBEE, "h")]
@@ -190,6 +208,12 @@ def check(m):
     for cp, x in ((0xE0B4, 0), (0xE0B6, w - 1)):
         if any(v != 255 for v in col(g(cp), x)):
             err("P", f"U+{cp:04X} edge column {x} has a gap: {col(g(cp), x)}")
+        ink = [i for i, v in enumerate(row(g(cp), h // 2)) if v]
+        if (ink[-1] + 1 if x == 0 else w - ink[0]) != math.ceil(min(w, h / 2)):
+            err("P", f"U+{cp:04X} middle row {row(g(cp), h // 2)} does not reach {min(w, h / 2)}")
+    gap = sum(255 - v for v in col(g(0xE0D2), 0)) / 255
+    if abs(gap - t) > 0.5 or sum(col(g(0xE0D2), 0)) <= sum(col(g(0xE0D2), w - 1)):
+        err("P", f"U+E0D2 column 0 {col(g(0xE0D2), 0)} misses {gap:.2f} px, not {t}, or the right column has more ink")
 
     for cp, horiz, rev in ((0xF5D2, True, False), (0xF5D3, True, True), (0xF5D4, False, False), (0xF5D5, False, True)):
         line = row(g(cp), htop) if horiz else col(g(cp), vleft)

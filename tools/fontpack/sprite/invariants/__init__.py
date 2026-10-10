@@ -1,9 +1,9 @@
 """Cell-size invariants of the generated glyphs, derived from Unicode names and the glyphs' own base strokes (no
 reference images). Each module's check(m) returns violation strings; empty means the glyphs hold."""
-from . import box, cells, curves
+from . import box, cells, curves, names
 
 SIZES = ((8, 16), (10, 20), (6, 12), (7, 14), (9, 17), (12, 24), (16, 32))
-MODULES = (box, cells, curves)
+MODULES = (box, cells, curves, names)
 
 
 def check_all(metrics):
