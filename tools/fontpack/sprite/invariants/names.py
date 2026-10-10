@@ -1,11 +1,13 @@
-"""Legacy computing glyphs against the shapes their Unicode names describe (not the drawers' tables).
+"""Legacy computing glyphs and the box drawing diagonals against the shapes their Unicode names describe (not the
+drawers' tables).
 
  N1  blocks, strips, sixteenths, shades and line pieces: pixels inside the named rectangles have their level, pixels
      outside are empty; a pixel that a rectangle edge cuts may be either
  N2  separated blocks: one solid piece in each named cell of the 2x2 or 2x3 grid, nothing elsewhere, off the cell edge
  N3  diagonal and triangular blocks, black circles: full more than 1 px inside the named shape (1.5 px for the edge
      triangles, whose apex is rounded to a pixel), empty more than that outside; diagonal lines and white circles and
-     ellipses: empty more than 1.5 px off the named path, ink along all of it
+     ellipses: empty more than 1.5 px off the named path, ink along all of it; the lines as wide as the light line
+     across the middle of each segment
  N4  NEGATIVE glyphs invert the light glyph of the same name; 1FBAF is 2500 with the heavy 2503 over it; 1FB98/1FB99
      have more ink on the named diagonal than on the other unless they are their own mirror image; 1FB95 starts its
      row of four squares filled, 1FB96 is its inverse, 1FB97 fills the second and fourth quarters (as kitty draws
@@ -19,7 +21,7 @@ from fractions import Fraction as Fr
 from .. import legacy
 from ..common import unicode_names
 from ..registry import render
-from .curves import MIRROR_TOL
+from .curves import MIRROR_TOL, WIDTH_TOL, seg_dist, stroke_width
 
 MEDIUM = 0x80
 SIDES = "(LEFT|RIGHT|UPPER|LOWER)"
@@ -76,15 +78,6 @@ def convex(pts, w, h):
     return lambda x, y: max(f(x, y) for f in sides)
 
 
-def segment(a, b):
-    dx, dy = b[0] - a[0], b[1] - a[1]
-
-    def d(x, y):
-        u = max(0, min(1, ((x - a[0]) * dx + (y - a[1]) * dy) / (dx * dx + dy * dy)))
-        return math.hypot(x - a[0] - u * dx, y - a[1] - u * dy)
-    return d
-
-
 def ellipse(cx, cy, a, b):
     """Approximate signed distance to the ellipse outline (F / |grad F|)."""
     def d(x, y):
@@ -133,13 +126,12 @@ def expect(cp, x):
     if n == "HEAVY HORIZONTAL FILL":
         return rects(grid(1, 4, (1, 3)))
     if m := re.fullmatch(r"BOX DRAWINGS LIGHT DIAGONAL (.+)", n):
-        paths = ["UPPER CENTRE TO MIDDLE RIGHT TO LOWER CENTRE TO MIDDLE LEFT TO UPPER CENTRE"] \
-            if m[1] == "DIAMOND" else m[1].split(" AND ")
+        paths = {"DIAMOND": ["UPPER CENTRE TO MIDDLE RIGHT TO LOWER CENTRE TO MIDDLE LEFT TO UPPER CENTRE"],
+                 "CROSS": ["UPPER LEFT TO LOWER RIGHT", "UPPER RIGHT TO LOWER LEFT"]}.get(m[1], m[1].split(" AND "))
         lines = [[px(point(p)) for p in path.split(" TO ")] for path in paths]
-        segs = [segment(a, b) for ps in lines for a, b in zip(ps, ps[1:])]
-        trace = [(a[0] + (b[0] - a[0]) * i / 16, a[1] + (b[1] - a[1]) * i / 16)
-                 for ps in lines for a, b in zip(ps, ps[1:]) for i in range(17)]
-        return "shape", lambda x, y: min(s(x, y) for s in segs) - t / 2, 1.5, None, trace
+        segs = [(a, b) for ps in lines for a, b in zip(ps, ps[1:])]
+        trace = [(a[0] + (b[0] - a[0]) * i / 16, a[1] + (b[1] - a[1]) * i / 16) for a, b in segs for i in range(17)]
+        return "shape", lambda x, y: min(seg_dist((x, y), *s) for s in segs) - t / 2, 1.5, None, trace, segs
     if n == "BOX DRAWINGS LIGHT HORIZONTAL WITH VERTICAL STROKE":
         return "same", bytes(map(max, x.glyph(0x2500), x.glyph(0x2503)))
     if m := re.fullmatch(r"BOX DRAWINGS LIGHT (.+)", n):
@@ -255,7 +247,7 @@ def check_separated(x, cp, g, rows, named):
         x.bad("N2", f"U+{cp:04X} {len(parts)} pieces for {len(named)} named cells")
 
 
-def check_shape(x, cp, g, sd, margin, level, trace):
+def check_shape(x, cp, g, sd, margin, level, trace, segs=()):
     w, h = x.w, x.h
     off = sum(1 for i, v in enumerate(g)
               if (d := sd(i % w + 0.5, i // w + 0.5)) <= -margin and level not in (None, v) or d >= margin and v)
@@ -266,6 +258,9 @@ def check_shape(x, cp, g, sd, margin, level, trace):
                     if 0 <= i < w and 0 <= j < h)]
     if gaps:
         x.bad("N3", f"U+{cp:04X} no ink near its path at {gaps[0]}")
+    for i in range(len(segs)):
+        if abs((d := stroke_width(g, w, h, segs, i)) - x.t) > WIDTH_TOL:
+            x.bad("N3", f"U+{cp:04X} segment {i} is {d:.2f} px wide, not {x.t}")
 
 
 def check_fill(x, cp, g, a, b):
@@ -282,7 +277,7 @@ def check_fill(x, cp, g, a, b):
 
 def check(m):
     x = Ctx(m)
-    for cp in legacy.ALL:
+    for cp in (*legacy.ALL, 0x2571, 0x2572, 0x2573):
         g = x.glyph(cp)
         e = expect(cp, x)
         if e is None:
