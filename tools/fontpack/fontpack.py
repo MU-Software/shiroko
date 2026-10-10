@@ -22,6 +22,7 @@ import collections
 import functools
 import hashlib
 import io
+import itertools
 import json
 import os
 import pathlib
@@ -485,6 +486,15 @@ def size_metrics(latin_face, size):
     underline = min(lh - 1, baseline + max(1, round(-latin_face.underline * ppem / latin_face.upem)))
     strike = max(0, min(lh - 1, baseline - round(latin_face.strike * ppem / latin_face.upem)))
     return baseline, underline, strike
+
+
+def check_height(latin_face, size):
+    """Exit unless the line holds the baseline size_metrics puts in it."""
+    cw, lh = size["cell_width"], size["line_height"]
+    fits = (n for n in itertools.count(lh) if size_metrics(latin_face, {"cell_width": cw, "line_height": n})[0] <= n)
+    need = next(fits)
+    if need > lh:
+        sys.exit(f"cell {cw}x{lh} is too short for {latin_face.id}; needs at least {cw}x{need}")
 
 
 def fit_ppem(face, role, size, baseline):
@@ -1478,6 +1488,7 @@ def build(names, size, out=None, keep=None, method="zstd", store_index=False, or
     ivd = ivd_pairs()
     resolve_set = CONFIG["packages"]
     faces = {f: Face(f) for f in {p["faces"]["regular"] for p in resolve_set.values()}}
+    check_height(faces[resolve_set["latin"]["faces"]["regular"]], size)
     generated, undrawn = generated_scalars(profile)
     if set(generated) - set(resolve_set):
         sys.exit(f"generated scalars for unknown packages {sorted(set(generated) - set(resolve_set))}")
@@ -1526,6 +1537,7 @@ def builtin(size, out):
     latin = CONFIG["packages"]["latin"]
     face_id = latin["faces"]["regular"]
     face = Face(face_id)
+    check_height(face, size)
     cps = set(range(0x20, 0x7F)) | {0xFFFD}
     if not cps <= set(face.cmap):
         sys.exit(f"{face_id} does not cover the built-in scalars")

@@ -109,7 +109,7 @@ endif()
 set(SHIROKO_CELL_WIDTH 8 CACHE STRING "Cell width in pixels baked into fonts and text (6..64)")
 set(SHIROKO_CELL_HEIGHT 16 CACHE STRING "Cell height (line height) in pixels (8..127)")
 # Glyph records hold a wide glyph (2 cells) and its bearing in a byte and an i8.
-# fontpack's generated glyphs need at least 6x8.
+# fontpack's generated glyphs need at least 6x8; fontpack also rejects a height below the Latin face's baseline.
 if(NOT SHIROKO_CELL_WIDTH MATCHES "^[1-9][0-9]?$" OR SHIROKO_CELL_WIDTH LESS 6 OR SHIROKO_CELL_WIDTH GREATER 64 OR
    NOT SHIROKO_CELL_HEIGHT MATCHES "^[1-9][0-9]*$" OR SHIROKO_CELL_HEIGHT LESS 8 OR SHIROKO_CELL_HEIGHT GREATER 127)
   message(FATAL_ERROR "SHIROKO_CELL_WIDTH must be in 6..64 and SHIROKO_CELL_HEIGHT in 8..127")
