@@ -116,7 +116,8 @@ bench: $(FETCHED)
 # Replay (tests/bench/replay.c): the Tab5 example's scenes recorded on its screen configuration, then replayed into the
 # software driver alone and into the compositor over a driver drawing nothing; REPLAY_ARGS = [SCENE[,SCENE...]|all|cost]
 # [FRAMES]. replay-tab5 takes the Tab5's packages, so its recording hashes match the device's (TAB5_DEFS="-D
-# TAB5_REPLAY=1"; for a firmware with other keep screens or bands, the same SHR_REPLAY_KEEPS and SHR_REPLAY_BANDS).
+# TAB5_REPLAY=1"; for a firmware with other keep screens, bands or rotation, the same SHR_REPLAY_KEEPS,
+# SHR_REPLAY_BANDS and SHR_REPLAY_ROTATION).
 # replay-cost: the app cost table's scenes (README; on the Tab5: TAB5_DEFS="-D TAB5_COST=1"), as
 # tools/bench/benchlog.py cost TAB5_LOG [DESKTOP_LOG] tabulates them.
 replay: $(FETCHED)

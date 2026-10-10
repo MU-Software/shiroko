@@ -344,6 +344,12 @@ over 12 bytes (each new one, and `shr_pl_lyr_tilemap_set_text` even when unchang
   while the PPA turns the other. One band leaves the app 40 KiB more, but on Tab5 (uncapped, ST7121, 64 KiB budget) the
   scenes took about 12 % longer (p50 summed) and a scrolling screen 34 ms a frame instead of 29. The replay bench's
   `SHR_REPLAY_BANDS` sets the same count.
+- Turn the screen so that scrolling up moves rows toward the start of the frame buffer (Kconfig
+  `SHIROKO_TAB5_ROTATION` in the example, default 90° counterclockwise, also the right way up on Tab5 with the keyboard
+  side down): DMA2D moves rows that way in one copy at any distance, the other way only up to 48 px. On Tab5 (capped
+  30, 2026-10-10) scrolling up 5 rows a frame took 1.4-1.5 ms less busy time than clockwise and scrolling down 5 rows
+  1.5 ms more (ILI9881C); one row either way costs the same busy time. The replay bench's `SHR_REPLAY_ROTATION` sets
+  the same turn.
 - Watch the internal heap: `heap_caps_register_failed_alloc_callback()` reports any failed request with its size and
   caps, `heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)` the lowest free since boot, and
   `heap_caps_monitor_local_minimum_free_size_start()` / `_stop()` the lowest over a stretch, such as one screen of

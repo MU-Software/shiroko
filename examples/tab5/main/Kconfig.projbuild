@@ -28,6 +28,20 @@ menu "shiroko Tab5 example"
             bool "ST7121 board (57 Hz)"
     endchoice
 
+    choice SHIROKO_TAB5_ROTATION
+        prompt "Screen rotation"
+        default SHIROKO_TAB5_ROTATE_90_CCW
+        help
+            The landscape screen is turned a quarter onto the portrait panel. Counterclockwise (default) shows it
+            the right way up on the Tab5 (ST7121 and ILI9881C boards) with the keyboard side down; clockwise shows
+            it upside down there.
+
+        config SHIROKO_TAB5_ROTATE_90_CCW
+            bool "90 degrees counterclockwise"
+        config SHIROKO_TAB5_ROTATE_90_CW
+            bool "90 degrees clockwise"
+    endchoice
+
     config SHIROKO_TAB5_BANDS
         int "Internal-RAM bands"
         range 1 2

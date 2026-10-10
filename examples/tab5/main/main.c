@@ -17,8 +17,9 @@
  * batches and calls replayed; TAB5_REPLAY_PARTS bits driver-sw, driver-p4, compositor; TAB5_REPLAY_FRAMES=1 adds BF
  * lines), TAB5_COST=1 (the README's app cost table), TAB5_SOAK=1 (H lines with the heaps and the allocations by the
  * context, the driver and, with CONFIG_HEAP_USE_HOOKS, all; a Z line that must count none over the last TAB5_SOAK_K
- * loop frames, else a FAIL line). CONFIG_SHIROKO_TAB5_BOARD_HEADLESS runs the same on an ESP32-P4 without a panel,
- * scanning the frame buffer out with a Tab5 panel's timing unless CONFIG_SHIROKO_TAB5_SCANOUT_NONE. */
+ * loop frames, else a FAIL line), TAB5_ROTATION=SHR_ROTATE_90_CW or _CCW (over CONFIG_SHIROKO_TAB5_ROTATION).
+ * CONFIG_SHIROKO_TAB5_BOARD_HEADLESS runs the same on an ESP32-P4 without a panel, scanning the frame buffer out with a
+ * Tab5 panel's timing unless CONFIG_SHIROKO_TAB5_SCANOUT_NONE. */
 #include <shiroko/port_software.h>
 
 #include <stdio.h>
@@ -52,6 +53,9 @@
 #endif
 #ifndef TAB5_REPLAY
 #define TAB5_REPLAY 0
+#endif
+#if !defined(TAB5_ROTATION) && CONFIG_SHIROKO_TAB5_ROTATE_90_CW
+#define TAB5_ROTATION SHR_ROTATE_90_CW
 #endif
 #include "rec.h"
 #if TAB5_REPLAY
@@ -696,16 +700,19 @@ static bool ppa_band(const shr_surface *d, const shr_draw_cmd *c, size_t n) {
             return false;
     const shr_surface *b = &a.bands[k];
     int s = hw.phys[k];
+    bool cw = c->rotation == SHR_ROTATE_90_CW;
     bool whole = n == 1 && s == k && !hw.cpu[k] && c->src.pixels == b->pixels && c->src.width == b->width &&
-                 c->src.height == b->height && c->rotation == SHR_ROTATE_90_CW;
+                 c->src.height == b->height && (cw || c->rotation == SHR_ROTATE_90_CCW);
     hw.phys[k] = k, hw.cpu[k] = true; /* the band's next draw batch sets them again */
     shr_rect all = {0, 0, b->width, b->height};
-    if (whole && k == 1 && hw.held && hw.held_op.out.block_offset_x == c->dst.x1 &&
-        hw.held_op.out.block_offset_y == c->dst.y0) {
+    /* Band 0 (rows above) turns to the right of band 1 clockwise, to its left counterclockwise. */
+    int32_t hx = hw.held_op.out.block_offset_x;
+    if (whole && k == 1 && hw.held && hw.held_op.rotation_angle == ccw[c->rotation] &&
+        (cw ? hx == c->dst.x1 : hx + b->height == c->dst.x0) && hw.held_op.out.block_offset_y == c->dst.y0) {
         hw.held = false, a.bytes.rotated -= b->byte_length; /* counted again below */
         hw.ppa_last[0] = hw.ppa_last[1] = ppa_queue(
             ppa_config(d, a.bands[0].pixels, b->width, 2 * b->height, (shr_rect){0, 0, b->width, 2 * b->height},
-                       c->dst.x0, c->dst.y0, c->rotation),
+                       cw ? c->dst.x0 : hx, c->dst.y0, c->rotation),
             later(rot_after(0), hw.dma_wr[1]));
         return true;
     }
@@ -1471,8 +1478,9 @@ void app_main(void) {
                                         &a.ppa));
     ESP_ERROR_CHECK(ppa_client_register_event_callbacks(a.ppa, &(ppa_event_callbacks_t){.on_trans_done = ppa_finished}));
     printf("shiroko on " BOARD ": %dx%d RGB565, cells %dx%d, bands %d x %zu B internal at %p, frame-rate cap %d,"
-           " keeps %d screens\n", BSP_LCD_H_RES, BSP_LCD_V_RES, CW, CH, BANDS, band_bytes, (void *)band_px, FPS_CAP,
-           CONFIG_SHIROKO_TAB5_KEEP_SCREENS);
+           " keeps %d screens, turned %s\n", BSP_LCD_H_RES, BSP_LCD_V_RES, CW, CH, BANDS, band_bytes, (void *)band_px,
+           FPS_CAP, CONFIG_SHIROKO_TAB5_KEEP_SCREENS,
+           TAB5_ROTATION == SHR_ROTATE_90_CW ? "clockwise" : "counterclockwise");
     heap_line("at boot");
     move_setup();
     map_packages();

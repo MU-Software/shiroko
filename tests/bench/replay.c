@@ -7,10 +7,10 @@
  * churn 30); cost: the scenes of the app cost table. SHR_REPLAY_PROFILE=tab5 (the only one so far),
  * SHR_REPLAY_PART=driver-sw or compositor (default both), SHR_REPLAY_REPS (default 5), SHR_REPLAY_FRAMES=1 adds BF lines
  * per frame, SHR_REPLAY_SAVE=DIR / SHR_REPLAY_LOAD=DIR write or read DIR/<scene>.shrr (commands) and
- * DIR/<scene>.calls.shrr instead of recording. SHR_REPLAY_KEEPS: the driver's keep slots in screens of rows, and
- * SHR_REPLAY_BANDS: the bands (1 or 2); 4 and 2 by default, the Tab5 example's defaults, so the hashes match the
- * device's (set them as its CONFIG_SHIROKO_TAB5_KEEP_SCREENS and BANDS); recordings loaded must have been made with
- * the same counts. */
+ * DIR/<scene>.calls.shrr instead of recording. SHR_REPLAY_KEEPS: the driver's keep slots in screens of rows,
+ * SHR_REPLAY_BANDS: the bands (1 or 2) and SHR_REPLAY_ROTATION: cw or ccw; 4, 2 and ccw by default, the Tab5 example's
+ * defaults, so the hashes match the device's (set them as its CONFIG_SHIROKO_TAB5_KEEP_SCREENS, BANDS and ROTATION);
+ * recordings loaded must have been made with the same settings. */
 #include <shiroko/port_software.h>
 #include <shiroko/shiroko.h>
 
@@ -32,6 +32,7 @@
 static struct {
     const char *fonts;
     uint32_t keeps;
+    shr_rotation rotation;
     uint32_t ntargets; /* the frame buffer and the bands */
     shr_surface targets[3];
     rec_package packages[T5_N(t5_packages)];
@@ -109,7 +110,7 @@ static uint32_t record(int load, int32_t frames, shr_framebuffer_driver *sw, rec
     cd.output = &output;
     shr_screen_desc sd;
     t5_screen_desc(s, &sd);
-    sd.bands = g.targets + 1, sd.band_count = g.ntargets - 1, sd.band_align = BAND_ALIGN;
+    sd.rotation = g.rotation, sd.bands = g.targets + 1, sd.band_count = g.ntargets - 1, sd.band_align = BAND_ALIGN;
     rec_profile p = {load_names[load], &cd, &sd, T5_REC_STEP_NS, frames, g.packages, T5_N(g.packages)};
     check(rec_begin(w, &p, sw, g.targets, g.ntargets), "rec_begin");
     rec_frame(w, REC_OPEN, s->frozen);
@@ -304,6 +305,7 @@ int main(int argc, char **argv) {
     const char *profile = getenv("SHR_REPLAY_PROFILE"), *part = getenv("SHR_REPLAY_PART");
     const char *reps_env = getenv("SHR_REPLAY_REPS"), *frames_env = getenv("SHR_REPLAY_FRAMES");
     const char *keeps_env = getenv("SHR_REPLAY_KEEPS"), *bands_env = getenv("SHR_REPLAY_BANDS");
+    const char *rot_env = getenv("SHR_REPLAY_ROTATION");
     int bands = bands_env ? atoi(bands_env) : 2;
     if ((profile && strcmp(profile, "tab5")) || (part && strcmp(part, "driver-sw") && strcmp(part, "compositor"))) {
         fprintf(stderr, "only SHR_REPLAY_PROFILE=tab5 and SHR_REPLAY_PART=driver-sw or compositor so far\n");
@@ -313,11 +315,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "SHR_REPLAY_BANDS must be 1 or 2\n");
         return 2;
     }
+    if (rot_env && strcmp(rot_env, "cw") && strcmp(rot_env, "ccw")) {
+        fprintf(stderr, "SHR_REPLAY_ROTATION must be cw or ccw\n");
+        return 2;
+    }
     if (SHR_PIXEL_FORMAT != SHR_FORMAT_RGB565) {
         fprintf(stderr, "the tab5 profile needs an RGB565 build\n");
         return 77;
     }
     g.fonts = argv[1];
+    g.rotation = rot_env && !strcmp(rot_env, "cw") ? SHR_ROTATE_90_CW : SHR_ROTATE_90_CCW;
     g.keeps = (keeps_env ? (uint32_t)atoi(keeps_env) : 4) * (OUT_W / SHR_CELL_HEIGHT);
     g.ntargets = 1 + (uint32_t)bands;
     g.targets[0] = surface(OUT_W, OUT_H, 0);

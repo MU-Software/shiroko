@@ -347,10 +347,14 @@ static void t5_context_desc(t5_scene *s, shr_context_desc *cd) {
     cd->io_retry_ns = cd->io_timeout_ns = 0;
 }
 
-/* The screen, turned a quarter clockwise onto the portrait output; the host adds the bands. */
+#ifndef TAB5_ROTATION
+#define TAB5_ROTATION SHR_ROTATE_90_CCW
+#endif
+
+/* The screen, turned a quarter (TAB5_ROTATION) onto the portrait output; the host adds the bands. */
 static void t5_screen_desc(const t5_scene *s, shr_screen_desc *sd) {
     shr_screen_desc_init(sd);
-    sd->width = s->width, sd->height = s->height, sd->rotation = SHR_ROTATE_90_CW;
+    sd->width = s->width, sd->height = s->height, sd->rotation = TAB5_ROTATION;
     sd->clear = SHR_RGB(0x1E, 0x1F, 0x29);
 }
 
