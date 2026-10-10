@@ -377,6 +377,51 @@ TEST test_image_pinned_across_bands(void) {
 }
 
 
+/* An image released and unused while a frame is built frees its id, which stays taken until a plan releases it: the
+ * image drawn in a later band of that frame gets another id, so the next frame registers nothing again. Released
+ * before the frame (freed by the pump that started it) and after its first band. */
+TEST test_image_id_freed_while_a_frame_is_built(void) {
+    static uint8_t band_px[2][HW * 16 * 4], big[8 * 8 * 4];
+    memset(big, 255, sizeof(big));
+    for (int late = 0; late < 2; late++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak);
+        shr_surface bands[2];
+        for (int k = 0; k < 2; k++)
+            bands[k] = (shr_surface){band_px[k], HW, 16, HW * SCREEN_BPP, HW * 16 * SCREEN_BPP, SHR_PIXEL_FORMAT, 1, 0, 0};
+        shr_screen_desc sd;
+        shr_screen_desc_init(&sd);
+        sd.width = HW, sd.height = HH, sd.bands = bands, sd.band_count = 2;
+        ASSERT_EQ_LL(shr_screen_configure(ctx, &sd), SHR_OK);
+        shr_pl_res_image *a, *b;
+        ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 8, 8, big, 32, &a), SHR_OK);
+        shr_lyr *la = image_layer(ctx, 0, a, (shr_rect){0, 0, 8, 8}, (shr_point){0, 0});
+        frame(ctx);
+        ASSERT_EQ_LL(shr_lyr_cmd_begin(la), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_cmd_commit(la), SHR_OK);
+        if (!late) ASSERT_EQ_LL(shr_pl_res_image_release(a), SHR_OK);
+        ASSERT_EQ_LL(shr_pl_res_image_create(ctx, 2, 2, quad, 8, &b), SHR_OK);
+        shr_lyr *lb = image_layer(ctx, 1, b, (shr_rect){0, 0, 2, 2}, (shr_point){0, 40});
+        h.drv.async = true;
+        frame(ctx);
+        ASSERT(h.drv.pending && h.drv.pending_dst->pixels == band_px[0]);
+        if (late) ASSERT_EQ_LL(shr_pl_res_image_release(a), SHR_OK);
+        while (h.drv.pending) md_complete(&h.drv), shr_pump(ctx);
+        int registers = h.drv.registers;
+        shr_request_redraw(ctx);
+        frame(ctx);
+        while (h.drv.pending) md_complete(&h.drv), shr_pump(ctx);
+        ASSERT_EQ_LL(h.drv.registers, registers);
+        ASSERT_EQ_LL(h.out.presents, 3);
+        ASSERT_EQ_LL(shr_lyr_destroy(la), SHR_OK);
+        ASSERT_EQ_LL(shr_lyr_destroy(lb), SHR_OK);
+        ASSERT_EQ_LL(shr_pl_res_image_release(b), SHR_OK);
+        harness_close(&h);
+        ASSERT_EQ_LL(oom.live, 0);
+    }
+    PASS();
+}
+
 /* An update while a frame reads the image goes to a second buffer: the frame in flight keeps the old pixels, the
  * next frame draws the new ones. The two buffers then take turns, each brought level before it is written. */
 TEST test_image_double_buffer(void) {
@@ -476,6 +521,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_image_pinned_by_frames);
     RUN_TEST(test_image_double_buffer);
     RUN_TEST(test_image_pinned_across_bands);
+    RUN_TEST(test_image_id_freed_while_a_frame_is_built);
     RUN_TEST(test_image_second_buffer_out_of_memory);
     GREATEST_MAIN_END();
 }

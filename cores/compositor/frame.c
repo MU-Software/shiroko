@@ -28,8 +28,10 @@ static void frame_reset(shr_context *ctx) {
 
 /* ===== Buffer plan: built with the frame, taken by the registry once the driver accepted it ===== */
 
-/* Ids with `releasing` set were stamped by plan_begin(). */
-static bool slot_free(const shr__slot *s, uint64_t frame) { return s->stamp == frame ? !s->taken : !s->buf; }
+/* An id released after plan_begin() (an image freed while the frame is built) stays taken until a plan releases it. */
+static bool slot_free(const shr__slot *s, uint64_t frame) {
+    return s->stamp == frame ? !s->taken : !s->buf && !s->releasing;
+}
 
 /* A buffer command or KEEP_RELEASE of `id`: a REGISTER names the memory of `b`, an UPDATE its dirty rect. */
 static shr_status prologue_push(shr_context *ctx, shr__frame *f, shr_cmd_kind kind, uint32_t id, const shr__buf *b) {
