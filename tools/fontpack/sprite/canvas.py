@@ -28,12 +28,6 @@ class Canvas:
             for y in range(y0, y1):
                 self.buf[y * self.stride + x0:y * self.stride + x1] = row
 
-    def get(self, x, y):
-        px, py = x + self.pad_x, y + self.pad_y
-        if 0 <= px < self.stride and 0 <= py < self.rows:
-            return self.buf[py * self.stride + px]
-        return 0
-
     def invert(self):
         self.buf[:] = bytes(255 - v for v in self.buf)
 

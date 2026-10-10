@@ -1440,9 +1440,9 @@ def write_licenses(out, names, reports):
                                              for f, v in LOCK["files"].items()
                                              if f == pin["patcher"] or f.startswith(pin["glyphs"])]}
     if "nerd_rules" in inventory:
-        notice += ["", "Nerd glyph sizes follow the rules of nerd-fonts font-patcher v3.4.0 (MIT, Copyright (c) 2014 Ryan L "
-                   "McIntyre; LICENSES/nerd/nerd-fonts-LICENSE), placed as Ghostty (MIT, "
-                   "https://github.com/ghostty-org/ghostty) places them."]
+        notice += ["", f"Nerd glyph sizes follow the rules of nerd-fonts font-patcher v{LOCK['nerd_rules']['version']} "
+                   "(MIT, Copyright (c) 2014 Ryan L McIntyre; LICENSES/nerd/nerd-fonts-LICENSE), placed as Ghostty "
+                   "(MIT, https://github.com/ghostty-org/ghostty) places them."]
     notice += ["", "Unicode data: Copyright (c) Unicode, Inc. Unicode License v3 (LICENSES/Unicode-3.0.txt)."
                + (" Unihan (Unihan.zip) orders CJK glyphs." if "Unihan.zip" in used else ""), ""]
     if "korean-frequency-2005.zip" in used:

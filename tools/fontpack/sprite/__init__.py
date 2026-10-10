@@ -4,9 +4,9 @@ import importlib
 
 from . import common
 from .metrics import Metrics
-from .registry import REGISTRY, draws, render
+from .registry import REGISTRY, render
 
-__all__ = ["MODULES", "Metrics", "REGISTRY", "draws", "load", "render"]
+__all__ = ["Metrics", "load", "render"]
 MODULES = ("box", "blocks", "legacy", "braille", "branch", "powerline")
 
 

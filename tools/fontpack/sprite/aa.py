@@ -205,7 +205,6 @@ def stroke_polys(pts, flags, closed, width):
     hw = width / 2
     if closed and len(pts) > 2 and pts[0] == pts[-1]:
         pts, flags = pts[:-1], flags[:-1]
-        flags = flags[:]
     n = len(pts)
     if n < 2:
         return []
