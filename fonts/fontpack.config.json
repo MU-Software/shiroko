@@ -92,5 +92,11 @@
     "emoji",
     "nerd"
   ],
-  "coverage_allowlist": {}
+  "coverage_allowlist": {},
+  "generated": {
+    "latin": ["2500-259F"],
+    "symbols": ["2800-28FF", "1FB00-1FBEF", "1CC1B-1CC1E", "1CC21-1CC3F", "1CD00-1CDE5", "1CE00-1CE01", "1CE0B-1CE0C",
+                "1CE16-1CE19", "1CE51-1CEAF", "F5D0-F60D"],
+    "nerd": ["E0B0-E0BF", "E0D2", "E0D4"]
+  }
 }

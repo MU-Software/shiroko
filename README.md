@@ -40,6 +40,11 @@ Korean. For the `ja`, `zh-Hans`, `zh-Hant` and `zh-HK` variants (`shr_pl_res_bit
 `make fontpack-locales` bakes every package, including `cjk-ja`, `cjk-zh-Hans`, `cjk-zh-Hant` and `cjk-zh-HK`,
 into `build/fonts-locales`.
 
+Box drawing and blocks (2500-259F, in `latin`), Braille, legacy computing and branch drawing (in `symbols`) and the
+Powerline separators (in `nerd`) are drawn for the cell size instead of rasterised from the fonts, so lines join
+across cells and blocks fill them exactly (`fontpack.config.json` "generated", `tools/fontpack/sprite`; the rules
+follow Ghostty's sprite code). `fontpack.py selftest` checks their invariants at seven cell sizes.
+
 Packages are zstd-compressed (`SHIROKO_ZSTD`, default ON, vcpkg feature `zstd`); `-DSHIROKO_ZSTD=OFF` bakes stored
 packages and builds a library that reads only those (`make test-nozstd`). A library built with zstd reads both: each
 box records its method, only zstd boxes go through the decoder, and the decoder's context (`ZSTD_DCtx`, 94 KiB on a

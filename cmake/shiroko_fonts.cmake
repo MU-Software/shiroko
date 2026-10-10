@@ -52,8 +52,9 @@ add_custom_command(OUTPUT ${_unicode}
 add_custom_target(shiroko_unicode_tables DEPENDS ${_unicode})
 target_sources(shiroko_shared PRIVATE ${_unicode})
 add_dependencies(shiroko_shared shiroko_unicode_tables)
+file(GLOB_RECURSE _sprite_py CONFIGURE_DEPENDS ${_src}/tools/fontpack/sprite/*.py)
 set(SHIROKO_FONT_DEPS ${_fetched} ${CMAKE_CURRENT_BINARY_DIR}/shiroko_cell.txt ${_font_json}
-  ${_src}/tools/fontpack/fontpack.py ${_unicode} ${_src}/pyproject.toml ${_src}/uv.lock)
+  ${_src}/tools/fontpack/fontpack.py ${_sprite_py} ${_unicode} ${_src}/pyproject.toml ${_src}/uv.lock)
 
 set(_builtin ${CMAKE_CURRENT_BINARY_DIR}/generated/shr_gen_builtin_package.c)
 add_custom_command(OUTPUT ${_builtin}

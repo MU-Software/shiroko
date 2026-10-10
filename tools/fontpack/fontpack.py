@@ -47,6 +47,7 @@ from PIL import Image
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "unicode"))
 import gen_unicode_tables as ucd  # noqa: E402
+import sprite  # noqa: E402
 
 FONTS = ROOT / "fonts"
 SRC = pathlib.Path(os.environ.get("SHIROKO_FONT_CACHE") or ROOT / ".cache" / "fonts") / "src"
@@ -97,8 +98,8 @@ LEGACY_TIERS = {"ko": ("euc-kr", (((0xA1, 0xA1), (0xA4, 0xA4), (0xB0, 0xC8)), ((
 # Other roles: scalar ranges (Nerd: glyph sets of the Nerd Fonts wiki, Material Design last).
 HOT_RANGES = {"latin": ((0x20, 0x7E), (0x2500, 0x259F), (0xA0, 0xFF), (0x2000, 0x206F), (0x2190, 0x21FF),
                         (0x2200, 0x23FF), (0x25A0, 0x25FF), (0x100, 0x17F)),
-              "symbols": ((0x2800, 0x28FF), (0x25A0, 0x25FF), (0x2190, 0x21FF), (0x2300, 0x23FF), (0x2600, 0x27BF),
-                          (0x2B00, 0x2BFF), (0x1FB00, 0x1FBFF)),
+              "symbols": (((0x2800, 0x28FF), (0xF5D0, 0xF60D)), (0x25A0, 0x25FF), (0x2190, 0x21FF), (0x2300, 0x23FF),
+                          (0x2600, 0x27BF), (0x2B00, 0x2BFF), (0x1FB00, 0x1FBFF), (0x1CC00, 0x1CEBF)),
               "nerd": ((0xE0A0, 0xE0D7), (0xE5FA, 0xE6B7), (0xE700, 0xE8EF), (0xF000, 0xF2FF), (0xF400, 0xF533),
                        (0xEA60, 0xEC1E), (0xF300, 0xF381), (0xE000, 0xF8FF))}
 
@@ -281,6 +282,7 @@ class Face:
         self.descent = max(-os2.sTypoDescender, -hhea.descent)
         post = self.tt["post"]
         self.underline = post.underlinePosition
+        self.underline_thickness = post.underlineThickness
         self.strike = os2.yStrikeoutPosition
         self.advance = collections.Counter(a for a, _ in self.tt["hmtx"].metrics.values() if a).most_common(1)[0][0]
         # the design cell: the full block, else the union of the sextants
@@ -310,8 +312,60 @@ def shaping_script(role):
     return "Zyyy" if role == "emoji" else "Latn"
 
 
-def resolve_providers(profile, packages, faces):
-    """Fix the provider of every scalar at build time (text path)."""
+@functools.cache
+def sprites():
+    """The glyph drawers of tools/fontpack/sprite: {scalar: (drawer, module)}."""
+    return sprite.load(ucd.CACHE / "UnicodeData.txt")
+
+
+@functools.cache
+def assigned_scalars():
+    """Scalars UnicodeData.txt assigns."""
+    out, first = set(), None
+    for line in (ucd.CACHE / "UnicodeData.txt").read_text(encoding="utf-8").splitlines():
+        f = line.split(";")
+        cp = int(f[0], 16)
+        if f[1].endswith(", First>"):
+            first = cp
+            continue
+        out.update(range(first, cp + 1) if f[1].endswith(", Last>") else (cp,))
+    return out
+
+
+def generated_scalars(profile):
+    """{package: scalars} drawn by the sprite code instead of rasterised from the package's face: the ranges of
+    fontpack.config.json "generated" that a drawer covers; also {package: configured scalars without a drawer}."""
+    config = CONFIG.get("generated", {})
+    if not config:
+        return {}, {}
+    drawn = set(sprites())
+    assigned = assigned_scalars()
+    out, undrawn, owner = {}, {}, {}
+    for name, ranges in config.items():
+        want = {cp for r in ranges for cp in scalar_set(r) if profile.drawable(cp) and cp in assigned}
+        out[name], undrawn[name] = want & drawn, want - drawn
+        for cp in out[name]:
+            if owner.setdefault(cp, name) != name:
+                sys.exit(f"generated U+{cp:04X} configured for {owner[cp]} and {name}")
+    return out, undrawn
+
+
+def sprite_glyph(cp, m, fmt, baseline):
+    """Coverage rows of the drawn cell cut to their ink (A4: nonzero after quantisation), bearing x and top."""
+    w, h = m.cell_width, m.cell_height
+    cov = sprite.render(cp, m).cell_bytes()
+    ink = (lambda a: a * 15 + 127 >= 255) if fmt == FMT_A4 else bool
+    xs = [x for x in range(w) if any(ink(cov[y * w + x]) for y in range(h))]
+    ys = [y for y in range(h) if any(ink(cov[y * w + x]) for x in range(w))]
+    if not xs:
+        return None, 0, 0
+    x0, x1, y0, y1 = xs[0], xs[-1] + 1, ys[0], ys[-1] + 1
+    return [cov[y * w + x0:y * w + x1] for y in range(y0, y1)], x0, baseline - y0
+
+
+def resolve_providers(profile, packages, faces, generated=None):
+    """Fix the provider of every scalar at build time (text path). A generated scalar is served by its package
+    only."""
     cover = {name: set(faces[p["faces"]["regular"]].cmap) for name, p in packages.items()}
     cjks = [n for n, p in packages.items() if p["role"] == "cjk"]
     latin = next((n for n, p in packages.items() if p["role"] == "latin"), None)
@@ -334,11 +388,15 @@ def resolve_providers(profile, packages, faces):
                 ok = profile.has(cp, ucd.F_EPRES)
             if ok:
                 out[name].add(cp)
+    for name, cps in (generated or {}).items():
+        for other in out:
+            out[other] = out[other] | cps if other == name else out[other] - cps
     return out
 
 
-def plan_keys(profile, pkg, face, scalars, ivd, report, keep=None):
-    """Keys of one package: scalar -> slot key, sequences -> (kind, slot key)."""
+def plan_keys(profile, pkg, face, scalars, ivd, report, keep=None, generated=frozenset()):
+    """Keys of one package: scalar -> slot key, sequences -> (kind, slot key). The face's variation sequences of a
+    generated scalar are left out (they would draw the face's glyph)."""
     cmap = {cp: ("cp", cp) for cp in sorted(scalars) if keep is None or cp in keep}
     seqs = {}
     role = pkg["role"]
@@ -390,7 +448,7 @@ def plan_keys(profile, pkg, face, scalars, ivd, report, keep=None):
         report["nfd_aliases"] = nfd
         uvs = ivs = 0
         for (base, sel), gid in face.uvs.items():
-            if base not in cmap:
+            if base not in cmap or base in generated:
                 continue
             if 0xE0100 <= sel <= 0xE01EF:
                 if (base, sel) not in ivd:
@@ -777,16 +835,17 @@ def slot_order(pkg, key, ranked):
     elif pkg["role"] == "cjk":
         tier = cjk_order(pkg["locale"])[0].get(v, 9)
     else:
-        tier = next((t for t, (lo, hi) in enumerate(HOT_RANGES[pkg["role"]]) if lo <= v <= hi), 9)
+        tier = next((t for t, r in enumerate(HOT_RANGES[pkg["role"]])
+                     if any(lo <= v <= hi for lo, hi in (r if isinstance(r[0], tuple) else (r,)))), 9)
     return tier, ranked.get(v, len(ranked)) if kind == "cp" else len(ranked), s
 
 
 def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, method="zstd", store_index=False,
-                  order="codepoint", ranked=None):
+                  order="codepoint", ranked=None, generated=frozenset()):
     role = pkg["role"]
     report = {"package": name, "role": role}
     regular = faces[pkg["faces"]["regular"]]
-    cmap, seqs = plan_keys(profile, pkg, regular, scalars, ivd, report, keep)
+    cmap, seqs = plan_keys(profile, pkg, regular, scalars, ivd, report, keep, generated)
 
     slot_keys = list(dict.fromkeys(list(cmap.values()) + [v[1] for v in seqs.values()]))
     inputs = []
@@ -804,9 +863,22 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
     inst_ppem, lift = (cjk_ppem(regular, scalars, size, baseline, em) if role == "cjk"
                        else (fit_ppem(regular, role, size, baseline), 0))
     glyph_records, bitmaps, record_of = [], [], []
-    clipped = notdef = 0
+    clipped = notdef = drawn = 0
+    m = sprite.Metrics.from_face(latin_face, size["cell_width"], size["line_height"])
     for key in slot_keys:
         kind, v = key
+        if kind == "cp" and v in generated:
+            rows, bx, top = sprite_glyph(v, m, fmt, baseline)
+            if rows is None:
+                record_of.append(None)
+                continue
+            packed = pack_rows(rows, fmt)
+            record_of.append(len(glyph_records))
+            cells = key_cells(profile, role, key)
+            glyph_records.append((len(rows[0]), len(rows), bx, top, fmt | (cells << 2), 0, packed))
+            bitmaps.append(sum(map(len, packed)))
+            drawn += 1
+            continue
         if kind == "cp":
             gid = regular.gid(v)
         elif kind == "gid":
@@ -849,7 +921,7 @@ def build_package(name, pkg, profile, faces, scalars, ivd, tools, size, keep, me
         glyph_records.append((w, h, bx, top, fmt | (cells << 2), gid, packed))
         bitmaps.append(sum(map(len, packed)))
     report.update(slots=len(slot_keys), blank=len(slot_keys) - len(glyph_records), clipped=clipped, notdef=notdef,
-                  bitmap_bytes=sum(bitmaps))
+                  bitmap_bytes=sum(bitmaps), generated=sum(1 for cp in cmap if cp in generated), generated_ink=drawn)
     if not glyph_records:
         sys.exit(f"{name}: the build has no glyphs")
 
@@ -1180,15 +1252,15 @@ def cell_fit(pkg):
                 if 0 <= px < cw and 0 <= py < lh:
                     cov[py][px] = a
         need = {0x2588: [(x, y) for y in range(lh) for x in range(cw)],
-                0x2502: [(cw // 2 - 1 + (cw % 2), y) for y in (0, lh - 1)],
-                0x2500: [(x, lh // 2) for x in (0, cw - 1)],
-                0xE0B0: [(0, y) for y in range(lh)], 0xE0B2: [(cw - 1, y) for y in range(lh)]}[cp]
+                0xE0B0: [(0, y) for y in range(lh)], 0xE0B2: [(cw - 1, y) for y in range(lh)]}.get(cp)
         if cp == 0x2588:
             ok = all(cov[y][x] == 255 for x, y in need)
         elif cp in (0xE0B0, 0xE0B2):
             ok = all(cov[y][x] and (cov[y][x] == 255 or y in (0, lh - 1)) for x, y in need)
-        else:
-            ok = all(any(cov[y][xx] for xx in range(cw)) and any(cov[yy][x] for yy in range(lh)) for x, y in need)
+        elif cp == 0x2500:  # a row with ink at both edges, near the middle
+            ok = any(cov[y][0] and cov[y][cw - 1] for y in range(lh // 2 - 2, lh // 2 + 2))
+        else:  # a column with ink at both ends, near the middle
+            ok = any(cov[0][x] and cov[lh - 1][x] for x in range(cw // 2 - 2, cw // 2 + 2))
         out[f"U+{cp:04X}"] = ok
         if not ok:
             print(f"warning: U+{cp:04X} does not fill its cell edges")
@@ -1267,6 +1339,11 @@ def write_licenses(out, names, reports):
                    if "notes" in c]
         inventory["packages"][f"shiroko-{name}"] = {"license": key, "spdx": spdx_expression(lic), "rfn_checked": rfn,
                                                     "report": reports[name]}
+    drawn = {f"shiroko-{n}": r["generated"] for n, r in reports.items() if r.get("generated")}
+    if drawn:
+        notice += ["", f"Generated glyphs ({', '.join(f'{k}: {v}' for k, v in drawn.items())}) are drawn by "
+                   "tools/fontpack/sprite. Generated glyph rules follow Ghostty (MIT) sprite code."]
+        inventory["generated"] = drawn
     (lic_dir / "Unicode-3.0.txt").write_bytes((ROOT / "LICENSES/Unicode-3.0.txt").read_bytes())
     used = sorted({n for r in reports.values() for n in r["order_inputs"] if n in LOCK["order"]})
     inventory["order_inputs"] = {n: {k: v for k, v in LOCK["order"][n].items() if k != "cache"} for n in used}
@@ -1305,7 +1382,10 @@ def build(names, size, out=None, keep=None, method="zstd", store_index=False, or
     ivd = ivd_pairs()
     resolve_set = CONFIG["packages"]
     faces = {f: Face(f) for f in {p["faces"]["regular"] for p in resolve_set.values()}}
-    providers = resolve_providers(profile, resolve_set, faces)
+    generated, undrawn = generated_scalars(profile)
+    if set(generated) - set(resolve_set):
+        sys.exit(f"generated scalars for unknown packages {sorted(set(generated) - set(resolve_set))}")
+    providers = resolve_providers(profile, resolve_set, faces, generated)
     gaps = unserved(profile, resolve_set, faces, providers) if keep is None else {}
     out.mkdir(parents=True, exist_ok=True)
     stage = pathlib.Path(tempfile.mkdtemp(prefix=".stage-", dir=out))
@@ -1313,7 +1393,9 @@ def build(names, size, out=None, keep=None, method="zstd", store_index=False, or
         reports = {}
         for name in names:
             blob, report = build_package(name, CONFIG["packages"][name], profile, faces, providers[name], ivd, tools,
-                                         size, keep, method, store_index, order, ranked)
+                                         size, keep, method, store_index, order, ranked, generated.get(name, set()))
+            if undrawn.get(name):
+                report["generated_undrawn"] = [f"{cp:04X}" for cp in sorted(undrawn[name])]
             try:
                 pkg = Package(blob, profile.id, profile.max_scalars)
             except FormatError as e:
@@ -1330,7 +1412,8 @@ def build(names, size, out=None, keep=None, method="zstd", store_index=False, or
                   f"{report['pages']} pages of {report['shape']} ({report['hot_pages']} hot"
                   f"{''.join('; ' + n for n in report['order_inputs'])}), "
                   f"atlas fill {report['atlas_fill']:.1%}, "
-                  f"{report['scalars']} scalars, {report['sequences']} sequences, clipped {report['clipped']}")
+                  f"{report['scalars']} scalars ({report['generated']} generated), {report['sequences']} sequences, "
+                  f"clipped {report['clipped']}")
         write_licenses(stage, names, reports)
         (stage / "coverage.json").write_text(json.dumps(reports, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         bad = {n: r["unserved"] for n, r in reports.items() if r.get("unserved")}
@@ -1686,9 +1769,23 @@ def reader_selftest(blob, profile):
         sys.exit(f"selftest: {name}: accepted")
 
 
+def sprite_selftest():
+    """The generated glyphs keep their cell-size invariants (tools/fontpack/sprite/invariants) at every size of
+    invariants.SIZES."""
+    from sprite import invariants
+    face = Face(CONFIG["packages"]["latin"]["faces"]["regular"])
+    drawn = sprites()
+    bad = invariants.check_all(lambda w, h: sprite.Metrics.from_face(face, w, h))
+    if bad:
+        sys.exit(f"selftest: generated glyph invariants: {len(bad)} violations\n  " + "\n  ".join(bad[:20]))
+    print(f"generated glyphs: {len(drawn)} drawn, invariants hold at {len(invariants.SIZES)} cell sizes")
+
+
 def selftest(packages):
     """Install recovery: a damaged payload is rewritten, the notices follow, activation advances. The reader
-    rejects broken pages."""
+    rejects broken pages. The generated glyphs keep their invariants."""
+    if CONFIG.get("generated"):
+        sprite_selftest()
     src = min(pathlib.Path(packages).glob("shiroko-*.shrf"), key=lambda p: p.stat().st_size, default=None)
     if not src:
         sys.exit(f"{packages}: no packages to test with; run `make fontpack` first")

@@ -80,3 +80,10 @@ uthash (vcpkg port uthash, header macros expanded into the library)
 Font packages (<build dir>/fonts, installed to share/shiroko/fonts; not part
 of the library) carry their own NOTICE, LICENSES/ and inventory.json written
 by tools/fontpack/fontpack.py.
+
+Generated glyph rules (tools/fontpack/sprite, build-time tool)
+  The box drawing, block, Braille, legacy computing, branch drawing and
+  Powerline glyphs that fontpack.py draws into the font packages follow
+  Ghostty's sprite code (src/font/sprite, commit 8f0dd3709050), reimplemented.
+  Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors. MIT
+  (LICENSES/Ghostty-MIT.txt).
