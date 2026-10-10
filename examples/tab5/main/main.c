@@ -1,7 +1,8 @@
 /* M5Stack Tab5: the software driver draws the desktop example's load modes over the full grid in landscape, and the
  * PPA rotates that into the portrait MIPI-DSI panel's frame buffer: (A) composed in PSRAM and rotated once per frame,
  * (B) drawn band by band into one internal-RAM band, (C) into two; in B and C a band the PPA still reads is drawn into
- * a PSRAM spare instead. C alone unless CONFIG_SHIROKO_TAB5_ALL_MODES. A worker task on the main task's core starts the
+ * a PSRAM spare instead. CONFIG_SHIROKO_TAB5_BANDS internal bands are taken (2 by default), and only their mode runs
+ * (C, or B with one) unless CONFIG_SHIROKO_TAB5_ALL_MODES (also A). A worker task on the main task's core starts the
  * queued DMA2D copies (keeps; in B and C also scrolled rows moved inside the frame buffer, once a boot self-test proved
  * the moves right) and PPA rotations in order, so the work of a frame runs on while the next one is built: a frame is
  * presented once the work of the frame before it is done; its tail runs until its own is.
@@ -79,6 +80,7 @@
 #define CAP_NS (FPS_CAP ? 1000000000ull / (FPS_CAP + !FPS_CAP) : 0)
 #define HW_TIMEOUT_MS 200
 #define PPA_QUEUE 8
+#define BANDS CONFIG_SHIROKO_TAB5_BANDS
 #define BAND_H 16
 /* Quarter turns to output x offsets of 2 mod 4 can hang the PPA (esp-idf#19096): 16-pixel edges avoid them. */
 #define PPA_ALIGN 16
@@ -87,7 +89,7 @@
 #define DMA_BURST 128      /* bytes per DMA2D burst (16..128): smaller ones hold PSRAM in shorter turns, slower */
 #define CHAIN 64           /* queued copies, and rotations */
 #define SPARES 3           /* PSRAM bands drawn into while an internal band still waits for the hardware */
-#define SLOTS (2 + SPARES)
+#define SLOTS (BANDS + SPARES)
 
 #define FONT_SUBTYPE 0x40
 
@@ -121,11 +123,13 @@
 #endif
 enum { COMPOSE, BAND1, BAND2, MODES };
 static const char *const mode_names[MODES] = {"A compose", "B 1 band", "C 2 bands"};
+#define MODE_BANDS (BANDS == 2 ? BAND2 : BAND1)
 #ifdef CONFIG_SHIROKO_TAB5_ALL_MODES
 #define MODE0 COMPOSE
 #else
-#define MODE0 BAND2
+#define MODE0 MODE_BANDS
 #endif
+#define MODE1 (MODE_BANDS + 1) /* past the last mode run */
 
 /* Bytes of keep copies by DMA and by the CPU, PPA rotations and moves (read and written). */
 typedef struct traffic {
@@ -146,7 +150,7 @@ static EXT_RAM_BSS_ATTR struct {
 
 static struct {
     esp_lcd_panel_handle_t panel;
-    shr_surface fb, bands[2];
+    shr_surface fb, bands[BANDS];
     shr_framebuffer_driver drv, sw; /* drv runs ROTATE on the PPA, the rest on sw */
     ppa_client_handle_t ppa;
     TaskHandle_t task;
@@ -167,6 +171,15 @@ static void check(shr_status st, const char *what) {
     if (st == SHR_OK) return;
     printf("%s: %s\n", what, shr_status_name(st));
     for (;;) vTaskDelay(portMAX_DELAY);
+}
+
+#define TARGETS (1 + BANDS)
+
+/* The frame buffer and the bands, as recordings name the surfaces drawn into. */
+static shr_surface *targets(shr_surface t[TARGETS]) {
+    t[0] = a.fb;
+    for (int k = 0; k < BANDS; k++) t[1 + k] = a.bands[k];
+    return t;
 }
 
 /* Writes the CPU's frame buffer writes back (C2M) or drops its cached lines (M2C); the first failure is printed. */
@@ -224,9 +237,9 @@ static struct {
     volatile uint32_t want_dma, want_ppa;
     volatile bool waiting, any;
     uint8_t *spare[SPARES];
-    int phys[2];  /* the slot each band draws into */
-    bool cpu[2];  /* whether the CPU draws into it */
-    bool held;    /* held_op: band 0's rotation, waiting to go with band 1's */
+    int phys[BANDS]; /* the slot each band draws into */
+    bool cpu[BANDS]; /* whether the CPU draws into it */
+    bool held;       /* held_op: band 0's rotation, waiting to go with band 1's */
     ppa_srm_oper_config_t held_op;
     esp_timer_handle_t pace;
     int64_t next_us;
@@ -419,7 +432,7 @@ static void hw_drain(void) {
     hw_wait((uint32_t)hw.dma_queued, (uint32_t)hw.ppa_queued);
 }
 
-static uint8_t *slot_px(int s) { return s < 2 ? a.bands[s].pixels : hw.spare[s - 2]; }
+static uint8_t *slot_px(unsigned s) { return s < BANDS ? a.bands[s].pixels : hw.spare[s - BANDS]; }
 
 static int slot_of(const void *p) {
     for (int s = 0; s < SLOTS; s++) {
@@ -437,8 +450,8 @@ static bool slot_started(int s) { return done(hw.dma_started, hw.dma_last[s]) &&
  * moves run (its rotation may wait for all of them) the one whose last rotation comes first. */
 static int slot_for(int k) {
     if (slot_started(k)) return k;
-    int e = 2;
-    for (int i = 2; i < SLOTS; i++) {
+    int e = BANDS;
+    for (int i = BANDS; i < SLOTS; i++) {
         if (slot_free(i)) return i;
         e = done(hw.ppa_last[i], hw.ppa_last[e]) ? e : i;
     }
@@ -500,7 +513,7 @@ static bool ppa_rotate(const shr_surface *d, const shr_draw_cmd *c) {
 }
 
 static int band_of(const void *p) {
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < BANDS; k++) {
         const uint8_t *b = a.bands[k].pixels;
         if (b && (const uint8_t *)p >= b && (const uint8_t *)p < b + a.bands[k].byte_length) return k;
     }
@@ -741,7 +754,7 @@ static shr_status p4_execute(void *user, const shr_surface *d, const shr_draw_cm
         hw.phys[k] = s, ds.pixels = slot_px(s);
     } else { /* the CPU may read the bands (ROTATE the PPA cannot take): their pixels back where they were drawn */
         hw_drain();
-        for (int j = 0; j < 2; j++)
+        for (int j = 0; j < BANDS; j++)
             if (hw.phys[j] != j) memcpy(a.bands[j].pixels, slot_px(hw.phys[j]), a.bands[j].byte_length), hw.phys[j] = j;
     }
     int64_t t1 = esp_timer_get_time();
@@ -851,9 +864,9 @@ static shr_status open_package(void *user, const char *name, shr_asset_source *o
     return SHR_E_NOT_FOUND;
 }
 
-/* Memory used every frame (SHR_ALLOC_HOT) goes to internal RAM while it fits in the budget, the rest of it and other
- * payload to PSRAM, so the rest of internal RAM stays with the application; DMA memory, hot or not, to DMA-capable
- * PSRAM, other descriptors to malloc. */
+/* Memory used every frame (SHR_ALLOC_HOT) goes to internal RAM while it fits in the budget, the rest of it and all
+ * other memory to PSRAM, so the rest of internal RAM stays with the application; DMA memory, hot or not, to
+ * DMA-capable PSRAM. */
 #define BUDGET ((size_t)CONFIG_SHIROKO_TAB5_INTERNAL_BUDGET_KB << 10)
 static struct {
     size_t used, peak, spilled; /* budgeted bytes, the most since the scene opened; hot bytes in PSRAM */
@@ -874,9 +887,8 @@ static void *place_alloc(void *user, size_t size, size_t align, shr_alloc_kind k
             budget.spilled += size;
         return p;
     }
-    if (kind == SHR_ALLOC_PAYLOAD) /* also the keep block DMA2D copies to and from: PSRAM, in 128-byte lines */
-        return heap_caps_aligned_alloc(align, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return align <= _Alignof(max_align_t) ? malloc(size) : aligned_alloc(align, (size + align - 1) / align * align);
+    /* also the keep block DMA2D copies to and from, in 128-byte lines */
+    return heap_caps_aligned_alloc(align, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
 static void place_free(void *user, void *p, size_t size, size_t align, shr_alloc_kind kind) {
@@ -971,11 +983,12 @@ static void frame(bool submit) {
 
 static void heap_line(const char *when) {
     printf("  heap %s: free internal %u KiB (largest %u KiB), PSRAM %u KiB, budget %u/%u/%u KiB used/peak/cap, hot in"
-           " PSRAM %u KiB\n", when,
+           " PSRAM %u KiB, least free internal %u KiB\n", when,
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >> 10),
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >> 10),
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >> 10), (unsigned)(budget.used >> 10),
-           (unsigned)(budget.peak >> 10), (unsigned)(BUDGET >> 10), (unsigned)(budget.spilled >> 10));
+           (unsigned)(budget.peak >> 10), (unsigned)(BUDGET >> 10), (unsigned)(budget.spilled >> 10),
+           (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) >> 10));
 }
 
 static long page_loads;
@@ -1006,10 +1019,10 @@ static void scene_open(int load, int mode, rec_writer *w, rec_profile *p, rec_ca
     if (mode != COMPOSE) sd.bands = a.bands, sd.band_count = mode == BAND1 ? 1 : 2, sd.band_align = PPA_ALIGN;
     if (w) {
         p->context = &cd, p->screen = &sd;
-        const shr_surface targets[3] = {a.fb, a.bands[0], a.bands[1]};
-        check(rec_begin(w, p, &a.drv, targets, 3), "rec_begin");
+        shr_surface ts[TARGETS];
+        check(rec_begin(w, p, &a.drv, targets(ts), TARGETS), "rec_begin");
         rec_frame(w, REC_OPEN, a.s.frozen);
-        if (c) check(rec_calls_begin(c, p, &a.drv.caps, targets, 3), "rec_calls_begin"), rec_frame(&c->w, REC_OPEN, a.s.frozen);
+        if (c) check(rec_calls_begin(c, p, &a.drv.caps, ts, TARGETS), "rec_calls_begin"), rec_frame(&c->w, REC_OPEN, a.s.frozen);
         cd.driver = &w->drv;
     }
     check(shr_create(&cd, &a.s.ctx), "create");
@@ -1247,9 +1260,9 @@ static void replay_part(int p4, bool verify, rec_times *t, shr_draw_cmd *cmds, u
     a.shown = NULL, a.dirty = (shr_rect){0};
     memset(a.fb.pixels, 0x5A, a.fb.byte_length);
     fb_sync(ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-    for (int k = 0; k < 2; k++) memset(a.bands[k].pixels, 0x5A, a.bands[k].byte_length);
-    const shr_surface targets[3] = {a.fb, a.bands[0], a.bands[1]};
-    rec_host h = {p4 ? &a.drv : &a.sw, targets, 3, cmds, rp_alloc, rp_free, clock_ns, rp_waited,
+    for (int k = 0; k < BANDS; k++) memset(a.bands[k].pixels, 0x5A, a.bands[k].byte_length);
+    shr_surface ts[TARGETS];
+    rec_host h = {p4 ? &a.drv : &a.sw, targets(ts), TARGETS, cmds, rp_alloc, rp_free, clock_ns, rp_waited,
                   p4 ? rp_finish : NULL, rp_settle, rp_checksum, NULL};
     check(rec_play(rp.arena, rp.w.len, &h, verify, t, sum, bad), "replay");
 }
@@ -1259,7 +1272,7 @@ static void replay_drivers(int load, uint32_t *ref) {
     static const char *const parts[2] = {"driver-sw", "driver-p4"};
     rec_profile p = {load_names[load], NULL, NULL, T5_REC_STEP_NS, t5_rec_frames(load), rp.pk, T5_N(rp.pk)};
     rp.w = (rec_writer){.buf = rp.arena, .cap = rp.cap};
-    scene_open(load, BAND2, &rp.w, &p, NULL);
+    scene_open(load, MODE_BANDS, &rp.w, &p, NULL);
     uint32_t pass = t5_record_loop(&a.s, &rp.w, NULL, rp_checksum, rp_idle, NULL);
     check(a.s.st, a.s.what);
     scene_close();
@@ -1312,7 +1325,7 @@ static void replay_calls(int load, const uint32_t *ref) {
     rec_profile p = {load_names[load], NULL, NULL, T5_REC_STEP_NS, t5_rec_frames(load), rp.pk, T5_N(rp.pk)};
     rec_calls c = {.w = {.buf = rp.arena, .cap = rp.cap - HASH_BYTES}};
     rec_writer v = {.buf = rp.arena + rp.cap - HASH_BYTES, .cap = HASH_BYTES, .hash_only = true};
-    scene_open(load, BAND2, &v, &p, &c);
+    scene_open(load, MODE_BANDS, &v, &p, &c);
     uint32_t pass = t5_record_loop(&a.s, &v, &c.w, rp_checksum, rp_idle, NULL);
     check(a.s.st, a.s.what);
     check(c.w.st, "call recording");
@@ -1333,8 +1346,8 @@ static void replay_calls(int load, const uint32_t *ref) {
     void *scratch = internal_or_psram(SCRATCH_BYTES, &internal);
     rec_times *t = heap_caps_malloc(2 * in.frames * sizeof(*t), MALLOC_CAP_SPIRAM);
     if (!scratch || !t) check(SHR_E_NO_MEMORY, "replay");
-    const shr_surface targets[3] = {a.fb, a.bands[0], a.bands[1]};
-    rec_calls_host h = {&a.drv, targets, 3, &placement, open_package, clock_ns, rp_idle, NULL, scratch, SCRATCH_BYTES};
+    shr_surface ts[TARGETS];
+    rec_calls_host h = {&a.drv, targets(ts), TARGETS, &placement, open_package, clock_ns, rp_idle, NULL, scratch, SCRATCH_BYTES};
     v = (rec_writer){.buf = rp.arena + rp.cap - HASH_BYTES, .cap = HASH_BYTES, .hash_only = true};
     check(rec_calls_play(rp.arena, len, &h, &v, t, t + in.frames), "replay calls");
     int32_t bad = -2;
@@ -1417,9 +1430,9 @@ void app_main(void) {
     /* Mid-scene the largest free internal block is a few KiB: the bands are taken first. */
     size_t band_bytes = (size_t)BSP_LCD_V_RES * 2 * BAND_H;
     uint8_t *band_px =
-        heap_caps_aligned_alloc(CONFIG_CACHE_L2_CACHE_LINE_SIZE, 2 * band_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        heap_caps_aligned_alloc(CONFIG_CACHE_L2_CACHE_LINE_SIZE, BANDS * band_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!band_px) check(SHR_E_NO_MEMORY, "bands");
-    for (int k = 0; k < 2; k++)
+    for (int k = 0; k < BANDS; k++)
         a.bands[k] = (shr_surface){band_px + k * band_bytes, BSP_LCD_V_RES, BAND_H, BSP_LCD_V_RES * 2, band_bytes,
                                    SHR_FORMAT_RGB565, 1, SHR_MEMORY_CPU, 0};
 #if CONFIG_SHIROKO_TAB5_BOARD_TAB5
@@ -1437,10 +1450,11 @@ void app_main(void) {
     size_t row = BSP_LCD_H_RES * 2;
     a.fb = (shr_surface){fb, BSP_LCD_H_RES, BSP_LCD_V_RES, row, row * BSP_LCD_V_RES, SHR_FORMAT_RGB565, 0, SHR_MEMORY_CPU, 0};
     /* Keeps for the rows of CONFIG_SHIROKO_TAB5_KEEP_SCREENS screens, each in a slot of one logical row (40960 B);
-     * PSRAM, as malloc places them. */
+     * PSRAM, as place_alloc puts them. */
     uint32_t keeps = CONFIG_SHIROKO_TAB5_KEEP_SCREENS * (BSP_LCD_H_RES / CH);
     check(shr_software_driver_create(DRIVER_ALLOCATOR, keeps * (BSP_LCD_V_RES * CH * 2ull), keeps, 256, &a.sw), "driver");
-    check(shr_software_driver_image_planes(&a.sw, 2u << 20), "planes"); /* twice the scenes' image_bytes */
+    /* Planes for 1 MiB of translucent images (opaque ones stay RGB565); the rest blend from their buffers. */
+    check(shr_software_driver_image_planes(&a.sw, 2u << 20), "planes");
     async_color_convert_config_t cc = {.backlog = DMA_QUEUE, .dma_burst_size = DMA_BURST};
     ESP_ERROR_CHECK(esp_async_color_convert_install_dma2d(&cc, &hw.conv));
     ESP_ERROR_CHECK(esp_timer_create(&(esp_timer_create_args_t){.callback = dma_paced, .name = "dma pace"}, &hw.pace));
@@ -1456,8 +1470,8 @@ void app_main(void) {
     ESP_ERROR_CHECK(ppa_register_client(&(ppa_client_config_t){.oper_type = PPA_OPERATION_SRM, .max_pending_trans_num = PPA_QUEUE},
                                         &a.ppa));
     ESP_ERROR_CHECK(ppa_client_register_event_callbacks(a.ppa, &(ppa_event_callbacks_t){.on_trans_done = ppa_finished}));
-    printf("shiroko on " BOARD ": %dx%d RGB565, cells %dx%d, bands 2 x %zu B internal at %p, frame-rate cap %d,"
-           " keeps %d screens\n", BSP_LCD_H_RES, BSP_LCD_V_RES, CW, CH, band_bytes, (void *)band_px, FPS_CAP,
+    printf("shiroko on " BOARD ": %dx%d RGB565, cells %dx%d, bands %d x %zu B internal at %p, frame-rate cap %d,"
+           " keeps %d screens\n", BSP_LCD_H_RES, BSP_LCD_V_RES, CW, CH, BANDS, band_bytes, (void *)band_px, FPS_CAP,
            CONFIG_SHIROKO_TAB5_KEEP_SCREENS);
     heap_line("at boot");
     move_setup();
@@ -1468,21 +1482,21 @@ void app_main(void) {
     for (long round = 0;; round++) {
         for (int rep = 0; rep < REPS; rep++)
             for (int load = 0; load < LOADS; load++)
-                for (int m = MODE0; (TAB5_LOADS >> load & 1) && m < MODES; m++)
-                    run_scene(rep, load, rep & 1 ? MODES - 1 - m + MODE0 : m);
+                for (int m = MODE0; (TAB5_LOADS >> load & 1) && m < MODE1; m++)
+                    run_scene(rep, load, rep & 1 ? MODE1 - 1 - m + MODE0 : m);
 #if TAB5_REPLAY
         for (int load = 0; load < LOADS; load++)
             if (TAB5_LOADS >> load & 1) replay_scene(load);
 #endif
         for (int load = 0; load < LOADS; load++)
-            for (int m = MODE0; (TAB5_LOADS >> load & 1) && m < MODES; m++) print_summary(load, m);
+            for (int m = MODE0; (TAB5_LOADS >> load & 1) && m < MODE1; m++) print_summary(load, m);
         printf("CHECKSUMS round %ld:", round);
         bool same = true;
         for (int load = 0; load < LOADS; load++) {
             if (!(TAB5_LOADS >> load & 1)) continue;
             printf(" %s", load_names[load]);
             for (int rep = 0; rep < REPS; rep++)
-                for (int m = MODE0; m < MODES; m++) {
+                for (int m = MODE0; m < MODE1; m++) {
                     printf(" %08lx", (unsigned long)a.sums[rep][load][m]);
                     same &= a.sums[rep][load][m] == a.sums[0][load][MODE0];
                 }

@@ -343,7 +343,7 @@ static void t5_context_desc(t5_scene *s, shr_context_desc *cd) {
     shr_context_desc_init(cd);
     cd->now_ns = t5_clock, cd->user = s;
     cd->blink = (shr_blink_profile){T5_BLINK_NS, 0, true};
-    cd->max_commands = 1u << 20, cd->page_cache_bytes = 16u << 20, cd->image_bytes = 1u << 20;
+    cd->max_commands = 1u << 20, cd->page_cache_bytes = 16u << 20, cd->image_bytes = 4u << 20;
     cd->io_retry_ns = cd->io_timeout_ns = 0;
 }
 

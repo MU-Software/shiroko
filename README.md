@@ -330,9 +330,13 @@ even when unchanged) and glyph pages loaded later.
   `SHR_ALLOC_HOT` in the allocator's `flags`, the kind of memory used every frame also carries `SHR_ALLOC_HOT`
   (rows of commands, a band's command list, per-frame state of the compositor, tilemap and driver), the memory most
   worth the fast RAM; with `flags` 0 the allocator never sees it. The example's `place_alloc` puts hot memory in
-  internal RAM while it fits in 216 KiB (Kconfig `SHIROKO_TAB5_INTERNAL_BUDGET_KB`) and the rest of it and all other
-  payload in PSRAM: about 190-205 KiB of internal RAM stays with the app while a scene runs. 256 KiB draws scenes
-  with many rows 0.4-0.7 ms faster on Tab5 and leaves the app about 160 KiB.
+  internal RAM while it fits in 64 KiB (Kconfig `SHIROKO_TAB5_INTERNAL_BUDGET_KB`) and the rest of it and all other
+  memory in PSRAM: about 360 KiB of internal RAM stays with the app while a scene runs. 216 KiB leaves the app about
+  165 KiB less and draws the example's scenes about 5 % faster on Tab5 (uncapped, ST7121, p50 summed over the
+  scenes; the Hangul scenes 4-5 ms a frame).
+- Draw with two bands (Kconfig `SHIROKO_TAB5_BANDS`, default 2: 2 x 40 KiB of internal RAM) so the CPU draws one
+  while the PPA turns the other. One band leaves the app 40 KiB more, but on Tab5 (uncapped, ST7121, 216 KiB budget) the
+  scenes took about 14 % longer (p50 summed) and a scrolling screen fell into periodic 60 ms frames.
 - Watch the internal heap: `heap_caps_register_failed_alloc_callback()` reports any failed request with its size and
   caps, `heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)` the lowest free since boot, and
   `heap_caps_monitor_local_minimum_free_size_start()` / `_stop()` the lowest over a stretch, such as one screen of

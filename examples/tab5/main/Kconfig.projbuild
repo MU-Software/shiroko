@@ -28,11 +28,22 @@ menu "shiroko Tab5 example"
             bool "ST7121 board (57 Hz)"
     endchoice
 
+    config SHIROKO_TAB5_BANDS
+        int "Internal-RAM bands"
+        range 1 2
+        default 2
+        help
+            The screen is drawn 16 rows at a time into bands of 40 KiB of internal RAM each, which the PPA turns
+            into the frame buffer. 2 (default) draws one band while the PPA turns the other. 1 leaves the app
+            40 KiB more internal RAM, but the CPU waits on the PPA: on the ST7121 Tab5 (uncapped, 216 KiB budget)
+            the scenes took about 14 % longer (p50 summed), and a scrolling screen fell into periodic 60 ms frames.
+
     config SHIROKO_TAB5_ALL_MODES
         bool "Run every drawing mode"
         default n
         help
-            Runs each scene composed in PSRAM (A), with one band (B) and with two bands (C); only C when off.
+            Runs each scene composed in PSRAM (A), with one band (B) and, with two bands, with two (C); only the
+            mode of SHIROKO_TAB5_BANDS when off.
 
     config SHIROKO_TAB5_FPS_CAP
         int "Frame-rate cap (frames per second, 0 = uncapped)"
@@ -55,11 +66,11 @@ menu "shiroko Tab5 example"
     config SHIROKO_TAB5_INTERNAL_BUDGET_KB
         int "Internal RAM for the renderer's per-frame memory (KiB)"
         range 0 1024
-        default 216
+        default 64
         help
             Memory the renderer uses every frame (SHR_ALLOC_HOT: rows of commands, the band command list, per-frame
             state) goes to internal RAM while it fits in this many KiB, the rest of it and all other renderer memory
-            to PSRAM; the rest of internal RAM stays with the application. 216 leaves the app about 200-215 KiB
-            while a scene runs; 256 draws scenes with many rows 0.4-0.7 ms faster and leaves about 160 KiB.
-            0 puts it all in PSRAM.
+            to PSRAM; the rest of internal RAM stays with the application. 64 (default) leaves the app about
+            360 KiB free at the end of each scene on Tab5, 165 KiB more than 216, for frames about 5 % longer
+            uncapped (p50 summed over the scenes; Hangul scenes 4-5 ms). 0 puts it all in PSRAM.
 endmenu
