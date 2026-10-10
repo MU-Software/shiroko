@@ -30,8 +30,8 @@ configure time, asking for `make fontpack-fetch`, when the inputs or the environ
 The build generates the Unicode tables (`<build dir>/generated/shr_gen_unicode_tables.c`) from `.cache/ucd`, and
 `test_grapheme` reads `GraphemeBreakTest.txt` from there.
 
-The build bakes the fonts for one cell size, `SHIROKO_CELL_WIDTH` x `SHIROKO_CELL_HEIGHT` (default 8x16; width 1..64,
-height 1..127; `make CELL_WIDTH=10 CELL_HEIGHT=20 ...`). The built-in package (ASCII + U+FFFD) is compiled into the
+The build bakes the fonts for one cell size, `SHIROKO_CELL_WIDTH` x `SHIROKO_CELL_HEIGHT` (default 8x16; width 6..64,
+height 8..127; `make CELL_WIDTH=10 CELL_HEIGHT=20 ...`). The built-in package (ASCII + U+FFFD) is compiled into the
 library; the other packages go to `<build dir>/fonts` with their NOTICE, LICENSES/ and inventory.json (target
 `shiroko_fonts`, part of the default build when Shiroko is the top-level project).
 

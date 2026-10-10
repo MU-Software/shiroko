@@ -86,6 +86,7 @@ MAX_PAGE_RECORDS = 4096
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 ZSTD_WINDOW = 1 << 18
 MAX_CELL = (64, 127)  # glyph records: u8 width/height, i8 bearing/top for glyphs up to two cells wide
+MIN_CELL = (6, 8)  # smaller cells leave generated glyphs empty (eighth strips at width 5) or merge their strokes
 SHAPING = {"direction": "ltr", "language": "und"}  # script per role; default features only
 # Glyph order (--order hot): hot tiers first, each in scalar order, so the glyphs of everyday text share few pages.
 # CJK: the legacy double-byte set of the locale by lead-byte rows (KS X 1001 punctuation, compatibility jamo and
@@ -1947,6 +1948,9 @@ def cell(value):
     m = re.fullmatch(r"([1-9]\d{0,2})x([1-9]\d{0,2})", value)
     if not m:
         raise argparse.ArgumentTypeError(f"cell size {value!r} is not WIDTHxHEIGHT")
+    if int(m[1]) < MIN_CELL[0] or int(m[2]) < MIN_CELL[1]:
+        raise argparse.ArgumentTypeError(f"cell size {value!r} is below {MIN_CELL[0]}x{MIN_CELL[1]}, the smallest the "
+                                         "generated glyphs fit")
     if int(m[1]) > MAX_CELL[0] or int(m[2]) > MAX_CELL[1]:
         raise argparse.ArgumentTypeError(f"cell size {value!r} exceeds {MAX_CELL[0]}x{MAX_CELL[1]}, the largest a "
                                          "glyph record can hold")
