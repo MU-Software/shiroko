@@ -221,8 +221,9 @@ def check(m):
             v(f"U+{cp:04X} (7) full block has holes")
         elif sp[0] == "side":
             _, side, f = sp
-            size = h if side in ("upper", "lower") else w
-            if size == h:
+            vertical = side in ("upper", "lower")
+            size = h if vertical else w
+            if vertical:
                 span = _span([1 if any(gl.px[y]) else 0 for y in range(h)])
             else:
                 span = _span([1 if any(gl.px[y][x] for y in range(h)) else 0 for x in range(w)])
@@ -231,7 +232,7 @@ def check(m):
                 continue
             ext = span[1] - span[0]
             touches = span[0] == 0 if side in ("upper", "left") else span[1] == size
-            rect = ext * (w if size == h else h) == len(ink)
+            rect = ext * (w if vertical else h) == len(ink)
             if not touches or not rect or abs(ext - f * size) > 0.5:
                 v(f"U+{cp:04X} (7) {side} {f}: span {span} of {size}")
     # 7: complementary pairs: OR = full; AND only on the split line of an odd size (both halves round up)
@@ -249,12 +250,12 @@ def check(m):
         if not (ia & ib) <= allowed:
             v(f"U+{a:04X}+U+{b:04X} (7) AND = {len(ia & ib)} px beyond the split line")
     # 7: eighth blocks nest, each step floor or ceil of size/8
-    for seq, size in (((0x2581, 0x2582, 0x2583, 0x2584, 0x2585, 0x2586, 0x2587, 0x2588), h),
-                      ((0x258F, 0x258E, 0x258D, 0x258C, 0x258B, 0x258A, 0x2589, 0x2588), w)):
+    for seq, size, across in (((0x2581, 0x2582, 0x2583, 0x2584, 0x2585, 0x2586, 0x2587, 0x2588), h, w),
+                              ((0x258F, 0x258E, 0x258D, 0x258C, 0x258B, 0x258A, 0x2589, 0x2588), w, h)):
         prev, prev_n = set(), 0
         for cp in seq:
             ink = g[cp].ink()
-            n = len(ink) // (w if size == h else h)
+            n = len(ink) // across
             if not prev <= ink or n - prev_n not in (size // 8, -(-size // 8)):
                 v(f"U+{cp:04X} (7) eighths do not nest/step evenly ({prev_n} -> {n} of {size})")
             prev, prev_n = ink, n

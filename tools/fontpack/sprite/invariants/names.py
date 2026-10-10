@@ -7,8 +7,9 @@
      triangles, whose apex is rounded to a pixel), empty more than that outside; diagonal lines and white circles and
      ellipses: empty more than 1.5 px off the named path, ink along all of it
  N4  NEGATIVE glyphs invert the light glyph of the same name; 1FBAF is 2500 with the heavy 2503 over it; 1FB98/1FB99
-     have more ink on the named diagonal than on the other unless they are symmetric; 1FB95 starts its row of four
-     squares filled, 1FB96 is its inverse, 1FB97 fills the second and fourth quarters (as kitty draws them)
+     have more ink on the named diagonal than on the other unless they are their own mirror image; 1FB95 starts its
+     row of four squares filled, 1FB96 is its inverse, 1FB97 fills the second and fourth quarters (as kitty draws
+     them)
  N5  every legacy glyph has one of these expectations
 """
 import math
@@ -18,6 +19,7 @@ from fractions import Fraction as Fr
 from .. import legacy
 from ..common import unicode_names
 from ..registry import render
+from .curves import MIRROR_TOL
 
 MEDIUM = 0x80
 SIDES = "(LEFT|RIGHT|UPPER|LOWER)"
@@ -272,8 +274,9 @@ def check_fill(x, cp, g, a, b):
     def ink(a, b):
         return sum(g[int(a[1] + (b[1] - a[1]) * f) * w + int(a[0] + (b[0] - a[0]) * f)]
                    for f in ((i + 0.5) / 64 for i in range(64)))
-    mirror = bytes(g[i - i % w + w - 1 - i % w] for i in range(w * h))
-    if ink(a, b) <= ink((w - a[0], a[1]), (w - b[0], b[1])) and g != mirror:  # a symmetric fill runs both ways
+    # a fill that is its own mirror image (within z2d's rounding) runs both ways
+    mirror = max(abs(g[i] - g[i - i % w + w - 1 - i % w]) for i in range(w * h))
+    if ink(a, b) <= ink((w - a[0], a[1]), (w - b[0], b[1])) and mirror > MIRROR_TOL:
         x.bad("N4", f"U+{cp:04X} less ink along its named diagonal than along the other")
 
 

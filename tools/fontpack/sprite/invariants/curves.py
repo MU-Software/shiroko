@@ -203,7 +203,7 @@ def check(m):
         if any(v != 255 for v in edge[k:h - k]):
             err("P", f"U+{cp:04X} edge column {x} has a gap: {edge}")
         tip = col(g(cp), w - 1 - x)
-        if not (tip[h // 2 - 1] and tip[h // 2]):
+        if not all(tip[y] for y in {(h - 1) // 2, h // 2}):  # the row or the two rows around h / 2
             err("P", f"U+{cp:04X} tip does not reach column {w - 1 - x}")
     for cp, x in ((0xE0B4, 0), (0xE0B6, w - 1)):
         if any(v != 255 for v in col(g(cp), x)):
