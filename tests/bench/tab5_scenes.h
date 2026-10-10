@@ -56,6 +56,7 @@ typedef struct t5_scene {
     shr_context *ctx;
     shr_pl_res_bitmap_font *font;
     shr_lyr *grid, *cursor, *alt;
+    shr_text_line *lines; /* paint_row's underlines, one per column */
     shr_pl_res_image *img[4];
     t5_sprite sprites[T5_SPRITES];
     int load, frames, nsprites;
@@ -128,14 +129,13 @@ static int32_t paint(t5_scene *s, int32_t row, int32_t col, uint32_t h, uint32_t
 
 /* Text line `line` into `row`; with SHR_STYLE_BLINK every other cell blinks. */
 static void paint_row(t5_scene *s, int32_t row, uint32_t line, uint32_t flags) {
-    shr_text_line lines[256];
     size_t n = 0;
-    bool under = (flags & T5_UNDERLINE) && s->cols <= 256;
+    bool under = (flags & T5_UNDERLINE) && s->lines;
     for (int32_t c = 0; c < s->cols;) {
         uint32_t f = ((row + c) & 1 ? flags & ~(uint32_t)SHR_STYLE_BLINK : flags) & ~T5_UNDERLINE;
-        c += paint(s, row, c, mix(line * 0x9E3779B1u + (uint32_t)c), f, under ? lines : NULL, &n);
+        c += paint(s, row, c, mix(line * 0x9E3779B1u + (uint32_t)c), f, under ? s->lines : NULL, &n);
     }
-    t5_try(s, shr_pl_lyr_tilemap_set_lines(s->grid, row, lines, n, NULL), "set_lines");
+    t5_try(s, shr_pl_lyr_tilemap_set_lines(s->grid, row, s->lines, n, NULL), "set_lines");
 }
 
 /* Latin text: words of printable ASCII, a colour per word. */
@@ -365,6 +365,7 @@ static void t5_preload(t5_scene *s) {
 /* The first screen: the grid, its text, the sprites and the cursor. */
 static void t5_scene_fill(t5_scene *s) {
     shr_color bg = SHR_RGB(0x1E, 0x1F, 0x29);
+    if (!(s->lines = malloc((size_t)s->cols * sizeof(*s->lines)))) t5_try(s, SHR_E_NO_MEMORY, "lines");
     t5_try(s, shr_lyr_create(s->ctx, 0, (shr_rect){0, 0, s->width, s->height}, &s->grid), "layer");
     t5_try(s, shr_pl_lyr_tilemap_resize(s->grid, s->font, s->rows, s->cols, &bg), "tilemap_resize");
     if (s->load == CHURN_KO || s->load == CJK_MIX)
@@ -445,6 +446,7 @@ static void t5_scene_close(t5_scene *s) {
     if (s->cursor) shr_lyr_destroy(s->cursor), s->cursor = NULL;
     if (s->alt) shr_lyr_destroy(s->alt), s->alt = NULL;
     memset(s->sprites, 0, sizeof(s->sprites)), memset(s->img, 0, sizeof(s->img));
+    free(s->lines), s->lines = NULL;
     shr_begin_shutdown(s->ctx);
     bool done = false;
     for (int i = 0; i < 64 && !done; i++) {

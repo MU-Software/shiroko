@@ -71,6 +71,7 @@ typedef struct app {
     int dw, dh;     /* drawable size the driver's keep slots were sized for */
     char what[128]; /* the open scene, for its statistics */
     shr_lyr *grid, *cursor;
+    shr_text_line *lines; /* paint_row's underlines, one per column */
     sprite sprites[MAX_SPRITES];
     uint64_t tick;
     uint32_t rng;
@@ -281,14 +282,13 @@ static int32_t paint(app *a, int32_t row, int32_t col, uint32_t h, uint32_t flag
 
 /* Text line `line` into `row`; with SHR_STYLE_BLINK every other cell blinks. */
 static void paint_row(app *a, int32_t row, uint32_t line, uint32_t flags) {
-    shr_text_line lines[256];
     size_t n = 0;
-    bool under = (flags & UNDERLINED) && a->cols <= 256;
+    bool under = (flags & UNDERLINED) && a->lines;
     for (int32_t c = 0; c < a->cols;) {
         uint32_t f = ((row + c) & 1 ? flags & ~(uint32_t)SHR_STYLE_BLINK : flags) & ~UNDERLINED;
-        c += paint(a, row, c, mix(line * 0x9E3779B1u + (uint32_t)c), f, under ? lines : NULL, &n);
+        c += paint(a, row, c, mix(line * 0x9E3779B1u + (uint32_t)c), f, under ? a->lines : NULL, &n);
     }
-    stage_ok(&a->s, shr_pl_lyr_tilemap_set_lines(a->grid, row, lines, n, NULL), "set_lines");
+    stage_ok(&a->s, shr_pl_lyr_tilemap_set_lines(a->grid, row, a->lines, n, NULL), "set_lines");
 }
 
 static void build_sprites(app *a) {
@@ -322,6 +322,7 @@ static void build_sprites(app *a) {
 static void load_build(app *a) {
     shr_color bg = SHR_RGB(0x1E, 0x1F, 0x29);
     a->rows = a->height / CH, a->cols = a->width / CW, a->rng = 0x9E3779B9u;
+    if (!(a->lines = malloc((size_t)a->cols * sizeof(*a->lines)))) stage_ok(&a->s, SHR_E_NO_MEMORY, "lines");
     a->grid = stage_grid(&a->s, 0, (shr_rect){0, 0, a->width, a->height}, &bg);
     for (int32_t r = 0; r < a->rows && a->grid; r++) paint_row(a, r, (uint32_t)r, a->load == BLINK ? SHR_STYLE_BLINK : 0);
     if (a->load == IMAGES || a->load == SCROLL_IMAGES) build_sprites(a);
@@ -593,6 +594,7 @@ static void scene_close(app *a) {
     a->tex = NULL;
     memset(a->sprites, 0, sizeof(a->sprites));
     a->cursor = NULL;
+    free(a->lines), a->lines = NULL;
 }
 
 /* Builds the scene and draws its first frame (the update step included), timed like test_render. */
