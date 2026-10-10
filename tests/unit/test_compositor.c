@@ -2918,35 +2918,21 @@ TEST test_scattered_damage(void) {
     PASS();
 }
 
-/* A damage list that cannot grow falls back to a full redraw. */
-TEST test_damage_out_of_memory_redraws_all(void) {
+/* Damage lists get their room with the context: listing damage asks for no memory. */
+TEST test_damage_lists_need_no_memory(void) {
     harness h;
     shr_context *ctx = harness_open(&h, PRESERVED, tweak_oom);
-    fake r;
-    fake_attach(&r, ctx, &fk_ops);
-    shr_lyr *l;
-    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
-    shr__lcmd c[24];
-    for (int i = 0; i < 24; i++) c[i] = glyph(&r, i % 8 * 8, i / 8 * 16, WHITE);
-    paint(l, 24, c);
+    shr_lyr *l = solid(ctx, 0, FULL, RED);
     frame(ctx);
     oom.budget = 0;
-    shr__res_changed(&r.res, (shr_rect){0, 0, 1, 1});
-    oom.budget = -1;
-    shr_pump(ctx);
-    ASSERT_EQ_LL(rec.damaged, HW * HH);
-    oom.budget = 0; /* a layer change that cannot be listed: still not drawn before shr_submit() */
-    for (int i = 0; i < SHR_MAX_DAMAGE && !ctx->staged.full; i++)
+    for (int i = 0; i <= SHR_MAX_DAMAGE; i++)
         shr__damage_add(ctx, &ctx->staged, (shr_rect){i % 16 * 4, i / 16 * 4, i % 16 * 4 + 1, i / 16 * 4 + 1});
+    ASSERT_EQ_LL(ctx->staged.rects.len, SHR_MAX_DAMAGE);
+    ASSERT_EQ_LL(shr_submit(ctx), SHR_OK);
     oom.budget = -1;
-    ASSERT(ctx->staged.full);
-    shr_request_redraw(ctx);
-    ASSERT_EQ_LL(deadline(ctx), SHR_DEADLINE_NONE);
-    int presents = h.out.presents;
+    ASSERT_EQ_LL(ctx->targets[0].damage.rects.len, SHR_MAX_DAMAGE);
     frame(ctx);
-    ASSERT(h.out.presents == presents + 1 && rec.damaged == HW * HH);
     destroy_layers(&l, 1);
-    r.res.dead = true;
     harness_close(&h);
     ASSERT_EQ_LL(oom.live, 0);
     PASS();
@@ -2977,8 +2963,8 @@ TEST test_async_frames_keep_presenting(void) {
     PASS();
 }
 
-/* A damage list that cannot be allocated fails the frame; its target is then redrawn whole. */
-TEST test_damage_list_out_of_memory_forgets_target(void) {
+/* A frame out of memory fails and gives its damage back: the next frame draws it. */
+TEST test_frame_out_of_memory_returns_damage(void) {
     for (int composing = 0; composing < 3; composing++) { /* 2: an output that preserves nothing */
         harness h;
         shr_context *ctx = harness_open(&h, composing == 2 ? SHR_OUTPUT_RELEASE_ON_PRESENT : PRESERVED, tweak_oom);
@@ -5847,9 +5833,9 @@ int main(int argc, char **argv) {
     RUN_TEST(test_frame_out_of_memory);
     RUN_TEST(test_lines_out_of_memory);
     RUN_TEST(test_scattered_damage);
-    RUN_TEST(test_damage_out_of_memory_redraws_all);
+    RUN_TEST(test_damage_lists_need_no_memory);
     RUN_TEST(test_async_frames_keep_presenting);
-    RUN_TEST(test_damage_list_out_of_memory_forgets_target);
+    RUN_TEST(test_frame_out_of_memory_returns_damage);
     RUN_TEST(test_automatic_frames_wait_for_submit);
     RUN_TEST(test_timers_saturate);
     RUN_TEST(test_configure_rejects_unreachable_composition);

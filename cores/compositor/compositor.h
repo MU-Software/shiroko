@@ -23,8 +23,7 @@ typedef struct shr__move {
 
 /* Moves happen first, in order; `rects` are in the coordinates after them. */
 typedef struct shr__damage {
-    shr__vec rects; /* shr_rect, screen coordinates */
-    bool full;
+    shr__vec rects; /* shr_rect, screen coordinates; room for SHR_MAX_DAMAGE from shr_create() on */
     uint32_t nmoves;
     shr__move moves[SHR_MAX_MOVES];
 } shr__damage;

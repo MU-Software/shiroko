@@ -449,21 +449,20 @@ static int target_for(shr_context *ctx, const shr_surface *s) {
     shr__target *t = &ctx->targets[pick];
     t->used = false;
     t->damage.rects.len = 0;
-    t->damage.full = false;
     t->damage.nmoves = 0;
     t->provisional.len = 0;
     return pick;
 }
 
 /* Moves the target's damage (and its provisional pixels) and moves into the frame; beyond 3/4 of the screen the
- * whole screen is drawn, without moves. On failure the target is forgotten, so the next frame redraws it whole. */
-static bool take_damage(shr_context *ctx, shr__frame *f) {
+ * whole screen is drawn, without moves. */
+static void take_damage(shr_context *ctx, shr__frame *f) {
     shr__target *t = f->target_rec >= 0 ? &ctx->targets[f->target_rec] : NULL;
     shr_rect full = {0, 0, ctx->screen.width, ctx->screen.height};
     f->damage.len = 0;
-    shr__damage d = {.rects = f->damage,
-                     .full = !t || !t->used || t->generation != f->target.generation || t->damage.full};
-    if (!d.full) {
+    shr__damage d = {.rects = f->damage};
+    bool whole = !t || !t->used || t->generation != f->target.generation;
+    if (!whole) {
         d.rects = t->damage.rects;
         t->damage.rects = f->damage;
         f->nmoves = t->damage.nmoves;
@@ -473,16 +472,10 @@ static bool take_damage(shr_context *ctx, shr__frame *f) {
     }
     int64_t area = 0;
     for (size_t i = 0; i < d.rects.len; i++) area += shr__rect_area(*SHR_VEC_AT(&d.rects, shr_rect, i));
-    if (d.full || area * 4 > shr__rect_area(full) * 3) {
-        d.rects.len = 0;
+    if (whole || area * 4 > shr__rect_area(full) * 3) {
+        d.rects.len = 1;
         f->nmoves = 0;
-        shr_rect *r = shr__vec_push(&d.rects, &ctx->al);
-        f->damage = d.rects;
-        if (!r) {
-            if (t) t->used = false;
-            return false;
-        }
-        *r = full;
+        *SHR_VEC_AT(&d.rects, shr_rect, 0) = full;
         area = shr__rect_area(full);
     }
     f->damage = d.rects;
@@ -493,7 +486,6 @@ static bool take_damage(shr_context *ctx, shr__frame *f) {
         t->damage.rects.len = t->provisional.len = 0;
     }
     f->took_damage = true;
-    return true;
 }
 
 /* A command whose fields the caller sets: those its kind reads. */
@@ -993,10 +985,7 @@ static void start_frame(shr_context *ctx) {
     }
     f->blink_visible = visible;
     f->target_rec = target_for(ctx, &f->target);
-    if (!take_damage(ctx, f)) {
-        frame_fail(ctx, SHR_E_NO_MEMORY);
-        return;
-    }
+    take_damage(ctx, f);
     if (!f->damage.len && !stale) { /* the output already shows this state; moves come with damage */
         shr_event ev = {.kind = SHR_EVENT_FRAME_SUPERSEDED, .frame_id = f->frame_id};
         shr__push_event(ctx, &ev);
@@ -1145,7 +1134,7 @@ static void progress(shr_context *ctx) {
 
 /* Automatic frames (blink, redraws, resolved fallbacks) wait while layer changes are not submitted. */
 static bool auto_allowed(const shr_context *ctx) {
-    return ctx->has_submitted && !ctx->failed && !ctx->staged.full && !ctx->staged.rects.len;
+    return ctx->has_submitted && !ctx->failed && !ctx->staged.rects.len;
 }
 
 static bool auto_due(const shr_context *ctx) {
@@ -1194,7 +1183,6 @@ shr_status shr_submit(shr_context *ctx) {
         shr__target *t = &ctx->targets[i];
         shr__damage *d = &t->damage;
         if (!t->used) continue;
-        d->full |= ctx->staged.full;
         for (uint32_t k = 0; k < ctx->staged.nmoves; k++) {
             shr__move m = ctx->staged.moves[k];
             shr__damage_move(ctx, d, m);
@@ -1207,7 +1195,6 @@ shr_status shr_submit(shr_context *ctx) {
             shr__damage_add(ctx, d, *SHR_VEC_AT(&ctx->staged.rects, shr_rect, k));
     }
     ctx->staged.rects.len = 0;
-    ctx->staged.full = false;
     ctx->staged.nmoves = 0;
     ctx->submitted = ctx->has_submitted = true;
     ctx->failed = false;

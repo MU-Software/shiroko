@@ -180,19 +180,23 @@ shr_status shr_create(const shr_context_desc *d, shr_context **out) {
     ctx->next_frame_id = 1;
     ctx->frame.target_rec = -1;
     atomic_init(&ctx->fence_state, 0);
+    bool lists = true;
     for (int i = 0; i < SHR_TARGETS; i++) {
-        SHR_VEC_INIT_HOT(&ctx->targets[i].damage.rects, shr_rect);
+        SHR_VEC_INIT(&ctx->targets[i].damage.rects, shr_rect);
         SHR_VEC_INIT_HOT(&ctx->targets[i].provisional, shr_rect);
+        lists &= shr__vec_reserve(&ctx->targets[i].damage.rects, &al, SHR_MAX_DAMAGE);
     }
-    SHR_VEC_INIT_HOT(&ctx->staged.rects, shr_rect);
+    SHR_VEC_INIT(&ctx->staged.rects, shr_rect);
     SHR_VEC_INIT_HOT(&ctx->frame.cmds, shr_draw_cmd);
-    SHR_VEC_INIT_HOT(&ctx->frame.damage, shr_rect);
+    SHR_VEC_INIT(&ctx->frame.damage, shr_rect);
     SHR_VEC_INIT_HOT(&ctx->frame.provisional, shr_rect);
     SHR_VEC_INIT_HOT(&ctx->frame.resolved, shr__res *);
     SHR_VEC_INIT_HOT(&ctx->frame.prologue, shr_draw_cmd);
     SHR_VEC_INIT_HOT(&ctx->frame.planned, shr__planned);
     SHR_VEC_INIT_HOT(&ctx->frame.kept, shr__kept);
     SHR_VEC_INIT_HOT(&ctx->frame.batches, shr__batch);
+    lists &= shr__vec_reserve(&ctx->staged.rects, &al, SHR_MAX_DAMAGE) &&
+             shr__vec_reserve(&ctx->frame.damage, &al, SHR_MAX_DAMAGE);
     ctx->io = shr__calloc(&al, ctx->nio, sizeof(shr__io), SHR_ALIGNOF(shr__io), SHR_ALLOC_DESCRIPTOR);
     ctx->events = shr__calloc(&al, ctx->event_cap, sizeof(shr_event), SHR_ALIGNOF(shr_event), SHR_ALLOC_DESCRIPTOR);
     ctx->unreleased = shr__calloc(&al, d->max_unreleased_frames, sizeof(uint64_t), 8, SHR_ALLOC_DESCRIPTOR);
@@ -208,7 +212,7 @@ shr_status shr_create(const shr_context_desc *d, shr_context **out) {
     ctx->keep_heads = SHR_NEW_HOT_ARRAY(&al, uint32_t, chains);
     ctx->seen = SHR_NEW_HOT_ARRAY(&al, shr__seen, (size_t)chains * 8);
     ctx->seen_mask = (size_t)chains * 8 - 1; /* 4-8 per keep */
-    if (!ctx->io || !ctx->events || !ctx->unreleased || !ctx->slots || !ctx->released || !ctx->keeps ||
+    if (!lists || !ctx->io || !ctx->events || !ctx->unreleased || !ctx->slots || !ctx->released || !ctx->keeps ||
         !ctx->keep_released || !ctx->keep_heads || !ctx->seen) {
         context_free(ctx);
         return SHR_E_NO_MEMORY;
@@ -249,7 +253,6 @@ void shr__targets_invalidate(shr_context *ctx) {
         shr__target *t = &ctx->targets[i];
         t->used = false;
         t->damage.rects.len = 0;
-        t->damage.full = false;
         t->damage.nmoves = 0;
         t->provisional.len = 0;
     }
@@ -262,7 +265,7 @@ static inline int32_t area32(shr_rect r) { return (r.x1 - r.x0) * (r.y1 - r.y0);
  * (at most 16384 x 16384 px) fit in 32 bits. */
 void shr__damage_add(const shr_context *ctx, shr__damage *d, shr_rect r) {
     r = shr__rect_intersect(r, (shr_rect){0, 0, ctx->screen.width, ctx->screen.height});
-    if (d->full || shr__rect_empty(r)) return;
+    if (shr__rect_empty(r)) return;
     shr_rect *v = d->rects.data;
     size_t best = 0;
     int32_t area = area32(r), best_growth = INT32_MAX;
@@ -279,11 +282,7 @@ void shr__damage_add(const shr_context *ctx, shr__damage *d, shr_rect r) {
         v[best] = shr__rect_union(v[best], r);
         return;
     }
-    shr_rect *p = shr__vec_push(&d->rects, &ctx->al);
-    if (p)
-        *p = r;
-    else
-        d->full = true;
+    v[d->rects.len++] = r;
 }
 
 void shr__moves_drop(const shr_context *ctx, shr__damage *d) {
