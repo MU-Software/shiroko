@@ -403,6 +403,7 @@ shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t fr
         r = n == 1 ? try_package(f, ROLE_BUILTIN, cps, 1, NULL, frame, &h) : GLYPH_MISSING;
         if (r == GLYPH_MISSING) r = try_package(f, ROLE_BUILTIN, &fffd, 1, NULL, frame, &h);
     }
+    if (r == GLYPH_MISSING) h = (hit){f->box_rec, &f->box, &f->pkg[ROLE_BUILTIN]}; /* no built-in package */
     if (r == GLYPH_BLANK) return SHR_E_NOT_FOUND; /* draws nothing: no page */
     const uint8_t *e = h.entry; /* found: the built-in package always has U+FFFD */
     shr__page *p = h.page;
@@ -421,11 +422,11 @@ shr_status shr__font_resolve(shr_pl_res_bitmap_font *f, uint64_t id, uint64_t fr
     out->offset = (shr_point){(int8_t)e[6], h.pkg->baseline - (int8_t)e[7]};
     /* Emoji and Nerd glyphs, and the glyphs that join their neighbours (box drawing, blocks, Braille, legacy
        computing, branch drawing), stay as drawn. */
-    bool plain = h.pkg->role == ROLE_EMOJI || h.pkg->role == ROLE_NERD || (base >= 0x2500 && base < 0x25A0) ||
+    bool plain = h.page == &f->box || h.pkg->role == ROLE_EMOJI || h.pkg->role == ROLE_NERD || (base >= 0x2500 && base < 0x25A0) ||
                  (base >= 0x2800 && base < 0x2900) || (base >= 0xF5D0 && base < 0xF60E) ||
                  (base >= 0x1CC00 && base < 0x1CEC0) || (base >= 0x1FB00 && base < 0x1FC00);
     out->synth = plain ? 0 : SHR_GLYPH_BOLD | SHR_GLYPH_ITALIC;
-    out->slant_axis = SHR_CELL_HEIGHT - 2 * out->offset.y;
+    out->slant_axis = f->ch - 2 * out->offset.y;
     return SHR_OK;
 }
 

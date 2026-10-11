@@ -268,7 +268,7 @@ TEST offscreen_backends_and_lifetime(void) {
     ASSERT_EQ_LL(shr_angle_offscreen_destroy(b), SHR_OK);
 
     shr_framebuffer_driver d;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, 4, &d), SHR_E_STATE);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, 4, 0, &d), SHR_E_STATE);
     PASS();
 }
 
@@ -278,19 +278,19 @@ SUITE(lifetime) { RUN_TEST(offscreen_backends_and_lifetime); }
 
 TEST driver_create_and_destroy(void) {
     shr_framebuffer_driver d;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, 4, NULL), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, 4, 0, NULL), SHR_E_INVALID_ARG);
     fail_alloc f = {-1, 0};
     shr_allocator half = fail_allocator(&f);
     half.free = NULL;
-    ASSERT_EQ_LL(shr_angle_driver_create(&half, 0, 0, 0, 4, &d), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_angle_driver_create(&half, 0, 0, 0, 4, 0, &d), SHR_E_INVALID_ARG);
     shr_allocator a = fail_allocator(&f);
     for (long budget = 0; budget < 6; budget++) { /* the driver, its buffer and keep tables, its instances */
         f.budget = budget;
-        ASSERT_EQ_LL(shr_angle_driver_create(&a, 0, 0, 0, 4, &d), SHR_E_NO_MEMORY);
+        ASSERT_EQ_LL(shr_angle_driver_create(&a, 0, 0, 0, 4, 0, &d), SHR_E_NO_MEMORY);
         ASSERT_EQ_LL(f.live, 0);
     }
     f.budget = -1;
-    ASSERT_EQ_LL(shr_angle_driver_create(&a, 1u << 20, 0, 0, 4, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(&a, 1u << 20, 0, 0, 4, 0, &d), SHR_OK);
     ASSERT_EQ_LL(d.caps.domains, SHR_MEMORY_CPU | SHR_MEMORY_DEVICE);
     ASSERT(d.caps.max_width >= 2048 && d.caps.max_width == d.caps.max_height);
     ASSERT_EQ_LL(d.caps.max_buffers, 4);
@@ -324,7 +324,7 @@ TEST driver_create_and_destroy(void) {
     ASSERT_EQ_LL(shr_angle_driver_stats(&sw, &st), SHR_E_INVALID_ARG);
     shr_software_driver_destroy(&sw);
     /* No buffer ids at all. */
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, 0, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, 0, 0, &d), SHR_OK);
     ASSERT_EQ_LL(d.execute(d.user, &cpu, c, 2, 0), SHR_E_INVALID_ARG);
     ASSERT_EQ_LL(shr_angle_driver_destroy(&d), SHR_OK);
     PASS();
@@ -531,7 +531,7 @@ TEST allocation_failures(void) {
     fail_alloc f = {-1, 0};
     shr_allocator a = fail_allocator(&f);
     shr_framebuffer_driver d;
-    ASSERT_EQ_LL(shr_angle_driver_create(&a, 1u << 20, 0, 0, IDS, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(&a, 1u << 20, 0, 0, IDS, 0, &d), SHR_OK);
     shr_surface s;
     f.budget = 0;
     ASSERT_EQ_LL(shr_angle_surface_create(&d, 8, 8, SHR_FORMAT_RGB565, &s), SHR_E_NO_MEMORY);
@@ -939,7 +939,7 @@ TEST rotations_map_exactly(void) {
 
 TEST scratch_textures_grow_in_either_direction(void) {
     shr_framebuffer_driver fresh;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, &fresh), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, 0, &fresh), SHR_OK);
     static const shr_rect areas[] = {{0, 0, 20, 2}, {0, 0, 2, 20}, {0, 0, 30, 5}};
     for (int i = 0; i < 3; i++) {
         shr_draw_cmd c = {.kind = SHR_CMD_FILL, .dst = areas[i], .color = rnd_color()};
@@ -979,7 +979,7 @@ static size_t probe(shr_draw_cmd *c, uint32_t id, shr_rect rect, int32_t x) {
 
 TEST buffers_register_update_replace_release(void) {
     shr_framebuffer_driver d;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, 0, &d), SHR_OK);
     enum { W = 15, H = 12 };
     uint8_t a8[H * W], old8[H * W], a4[H * 8], old4[H * 8];
     coverage_noise(a8, sizeof(a8)), coverage_noise(a4, sizeof(a4));
@@ -1068,7 +1068,7 @@ TEST buffers_register_update_replace_release(void) {
 /* Same-shape buffers share array textures: the first one alone, then 16 layers; freed layers are taken again. */
 TEST texture_arrays_are_shared_and_reused(void) {
     shr_framebuffer_driver d;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, 0, &d), SHR_OK);
     enum { W = 8, H = 16, N = 20 };
     static uint8_t px[N][H * W / 2];
     for (int i = 0; i < N; i++) coverage_noise(px[i], sizeof(px[i]));
@@ -1152,7 +1152,7 @@ TEST more_than_eight_textures_flush(void) {
 TEST budget_limits_registration(void) {
     enum { B = 3 * 16 * 16 };
     shr_framebuffer_driver d;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, B, 0, 0, IDS, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, B, 0, 0, IDS, 0, &d), SHR_OK);
     ASSERT_EQ_LL(d.caps.buffer_bytes, B);
     static uint8_t px[5][16 * 16];
     for (int i = 0; i < 5; i++) noise(px[i], sizeof(px[i]));
@@ -1178,7 +1178,7 @@ TEST budget_limits_registration(void) {
     ASSERT_EQ_LL(shr_angle_driver_destroy(&d), SHR_OK);
 
     /* Unlimited budget; buffers beyond the texture size or outside the domains. */
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, 0, &d), SHR_OK);
     ASSERT_EQ_LL(d.execute(d.user, &s, c, 4, 0), SHR_OK);
     int32_t wide = d.caps.max_buffer_width + 1;
     uint8_t *row = calloc((size_t)wide, 1);
@@ -1204,7 +1204,7 @@ TEST budget_limits_registration(void) {
 /* After an error the compositor registers again; that works whatever the error left registered. */
 TEST errors_then_registering_again(void) {
     shr_framebuffer_driver d;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 0, IDS, 0, &d), SHR_OK);
     uint8_t cov[9 * 6], px[16 * 8 * 2], before[sizeof(px)];
     coverage_noise(cov, sizeof(cov));
     noise(px, sizeof(px));
@@ -1477,7 +1477,7 @@ static void pair_open(pair *p, uint64_t keep_bytes, uint32_t keeps, shr_pixel_fo
     *p = (pair){.f = f, .w = w, .h = h, .device = device, .ref = malloc(len), .out = malloc(len)};
     noise(p->ref, len);
     memcpy(p->out, p->ref, len);
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, keep_bytes, keeps, IDS, &p->gl), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, keep_bytes, keeps, IDS, 0, &p->gl), SHR_OK);
     ASSERT_EQ_LL(shr_software_driver_create(NULL, keep_bytes, keeps, IDS, &p->sw), SHR_OK);
     p->rs = packed(p->ref, f, w, h);
     p->ds = device ? device_on(&p->gl, f, w, h, p->out) : packed(p->out, f, w, h);
@@ -1532,18 +1532,18 @@ static size_t keep_group(shr_draw_cmd *c, uint32_t id, shr_rect k, uint32_t i8, 
 
 TEST keep_caps_and_slot_textures(void) {
     shr_framebuffer_driver d;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 2, IDS, &d), SHR_E_INVALID_ARG);
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 255, 2, IDS, &d), SHR_E_INVALID_ARG); /* slots of 0 bytes */
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 0, 2, IDS, 0, &d), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 255, 2, IDS, 0, &d), SHR_E_INVALID_ARG); /* slots of 0 bytes */
     /* Slots of a whole layer: 256 layers at most, the layers an instance can name. Nothing is allocated yet. */
     uint64_t layer = 4ull * (uint64_t)gl.caps.max_width * (uint64_t)gl.caps.max_width;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 257 * layer, 257, IDS, &d), SHR_E_UNSUPPORTED);
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 256 * layer, 256, IDS, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 257 * layer, 257, IDS, 0, &d), SHR_E_UNSUPPORTED);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 256 * layer, 256, IDS, 0, &d), SHR_OK);
     ASSERT_EQ_LL(stats_of(&d).keep_texture_bytes, 0);
     ASSERT_EQ_LL(shr_angle_driver_destroy(&d), SHR_OK);
 
     enum { N = 6, KW = 48 };
     uint64_t bytes = N * row_slot(KW) + 100;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, bytes, N, IDS, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, bytes, N, IDS, 0, &d), SHR_OK);
     ASSERT(d.caps.max_keeps == N && d.caps.keep_bytes == bytes && d.caps.max_keep_bytes == row_slot(KW));
     ASSERT_EQ_LL(stats_of(&d).keep_texture_bytes, 0);
     /* Each destination format takes one texture for every slot at its first store, within keep_bytes. */
@@ -1639,7 +1639,7 @@ TEST keep_draws_are_exact(void) {
     uint32_t i8 = use(mem(cov, SHR_FORMAT_A8, 9, 6, 9)), ii = use(mem(rgba, SHR_FORMAT_RGBA8888, 7, 5, 28));
     EACH_TARGET(f, dev) {
         shr_framebuffer_driver d;
-        ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 2 * row_slot(KW), 2, IDS, &d), SHR_OK);
+        ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 2 * row_slot(KW), 2, IDS, 0, &d), SHR_OK);
         size_t len = (size_t)W * H * bpp(f);
         uint8_t *init = malloc(len), *a = malloc(len), *b = malloc(len);
         noise(init, len);
@@ -1751,6 +1751,27 @@ TEST keep_slots_by_id(void) {
     PASS();
 }
 
+/* Slots as tall as the cell height the driver is given (0: the build's): a row of taller cells fits only then. */
+TEST keep_slots_take_the_cell_height(void) {
+    enum { KW = 48, TH = KH + 8 };
+    const uint64_t slot = ((uint64_t)KW * TH * 4 + 127) / 128 * 128;
+    shr_framebuffer_driver d;
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, slot, 1, IDS, -1, &d), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, slot, 1, IDS, 128, &d), SHR_E_INVALID_ARG);
+    static uint8_t px[KW * TH * 4];
+    shr_surface s = packed(px, SHR_FORMAT_RGBX8888, KW, TH);
+    shr_draw_cmd c[] = {{.kind = SHR_CMD_KEEP_BEGIN, .dst = {0, 0, KW, TH}, .buffer = 1},
+                        {.kind = SHR_CMD_FILL, .dst = {0, 0, KW, TH}, .color = rnd_color()},
+                        {.kind = SHR_CMD_KEEP_END}};
+    for (int32_t ch = 0; ch <= TH; ch += TH) {
+        ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, slot, 1, IDS, ch, &d), SHR_OK);
+        ASSERT_EQ_LL(d.execute(d.user, &s, c, 3, 0), ch ? SHR_OK : SHR_E_NO_MEMORY);
+        ASSERT_EQ_LL(stats_of(&d).keep_stores, ch ? 1 : 0);
+        ASSERT_EQ_LL(shr_angle_driver_destroy(&d), SHR_OK);
+    }
+    PASS();
+}
+
 /* A GL error empties every keep and drops the slot texture; the next store makes it again. */
 TEST gl_errors_empty_the_keeps(void) {
     enum { KW = 16 };
@@ -1762,7 +1783,7 @@ TEST gl_errors_empty_the_keeps(void) {
     uint16_t px[KW * KH];
     shr_surface s = packed(px, SHR_FORMAT_RGB565, KW, KH);
     shr_framebuffer_driver d;
-    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 2 * row_slot(KW), 2, IDS, &d), SHR_OK);
+    ASSERT_EQ_LL(shr_angle_driver_create(NULL, 0, 2 * row_slot(KW), 2, IDS, 0, &d), SHR_OK);
     shr_draw_cmd c[] = {{.kind = SHR_CMD_KEEP_BEGIN, .dst = {0, 0, KW, KH}, .buffer = 1},
                         {.kind = SHR_CMD_FILL, .dst = {0, 0, KW, KH}, .color = SHR_RGB(10, 20, 30)},
                         {.kind = SHR_CMD_KEEP_END},
@@ -2026,6 +2047,7 @@ SUITE(driver) {
     RUN_TEST(lines_in_keep_groups_match);
     RUN_TEST(keep_draws_are_exact);
     RUN_TEST(keep_slots_by_id);
+    RUN_TEST(keep_slots_take_the_cell_height);
     RUN_TEST(gl_errors_empty_the_keeps);
     RUN_TEST(scene_matches_the_software_driver);
 }
@@ -2043,7 +2065,7 @@ int main(int argc, char **argv) {
     RUN_SUITE(lifetime);
     shr_angle_offscreen *off;
     if (shr_angle_offscreen_create(64, 64, &off) != SHR_OK ||
-        shr_angle_driver_create(NULL, 64u << 20, 0, 0, 256, &gl) != SHR_OK ||
+        shr_angle_driver_create(NULL, 64u << 20, 0, 0, 256, 0, &gl) != SHR_OK ||
         shr_software_driver_create(NULL, 0, 0, IDS, &swd) != SHR_OK)
         return EXIT_FAILURE;
     printf("GL_RENDERER: %s\n", (const char *)glGetString(GL_RENDERER));

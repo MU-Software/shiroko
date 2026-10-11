@@ -2,7 +2,7 @@
 
 _Static_assert(offsetof(shr__lcmd, end) + sizeof(size_t) <= offsetof(shr__lcmd, res) + sizeof(shr__res *),
                "a CACHE_BEGIN's end fits beside its key");
-_Static_assert(sizeof(shr__rcmd) == 20 && SHR_CELL_HEIGHT <= UINT8_MAX &&
+_Static_assert(sizeof(shr__rcmd) == 20 && SHR__CELL_MAX_H <= UINT8_MAX &&
                    (SHR__LCMD_DIM | SHR__LCMD_BOLD | SHR__LCMD_ITALIC | SHR__LCMD_ON_FILL | SHR__LCMD_BLINK) <= UINT8_MAX,
                "row commands hold row pixels and flags");
 
@@ -33,14 +33,14 @@ static shr_rect grow(shr_rect a, shr_rect r, bool take) {
 static shr_rect grown(shr_rect a) { return a.x0 < a.x1 ? a : (shr_rect){0, 0, 0, 0}; }
 static bool covers(shr_rect a, shr_rect b) { return (a.x0 <= b.x0) & (a.y0 <= b.y0) & (a.x1 >= b.x1) & (a.y1 >= b.y1); }
 
-/* The kind of command i of `g`, its dst in *dst. */
-static uint32_t cmd_at(const shr__group *g, size_t i, shr_rect *dst) {
-    if (g->compact) return *dst = shr__rcmd_dst(&g->rows[i]), g->rows[i].kind;
+/* The kind of command i of `g`, its dst in *dst (row commands in cells `cw` pixels wide). */
+static uint32_t cmd_at(const shr__group *g, size_t i, int32_t cw, shr_rect *dst) {
+    if (g->compact) return *dst = shr__rcmd_dst(&g->rows[i], cw), g->rows[i].kind;
     return *dst = g->cmds[i].dst, g->cmds[i].kind;
 }
 
 /* What commands [lo, hi) of `g` draw or cache, by whole blocks where they fit or add nothing. */
-static shr_rect span(const shr__group *g, size_t lo, size_t hi) {
+static shr_rect span(const shr__group *g, size_t lo, size_t hi, int32_t cw) {
     shr_rect u = nothing;
     for (size_t i = lo; i < hi; i++) {
         const shr_rect b = g->blocks[i / SHR__BLOCK];
@@ -49,7 +49,7 @@ static shr_rect span(const shr__group *g, size_t lo, size_t hi) {
             i = i / SHR__BLOCK * SHR__BLOCK + SHR__BLOCK - 1;
         } else {
             shr_rect d;
-            uint32_t kind = cmd_at(g, i, &d);
+            uint32_t kind = cmd_at(g, i, cw, &d);
             u = grow(u, d, (kind <= SHR__LCMD_LINE) | (kind == SHR__LCMD_CACHE_BEGIN));
         }
     }
@@ -280,6 +280,7 @@ static inline __attribute__((always_inline)) bool cmd_bad(uint32_t kind, uint32_
  * copied into the spare once it changes the group. */
 static shr_status group_set(shr_lyr *l, uint32_t id, int32_t oy, shr__group in) {
     const shr__alloc *al = &l->ctx->al;
+    const int32_t cw = l->ctx->cell.w;
     size_t pos = 0, end = l->groups.len, n = in.n, unit = unit_of(in.compact);
     while (pos < end) {
         size_t mid = pos + (end - pos) / 2;
@@ -314,7 +315,7 @@ static shr_status group_set(shr_lyr *l, uint32_t id, int32_t oy, shr__group in) 
         const shr__rcmd *r = in.compact ? &in.rows[i] : NULL;
         const shr__lcmd *c = in.compact ? NULL : &in.cmds[i];
         uint32_t kind = r ? r->kind : c->kind, flags = r ? r->flags : c->flags;
-        shr_rect dst = r ? shr__rcmd_dst(r) : c->dst;
+        shr_rect dst = r ? shr__rcmd_dst(r, cw) : c->dst;
         bool begin = kind == SHR__LCMD_CACHE_BEGIN, finish = kind == SHR__LCMD_CACHE_END;
         bool draw = kind <= SHR__LCMD_LINE, res_cmd = kind == SHR__LCMD_GLYPH || kind == SHR__LCMD_IMAGE;
         shr__res *res = !res_cmd ? NULL : r ? in.res : c->res;
@@ -350,18 +351,18 @@ static shr_status group_set(shr_lyr *l, uint32_t id, int32_t oy, shr__group in) 
     /* In the coordinates of the new commands. */
     while (same && ha > lo && hb > lo && cmd_equal(g, ha - 1, &in, hb - 1)) ha--, hb--;
     shr_rect run = same && ha == hb ? none
-                                    : grown(grow(shr__rect_move(span(g, lo, ha), 0, shr__clamp32((int64_t)g->oy - oy)),
-                                                 span(&in, lo, hb), true));
+                                    : grown(grow(shr__rect_move(span(g, lo, ha, cw), 0, shr__clamp32((int64_t)g->oy - oy)),
+                                                 span(&in, lo, hb, cw), true));
     int runs = 0;
     for (size_t i = lo; same && ha == hb && i < ha; i++) {
         if (cmd_equal(g, i, &in, i)) continue;
         if (runs == GROUP_RUNS) {
-            run = shr__rect_union(run, grown(grow(span(g, i, ha), span(&in, i, hb), true)));
+            run = shr__rect_union(run, grown(grow(span(g, i, ha, cw), span(&in, i, hb, cw), true)));
             break;
         }
         shr_rect parts[2];
-        if (cmd_at(g, i, &parts[0]) > SHR__LCMD_LINE) parts[0] = none;
-        if (cmd_at(&in, i, &parts[1]) > SHR__LCMD_LINE) parts[1] = none;
+        if (cmd_at(g, i, cw, &parts[0]) > SHR__LCMD_LINE) parts[0] = none;
+        if (cmd_at(&in, i, cw, &parts[1]) > SHR__LCMD_LINE) parts[1] = none;
         for (int k = 0; k < 2; k++) {
             shr_rect u = shr__rect_union(run, parts[k]);
             if (shr__rect_area(u) > shr__rect_area(run) + shr__rect_area(parts[k]))
@@ -537,7 +538,7 @@ void shr__res_changed(shr__res *res, shr_rect area) {
             const shr__group *g = SHR_VEC_AT(&l->groups, shr__group, gi);
             if (g->res ? g->res != res : !g->uses) continue;
             for (size_t i = 0; i < g->n; i++) {
-                const shr__lcmd c = shr__group_cmd(g, i);
+                const shr__lcmd c = shr__group_cmd(g, i, ctx->cell.w);
                 if (!uses_res(&c) || c.res != res) continue;
                 shr_point at = shr__group_at(l, g);
                 shr_rect r = shr__rect_intersect(shr__rect_move(area, c.anchor.x, c.anchor.y), c.dst);

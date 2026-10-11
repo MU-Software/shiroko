@@ -104,9 +104,14 @@ struct shr_pl_res_bitmap_font {
     void *user;
     shr_status (*open)(void *user, const char *package, shr_asset_source *out);
     const char *locale;
+    int32_t cw, ch; /* the context's cell size */
     uint64_t cache_bytes, retry_ns;
     uint32_t retry_limit;
     shr__pkg pkg[ROLE_COUNT];
+    /* At another cell size than the build's: the box drawn in place of the built-in package's glyphs. */
+    shr__page_slot box_slot;
+    shr__page box;
+    uint8_t box_rec[16];
     shr__lru_node *lru, *pinned; /* resident pages without and with pins */
     uint64_t page_bytes;
     uint64_t wake;     /* bumped when a read ends or cache space frees up */

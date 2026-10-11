@@ -6,6 +6,7 @@ static bool has_async(const shr__pkg *pkg) { return !pkg->ix.mapped && pkg->src.
 
 static void font_free(shr_pl_res_bitmap_font *f) {
     for (int r = 0; r < ROLE_COUNT; r++) shr__pkg_release(&f->pkg[r]);
+    if (f->box.slot) shr__buf_free(f->res.ctx, &f->box_slot.buf);
     shr__zfree(f);
     shr__vec_free(&f->wants, &f->al);
     shr__vec_free(&f->clusters, &f->al);
@@ -128,6 +129,25 @@ static void op_free(shr__res *res) { font_free(font_of(res)); }
 static const shr__res_ops font_ops = {op_resolve, op_fallback, op_frame_end, op_pump, op_has_work, op_deadline,
                                       op_io_done, op_shutdown, op_free};
 
+/* A hollow box inside the cell, 1 pixel in from its sides, its stroke as thick as fontpack's generated box glyphs draw
+ * light lines for the shipped Latin face (underline 90 / advance 1233 font units at cw pixels a cell). */
+static shr_status box_make(shr_pl_res_bitmap_font *f) {
+    int32_t cw = f->cw, ch = f->ch, t = (cw * 90 + 1232) / 1233;
+    shr__buf *b = &f->box_slot.buf;
+    shr_status st = shr__buf_alloc(f->res.ctx, SHR_FORMAT_A8, cw, ch, b);
+    if (st != SHR_OK) return st;
+    uint8_t *px = (uint8_t *)b->mem.pixels;
+    for (int32_t y = 0; y < ch; y++)
+        for (int32_t x = 0; x < cw; x++) {
+            bool side = x >= 1 && x < cw - 1, edge = y < t || y >= ch - t || x < 1 + t || x >= cw - 1 - t;
+            px[(size_t)y * b->mem.stride + (size_t)x] = side && edge ? 255 : 0;
+        }
+    shr__buf_changed(b, (shr_rect){0, 0, cw, ch});
+    f->box_rec[4] = (uint8_t)cw, f->box_rec[5] = (uint8_t)ch;
+    f->box = (shr__page){.pkg = &f->pkg[ROLE_BUILTIN], .slot = &f->box_slot, .recs = f->box_rec, .state = PAGE_READY};
+    return SHR_OK;
+}
+
 shr_status shr_pl_res_bitmap_font_desc_init(shr_pl_res_bitmap_font_desc *desc) {
     if (!desc) return SHR_E_INVALID_ARG;
     *desc = (shr_pl_res_bitmap_font_desc){0};
@@ -162,12 +182,20 @@ shr_status shr_pl_res_bitmap_font_create(shr_context *ctx, const shr_pl_res_bitm
     SHR_VEC_INIT(&f->clusters, shr__cluster);
     SHR_VEC_INIT(&f->pool, uint32_t);
     for (int r = 0; r < ROLE_COUNT; r++) f->pkg[r] = (shr__pkg){.font = f, .role = (uint8_t)r};
+    const shr__cell_info *cell = shr__ctx_cell(ctx);
+    f->cw = cell->w, f->ch = cell->h;
     shr__pkg *builtin = &f->pkg[ROLE_BUILTIN];
-    builtin->src.data = shr__builtin_package;
-    builtin->src.size = shr__builtin_package_size;
     const char *why;
-    shr_status st = shr__pkg_map(builtin, &why); /* checked by the build: stored, used in place */
-    if (st == SHR_OK) st = shr__pages_builtin(builtin);
+    shr_status st;
+    if (f->cw == SHR_CELL_WIDTH && f->ch == SHR_CELL_HEIGHT) {
+        builtin->src.data = shr__builtin_package;
+        builtin->src.size = shr__builtin_package_size;
+        st = shr__pkg_map(builtin, &why); /* checked by the build: stored, used in place */
+        if (st == SHR_OK) st = shr__pages_builtin(builtin);
+    } else {
+        builtin->state = PKG_ABSENT;
+        st = box_make(f);
+    }
     if (st != SHR_OK) {
         font_free(f);
         return st;

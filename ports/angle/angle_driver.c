@@ -492,11 +492,11 @@ static shr_status gl_status(gl_drv *g) {
     return SHR_E_DEVICE;
 }
 
-/* Slots of `bytes` (P texels) are sw x sh texels, sh at least SHR_CELL_HEIGHT where P allows, so a row of cells
+/* Slots of `bytes` (P texels) are sw x sh texels, sh at least the cell height `ch` where P allows, so a row of cells
  * whose bytes fit fits as it is. They stack in as few columns as fit, so up to cols - 1 go unused. False when they
  * take more than `max_layers` layers. */
-static bool atlas_init(atlas *a, int kind, uint64_t bytes, uint32_t n, int32_t max, uint32_t max_layers) {
-    uint64_t p = bytes / tex_formats[kind].bpp, w = p / SHR_CELL_HEIGHT, m = (uint64_t)max;
+static bool atlas_init(atlas *a, int kind, uint64_t bytes, int32_t ch, uint32_t n, int32_t max, uint32_t max_layers) {
+    uint64_t p = bytes / tex_formats[kind].bpp, w = p / (uint64_t)ch, m = (uint64_t)max;
     a->sw = (int32_t)(w < 1 ? 1 : w > m ? m : w);
     a->sh = (int32_t)(p / (uint64_t)a->sw > m ? m : p / (uint64_t)a->sw);
     uint64_t rows = m / (uint64_t)a->sh, cols = m / (uint64_t)a->sw, layers = (n + rows * cols - 1) / (rows * cols);
@@ -940,12 +940,15 @@ static void setup(gl_drv *g) {
 }
 
 shr_status shr_angle_driver_create(const shr_allocator *allocator, uint64_t texture_cache_bytes, uint64_t keep_bytes,
-                                   uint32_t max_keeps, uint32_t max_buffers, shr_framebuffer_driver *out) {
+                                   uint32_t max_keeps, uint32_t max_buffers, int32_t cell_height,
+                                   shr_framebuffer_driver *out) {
     if (!out) return SHR_E_INVALID_ARG;
     memset(out, 0, sizeof(*out));
     uint64_t keep_slot = max_keeps ? keep_bytes / max_keeps / 128 * 128 : 0;
     shr__alloc al;
-    if (!shr__alloc_init(&al, allocator) || (max_keeps && !keep_slot)) return SHR_E_INVALID_ARG;
+    if (!shr__alloc_init(&al, allocator) || (max_keeps && !keep_slot) || cell_height < 0 || cell_height > 127)
+        return SHR_E_INVALID_ARG;
+    int32_t ch = cell_height ? cell_height : SHR_CELL_HEIGHT;
     EGLContext context = eglGetCurrentContext();
     if (context == EGL_NO_CONTEXT) return SHR_E_STATE;
     gl_drv *g = SHR_NEW(&al, gl_drv);
@@ -973,7 +976,7 @@ shr_status shr_angle_driver_create(const shr_allocator *allocator, uint64_t text
     }
     uint32_t max_layers = layers < 256 ? (uint32_t)layers : 256; /* inst.layer */
     for (int k = TEX_RGBA8; k < TEX_KINDS; k++) /* the destination kinds */
-        if (max_keeps && !atlas_init(&g->atlas[k], k, keep_slot, max_keeps, g->max, max_layers)) {
+        if (max_keeps && !atlas_init(&g->atlas[k], k, keep_slot, ch, max_keeps, g->max, max_layers)) {
             teardown(g);
             return SHR_E_UNSUPPORTED;
         }

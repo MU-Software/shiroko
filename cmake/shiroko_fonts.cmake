@@ -62,7 +62,7 @@ add_custom_command(OUTPUT ${_builtin}
   COMMAND ${SHIROKO_FONTPACK} builtin --cell ${_cell} --out ${_builtin}
   DEPENDS ${SHIROKO_FONT_DEPS} WORKING_DIRECTORY ${_src} VERBATIM
   COMMENT "Baking the built-in font package (${_cell})")
-target_sources(shiroko_pl_res_bitmap_font PRIVATE ${_builtin})
+target_sources(shiroko_shared PRIVATE ${_builtin})
 add_dependencies(shiroko_pl_res_bitmap_font shiroko_unicode_tables)
 
 set(_fonts ${CMAKE_BINARY_DIR}/fonts)

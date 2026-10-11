@@ -106,13 +106,14 @@ if(SHIROKO_COVERAGE)
   add_link_options(-fprofile-instr-generate)
 endif()
 
-set(SHIROKO_CELL_WIDTH 8 CACHE STRING "Cell width in pixels baked into fonts and text (6..64)")
-set(SHIROKO_CELL_HEIGHT 16 CACHE STRING "Cell height (line height) in pixels (8..127)")
-# Glyph records hold a wide glyph (2 cells) and its bearing in a byte and an i8.
+set(SHIROKO_CELL_WIDTH 8 CACHE STRING "Default cell width in pixels, baked into the built-in package (6..32)")
+set(SHIROKO_CELL_HEIGHT 16 CACHE STRING "Default cell height (line height) in pixels (8..127)")
+# Glyph records hold a wide glyph (2 cells) and its bearing in a byte and an i8; line patterns are a cell wide
+# (SHR_LINE_MAX_PERIOD 32).
 # fontpack's generated glyphs need at least 6x8; fontpack also rejects a height below the Latin face's baseline.
-if(NOT SHIROKO_CELL_WIDTH MATCHES "^[1-9][0-9]?$" OR SHIROKO_CELL_WIDTH LESS 6 OR SHIROKO_CELL_WIDTH GREATER 64 OR
+if(NOT SHIROKO_CELL_WIDTH MATCHES "^[1-9][0-9]?$" OR SHIROKO_CELL_WIDTH LESS 6 OR SHIROKO_CELL_WIDTH GREATER 32 OR
    NOT SHIROKO_CELL_HEIGHT MATCHES "^[1-9][0-9]*$" OR SHIROKO_CELL_HEIGHT LESS 8 OR SHIROKO_CELL_HEIGHT GREATER 127)
-  message(FATAL_ERROR "SHIROKO_CELL_WIDTH must be in 6..64 and SHIROKO_CELL_HEIGHT in 8..127")
+  message(FATAL_ERROR "SHIROKO_CELL_WIDTH must be in 6..32 and SHIROKO_CELL_HEIGHT in 8..127")
 endif()
 set(SHIROKO_PIXEL_FORMAT RGB565 CACHE STRING "Screen pixel format: RGB565 or RGBX8888")
 set_property(CACHE SHIROKO_PIXEL_FORMAT PROPERTY STRINGS RGB565 RGBX8888)
@@ -165,7 +166,7 @@ include(GNUInstallDirs)
 set(SHIROKO_GENERATED_DIR "" CACHE PATH "Pre-generated shr_gen_*.c (skips the uv generators and font packages)")
 if(SHIROKO_GENERATED_DIR)
   target_sources(shiroko_shared PRIVATE ${SHIROKO_GENERATED_DIR}/shr_gen_unicode_tables.c)
-  target_sources(shiroko_pl_res_bitmap_font PRIVATE ${SHIROKO_GENERATED_DIR}/shr_gen_builtin_package.c)
+  target_sources(shiroko_shared PRIVATE ${SHIROKO_GENERATED_DIR}/shr_gen_builtin_package.c)
 else()
   include(cmake/shiroko_fonts.cmake)
 endif()

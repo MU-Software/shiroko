@@ -410,7 +410,7 @@ static const shr__lcmd *cmd(const shr_lyr *l, int32_t row, size_t i) {
     static unsigned next;
     ASSERT_EQ_LL(i < ncmds(l, row), 1);
     shr__lcmd *c = &ring[next++ % 8];
-    *c = shr__group_cmd(group_of(l, row), i);
+    *c = shr__group_cmd(group_of(l, row), i, l->ctx->cell.w);
     return c;
 }
 
@@ -1011,7 +1011,7 @@ TEST background_paints_cells_without_their_own(void) {
 
 TEST row_commands_follow_cell_styles(void) {
     shr_lyr *l = open_grid(3, 8, NULL);
-    const shr__line_metrics lm = shr__bitmap_font_line_metrics();
+    const shr__line_metrics lm = shr__ctx_cell(H.ctx)->lines;
     shr__res *res = shr__bitmap_font_res(H.font);
     uint32_t all = SHR_STYLE_BLINK | SHR_STYLE_BOLD | SHR_STYLE_ITALIC;
     ASSERT_EQ_LL(set_cell(l, 0, 1, "A", 1, (shr_text_style){HALF(RED), BLUE, all}), SHR_OK);
@@ -1070,7 +1070,7 @@ TEST row_commands_follow_cell_styles(void) {
 /* Each shape's band: one row for single and dashed, three for double and dotted, the wave below an underline. */
 TEST lines_take_the_bands_of_their_shapes(void) {
     shr_lyr *l = open_grid(1, 8, NULL);
-    const shr__line_metrics lm = shr__bitmap_font_line_metrics();
+    const shr__line_metrics lm = shr__ctx_cell(H.ctx)->lines;
     int32_t amp = CW * 113 / 355 < CH - lm.baseline - 1 ? CW * 113 / 355 : CH - lm.baseline - 1;
     const struct {
         uint8_t kind, shape;
@@ -1502,7 +1502,7 @@ static bool cell_lit(const uint8_t *buf, int32_t row, int32_t col) {
 
 TEST frames_show_backgrounds_glyphs_and_lines(void) {
     shr_lyr *l = open_grid(3, 8, NULL);
-    const shr__line_metrics lm = shr__bitmap_font_line_metrics();
+    const shr__line_metrics lm = shr__ctx_cell(H.ctx)->lines;
     ASSERT_EQ_LL(set_cell(l, 0, 0, "", 1, on_blue), SHR_OK);
     ASSERT_EQ_LL(set_cell(l, 0, 1, "A", 1, plain), SHR_OK);
     const shr_text_line lines[3] = {{0, 1, SHR_LINE_UNDER, SHR_LINE_SINGLE, 0, WHITE},
@@ -1694,7 +1694,7 @@ static void assert_same_rows(const shr_lyr *a, const shr_lyr *b) {
         ASSERT_EQ_LL(ga->id, gb->id);
         ASSERT_EQ_LL(ga->n, gb->n);
         for (size_t k = 0; k < ga->n; k++) {
-            const shr__lcmd xa = shr__group_cmd(ga, k), ya = shr__group_cmd(gb, k), *x = &xa, *y = &ya;
+            const shr__lcmd xa = shr__group_cmd(ga, k, CW), ya = shr__group_cmd(gb, k, CW), *x = &xa, *y = &ya;
             ASSERT_EQ_LL(x->kind, y->kind);
             ASSERT_EQ_LL(x->flags, y->flags);
             ASSERT_EQ_LL(memcmp(&x->dst, &y->dst, sizeof(x->dst)), 0);

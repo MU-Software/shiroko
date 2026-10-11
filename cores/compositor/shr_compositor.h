@@ -6,6 +6,7 @@
 #include "shr_alloc.h"
 #include "shr_err.h"
 #include "shr_lru.h"
+#include "shr_package.h"
 #include "shr_rect.h"
 #include "shr_vec.h"
 
@@ -15,6 +16,14 @@ const shr__alloc *shr__ctx_alloc(const shr_context *ctx);
 /* The descriptor given to shr_create() (budgets, retry policy); pointers in it are not kept. */
 const shr_context_desc *shr__ctx_desc(const shr_context *ctx);
 uint32_t shr__ctx_driver_flags(const shr_context *ctx); /* the caps flags shr_create() read */
+/* The cell sizes a context takes: width up to SHR_LINE_MAX_PERIOD. */
+enum { SHR__CELL_MIN_W = 6, SHR__CELL_MIN_H = 8, SHR__CELL_MAX_H = 127 };
+/* The cell size, fixed at shr_create(), and the line positions of its Latin instance. */
+typedef struct shr__cell_info {
+    int32_t w, h;
+    shr__line_metrics lines;
+} shr__cell_info;
+const shr__cell_info *shr__ctx_cell(const shr_context *ctx);
 uint64_t shr__ctx_now(const shr_context *ctx); /* 0 without a clock */
 uint64_t shr__sat_add(uint64_t a, uint64_t b); /* deadlines: UINT64_MAX on overflow */
 /* Bumped by shr_asset_ready(): read it before a read or open, retry what a source refused once it changed. */

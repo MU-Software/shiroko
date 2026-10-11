@@ -86,7 +86,7 @@ SHAPE_SIDES = (64, 128, 256, 512)
 MAX_PAGE_RECORDS = 4096
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 ZSTD_WINDOW = 1 << 18
-MAX_CELL = (64, 127)  # glyph records: u8 width/height, i8 bearing/top for glyphs up to two cells wide
+MAX_CELL = (32, 127)  # line patterns a cell wide (SHR_LINE_MAX_PERIOD); i8 bearing/top for glyphs up to two cells wide
 MIN_CELL = (6, 8)  # smaller cells leave generated glyphs empty (eighth strips at width 5) or merge their strokes
 SHAPING = {"direction": "ltr", "language": "und"}  # script per role; default features only
 # Glyph order (--order hot): hot tiers first, each in scalar order, so the glyphs of everyday text share few pages.

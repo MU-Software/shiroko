@@ -699,7 +699,7 @@ TEST test_builtin_without_packages(void) {
         ASSERT_EQ_LL(load(ctx, f, ' ', &a), SHR_E_NOT_FOUND); /* blank: nothing to draw */
     }
     ASSERT_EQ_LL(l.opens, 3); /* latin, CJK and symbols, each asked once */
-    shr__line_metrics lm = shr__bitmap_font_line_metrics();
+    shr__line_metrics lm = shr__ctx_cell(ctx)->lines;
     ASSERT(lm.baseline > 0 && lm.baseline <= CH && lm.underline_y < CH && lm.strike_y < lm.baseline);
     ASSERT_EQ_LL(shr__bitmap_font_res(fonts[0])->ops->has_work(shr__bitmap_font_res(fonts[0])), false);
     h.font = fonts[0];
@@ -3236,16 +3236,16 @@ TEST test_package_info(void) {
     shr__pkg_desc desc;
     const char *why;
     ASSERT_EQ_LL(shr__pkg_describe(&builtin, &desc, &why), SHR_OK);
-    shr__line_metrics lm = shr__bitmap_font_line_metrics();
     ASSERT(desc.role == ROLE_LATIN && desc.cell_width == CW && desc.line_height == CH &&
            (desc.format == SY_A4 || desc.format == SY_A8) && desc.page_width >= 64 && desc.page_height >= 64 && !why);
-    ASSERT(desc.lines.baseline == lm.baseline && desc.lines.underline_y == lm.underline_y &&
-           desc.lines.strike_y == lm.strike_y);
 
     static sy_raw r;
     static spkg d;
     harness h;
     shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
+    shr__line_metrics lm = shr__ctx_cell(ctx)->lines; /* a context of the build's size takes the built-in's */
+    ASSERT(desc.lines.baseline == lm.baseline && desc.lines.underline_y == lm.underline_y &&
+           desc.lines.strike_y == lm.strike_y);
     sy_init(&r, ROLE_LATIN, "", 'A', 'B', SY_A4); /* another cell size: described, but no font takes it */
     put(r.box[BOX_INST] + 4, CH + 2, 2), put(r.box[BOX_INST] + 6, CW + 1, 2);
     assemble(&d, &r, SY_STORED);

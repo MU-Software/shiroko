@@ -78,10 +78,10 @@ static const backend software = {"software",         sw_driver_create, shr_softw
 
 #ifdef SHR_RENDER_ANGLE
 static shr_status angle_driver_create(shr_framebuffer_driver *out) {
-    return shr_angle_driver_create(NULL, 0, 0, 0, 256, out);
+    return shr_angle_driver_create(NULL, 0, 0, 0, 256, 0, out);
 }
 static shr_status angle_keeps_create(shr_framebuffer_driver *out) {
-    return shr_angle_driver_create(NULL, 0, 128ull * KEEP_SLOT, 128, 256, out);
+    return shr_angle_driver_create(NULL, 0, 128ull * KEEP_SLOT, 128, 256, 0, out);
 }
 static void angle_finish(void) { glFinish(); }
 static const backend angle = {"angle",

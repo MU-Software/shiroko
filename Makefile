@@ -290,7 +290,7 @@ tab5-host: $(FETCHED)
 	cmake -S . -B $(TAB5_HOST) $(CMAKE_TAB5) -DCMAKE_BUILD_TYPE=Release -DSHIROKO_ZSTD=OFF \
 	    -DSHIROKO_BUILD_TESTS=OFF -DSHIROKO_BUILD_EXAMPLES=OFF \
 	    $(if $(filter ON,$(TAB5_ZSTD)),-DVCPKG_OVERLAY_PORTS=$(CURDIR)/cmake/ports -DVCPKG_MANIFEST_FEATURES=zstd-source)
-	cmake --build $(TAB5_HOST) --target shiroko_unicode_tables shiroko_pl_res_bitmap_font
+	cmake --build $(TAB5_HOST) --target shiroko_unicode_tables shiroko_shared shiroko_pl_res_bitmap_font
 	$(UV) tools/fontpack/fontpack.py build --cell $(TAB5_CELL) --out $(TAB5_HOST)/fonts --method $(if $(filter ON,$(TAB5_ZSTD)),zstd,stored) \
 	    --page-atlas 64x512 latin cjk-ko symbols emoji nerd
 

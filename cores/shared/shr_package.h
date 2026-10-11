@@ -61,6 +61,10 @@ typedef struct shr__pkg_desc {
     shr__line_metrics lines;
 } shr__pkg_desc;
 
+/* The built-in package (ASCII + U+FFFD), baked by the build into the library for SHR_CELL_WIDTH x SHR_CELL_HEIGHT. */
+extern const uint8_t shr__builtin_package[];
+extern const size_t shr__builtin_package_size;
+
 /* The metadata box types, 4 characters each by BOX_. */
 extern const char shr__box_types[];
 

@@ -78,6 +78,8 @@ typedef struct shr_trace_event {
     uint64_t value0, value1;
 } shr_trace_event;
 
+struct shr_asset_source;
+
 typedef struct shr_context_desc {
     const shr_allocator *allocator; /* its flags may ask for SHR_ALLOC_HOT: memory used every frame */
     void *user; /* passed to now_ns, log and trace */
@@ -108,10 +110,24 @@ typedef struct shr_context_desc {
     uint64_t min_frame_interval_ns;
     void (*log)(void *user, shr_status status, const char *message);
     void (*trace)(void *user, const shr_trace_event *event);
+    /* The cell size of tilemaps and font packages for the context's lifetime: width 6..SHR_LINE_MAX_PERIOD, height
+     * 8..127; 0 x 0 = SHR_CELL_WIDTH x SHR_CELL_HEIGHT, the size the built-in package is baked for. */
+    uint32_t cell_width, cell_height;
+    /* Needed at another cell size, where the built-in package is not used: shr_create() opens "shiroko-latin.shrf"
+     * with it, checks its header, index and instance as shr_pl_res_bitmap_font_package_info() does, and closes it.
+     * Fonts must then open the same package. Glyphs whose pages are not ready or failed draw a box the size of a
+     * cell. Runs as a host callback, with `user`. */
+    shr_status (*open)(void *user, const char *package, struct shr_asset_source *out);
 } shr_context_desc;
 
 shr_status shr_context_desc_init(shr_context_desc *desc);
+/* SHR_E_INVALID_ARG for a bad descriptor (also a cell size out of range, or another size without open()). At another
+ * cell size than the build's, also open()'s error, or the error the Latin package gives as
+ * shr_pl_res_bitmap_font_package_info() describes, SHR_E_FORMAT when it is not a Latin package and
+ * SHR_E_UNSUPPORTED when it has no instance for the size; log() receives the reason. */
 shr_status shr_create(const shr_context_desc *desc, shr_context **out_ctx);
+/* The context's cell size; either may be NULL. */
+shr_status shr_cell_size_get(const shr_context *ctx, int32_t *width, int32_t *height);
 shr_status shr_begin_shutdown(shr_context *ctx);
 /* Begins shutdown if needed, then frees the context. SHR_E_WOULD_BLOCK while work, reads or presented
  * frames are outstanding (keep pumping) or while layers or resources of the context are alive. */
@@ -302,7 +318,7 @@ shr_status shr_pl_res_image_view(shr_pl_res_image *image, shr_rect src, int32_t 
                                  shr_pl_res_image **out);
 
 /* ===== Bitmap font resource =====
- * Packages are baked for SHR_CELL_WIDTH x SHR_CELL_HEIGHT and opened on demand. */
+ * Packages are baked for one cell size and opened on demand; a font draws with those of its context's cell size. */
 
 /* Bounded byte-range reads of one package. With `data` the package is mapped in memory for the
  * resource's lifetime and read() is not used. read(): SHR_OK = `dst` is filled before returning;
@@ -386,7 +402,7 @@ typedef struct shr_package_info {
 shr_status shr_pl_res_bitmap_font_package_info(const shr_asset_source *source, shr_package_info *out);
 
 /* ===== Tilemap layer =====
- * A grid of SHR_CELL_WIDTH x SHR_CELL_HEIGHT cells in a layer, updated cell by cell. */
+ * A grid of cells of the context's cell size in a layer, updated cell by cell. */
 
 enum {
     SHR_STYLE_BOLD = 1u << 0,

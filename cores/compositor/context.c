@@ -3,6 +3,7 @@
 const shr__alloc *shr__ctx_alloc(const shr_context *ctx) { return &ctx->al; }
 const shr_context_desc *shr__ctx_desc(const shr_context *ctx) { return &ctx->desc; }
 uint32_t shr__ctx_driver_flags(const shr_context *ctx) { return ctx->driver.caps.flags; }
+const shr__cell_info *shr__ctx_cell(const shr_context *ctx) { return &ctx->cell; }
 uint64_t shr__ctx_now(const shr_context *ctx) { return ctx->desc.now_ns ? ctx->desc.now_ns(ctx->desc.user) : 0; }
 bool shr__ctx_refused(const shr_context *ctx) { return ctx->shutting_down || ctx->in_callback; }
 
@@ -151,6 +152,39 @@ static void context_free(shr_context *ctx) {
     SHR_DELETE(&al, ctx, shr_context);
 }
 
+shr_status shr_cell_size_get(const shr_context *ctx, int32_t *width, int32_t *height) {
+    if (!ctx) return SHR_E_INVALID_ARG;
+    if (width) *width = ctx->cell.w;
+    if (height) *height = ctx->cell.h;
+    return SHR_OK;
+}
+
+/* The cell size and its line positions: from the built-in package at the build's size, else from the Latin package
+ * open() gives, read now (before the context exists, so its callbacks cannot call back into it). */
+static shr_status cell_get(const shr_context_desc *d, shr__cell_info *out) {
+    int32_t w = d->cell_width ? (int32_t)d->cell_width : SHR_CELL_WIDTH;
+    int32_t h = d->cell_height ? (int32_t)d->cell_height : SHR_CELL_HEIGHT;
+    bool built = w == SHR_CELL_WIDTH && h == SHR_CELL_HEIGHT;
+    if (!d->cell_width != !d->cell_height || d->cell_width > SHR_LINE_MAX_PERIOD || d->cell_height > SHR__CELL_MAX_H ||
+        w < SHR__CELL_MIN_W || h < SHR__CELL_MIN_H || (!built && !d->open))
+        return SHR_E_INVALID_ARG;
+    shr_asset_source src = {.data = shr__builtin_package, .size = shr__builtin_package_size};
+    shr__pkg_desc pd = {0};
+    const char *why = "font package open failed";
+    shr_status st = built ? SHR_OK : d->open(d->user, "shiroko-latin.shrf", &src);
+    if (st == SHR_OK) {
+        st = shr__pkg_describe(&src, &pd, &why);
+        if (st == SHR_OK && pd.role != ROLE_LATIN)
+            st = SHR_E_FORMAT, why = "package role or locale differs from its file name";
+        else if (st == SHR_OK && (pd.cell_width != w || pd.line_height != h))
+            st = SHR_E_UNSUPPORTED, why = "no instance for the cell size";
+        if (src.close) src.close(src.user);
+    }
+    if (st != SHR_OK && d->log) d->log(d->user, st, why);
+    *out = (shr__cell_info){w, h, pd.lines};
+    return st;
+}
+
 shr_status shr_create(const shr_context_desc *d, shr_context **out) {
     shr__alloc al;
     if (out) *out = NULL;
@@ -165,11 +199,15 @@ shr_status shr_create(const shr_context_desc *d, shr_context **out) {
         !shr__alloc_init(&al, d->allocator))
         return SHR_E_INVALID_ARG;
     if (d->max_reads > 0xFFFF) return SHR_E_LIMIT;
+    shr__cell_info cell;
+    shr_status cst = cell_get(d, &cell);
+    if (cst != SHR_OK) return cst;
     shr_context *ctx = SHR_NEW(&al, shr_context);
     if (!ctx) return SHR_E_NO_MEMORY;
     ctx->al = al;
     ctx->dma_alloc = d->allocator && d->allocator->alloc;
     ctx->desc = *d;
+    ctx->cell = cell;
     ctx->desc.allocator = NULL, ctx->desc.driver = NULL, ctx->desc.output = NULL;
     if (ctx->desc.io_retry_limit > 0xFFFF) ctx->desc.io_retry_limit = 0xFFFF;
     ctx->driver = *drv;
@@ -364,9 +402,8 @@ shr_status shr_screen_configure(shr_context *ctx, const shr_screen_desc *d) {
     shr__vec cmds;
     SHR_VEC_INIT(&cmds, shr_draw_cmd);
     cmds.kind = SHR__HOT;
-    size_t cells = d->band_count ? (size_t)((d->width + SHR_CELL_WIDTH - 1) / SHR_CELL_WIDTH) *
-                                       (size_t)((d->bands[0].height + SHR_CELL_HEIGHT - 1) / SHR_CELL_HEIGHT)
-                                 : 0;
+    int32_t cw = ctx->cell.w, ch = ctx->cell.h;
+    size_t cells = d->band_count ? (size_t)((d->width + cw - 1) / cw) * (size_t)((d->bands[0].height + ch - 1) / ch) : 0;
     shr_status st = SHR_OK;
     if (composing && !shr__driver_reaches(&ctx->driver.caps, &comp)) /* every frame would fail */
         st = SHR_E_UNSUPPORTED;

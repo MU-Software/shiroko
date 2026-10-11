@@ -534,7 +534,7 @@ static shr_status open_driver(app *a, int driver, int w, int h) {
 #ifdef SHR_DESKTOP_ANGLE
     else {
         a->gl = SDL_GL_CreateContext(a->win);
-        st = a->gl && SDL_GL_MakeCurrent(a->win, a->gl) ? shr_angle_driver_create(NULL, 0, keep, keeps, 256, &a->drv)
+        st = a->gl && SDL_GL_MakeCurrent(a->win, a->gl) ? shr_angle_driver_create(NULL, 0, keep, keeps, 256, 0, &a->drv)
                                                         : SHR_E_DEVICE;
         if (st == SHR_OK) {
             const char *r = (const char *)glGetString(GL_RENDERER);
@@ -804,7 +804,7 @@ static void resize(app *a) {
 #ifdef SHR_DESKTOP_ANGLE
     else if (SDL_GL_MakeCurrent(a->win, a->gl)) {
         shr_angle_driver_destroy(&a->drv);
-        st = shr_angle_driver_create(NULL, 0, keep, keeps, 256, &a->drv);
+        st = shr_angle_driver_create(NULL, 0, keep, keeps, 256, 0, &a->drv);
     }
 #endif
     a->has_drv = st == SHR_OK;

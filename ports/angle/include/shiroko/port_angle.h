@@ -34,8 +34,9 @@ shr_status shr_angle_offscreen_destroy(shr_angle_offscreen *offscreen);
  * Keep ids are 1..max_keeps (caps.max_keeps, caps.keep_bytes = `keep_bytes`). Id k owns slot k of keep_bytes /
  * max_keeps bytes rounded down to a multiple of 128 (caps.max_keep_bytes; SHR_E_INVALID_ARG when that is 0 with
  * max_keeps), kept after KEEP_RELEASE. A slot holds P = slot bytes / destination bytes per pixel texels as sw x sh,
- * sw = P / SHR_CELL_HEIGHT within 1..caps.max_width and sh = P / sw at most caps.max_height, so a keep of a row of
- * cells inside the destination fits whenever its bytes do; a store wider than sw or taller than sh fails with
+ * sw = P / cell_height within 1..caps.max_width and sh = P / sw at most caps.max_height, so a keep of a row of cells
+ * inside the destination fits whenever its bytes do (cell_height: the contexts' cell height, 0..127, 0 =
+ * SHR_CELL_HEIGHT); a store wider than sw or taller than sh fails with
  * SHR_E_NO_MEMORY, as does one GL has no memory for. keep_bytes = max_keeps * (row bytes rounded up to 128) holds
  * max_keeps rows. The slots of a destination format are one array texture, in as few columns and layers as fit
  * (SHR_E_UNSUPPORTED beyond 256 layers), allocated by the first store into a destination of that format and kept
@@ -44,7 +45,8 @@ shr_status shr_angle_offscreen_destroy(shr_angle_offscreen *offscreen);
  * SHR_E_DEVICE is a GL error, which may leave the destination partly written and unregisters every buffer and
  * empties every keep. */
 shr_status shr_angle_driver_create(const shr_allocator *allocator, uint64_t texture_cache_bytes, uint64_t keep_bytes,
-                                   uint32_t max_keeps, uint32_t max_buffers, shr_framebuffer_driver *out);
+                                   uint32_t max_keeps, uint32_t max_buffers, int32_t cell_height,
+                                   shr_framebuffer_driver *out);
 /* Also destroys the surfaces still alive. */
 shr_status shr_angle_driver_destroy(shr_framebuffer_driver *driver);
 

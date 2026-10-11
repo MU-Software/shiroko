@@ -136,7 +136,7 @@ static bool same_rows(shr_lyr *a, shr_lyr *b) {
             if (SHR_VEC_AT(&b->groups, shr__group, j)->id == x->id) y = SHR_VEC_AT(&b->groups, shr__group, j);
         if (!y || x->n != y->n) return false;
         for (size_t k = 0; k < x->n; k++) {
-            shr__lcmd p = shr__group_cmd(x, k), q = shr__group_cmd(y, k);
+            shr__lcmd p = shr__group_cmd(x, k, a->ctx->cell.w), q = shr__group_cmd(y, k, b->ctx->cell.w);
             bool drawn = p.kind == SHR__LCMD_GLYPH || p.kind == SHR__LCMD_LINE;
             if (p.kind != q.kind || p.flags != q.flags || p.color != q.color || memcmp(&p.dst, &q.dst, sizeof(p.dst)) ||
                 (drawn && (p.id != q.id || p.bg != q.bg || p.res != q.res)) ||

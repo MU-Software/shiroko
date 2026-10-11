@@ -184,7 +184,7 @@ static uint32_t keep_find(shr_context *ctx, shr__frame *f, const shr__keep_key *
 }
 
 void shr__keep_moved(shr_context *ctx, const shr__group *g) {
-    const shr__lcmd c = shr__group_cmd(g, 0);
+    const shr__lcmd c = shr__group_cmd(g, 0, ctx->cell.w);
     if (c.kind != SHR__LCMD_CACHE_BEGIN) return;
     for (int hidden = 0; hidden <= !shr__rect_empty(g->blink); hidden++) {
         shr__keep_key key = {{c.key[0], c.key[1] ^ (hidden ? KEEP_HIDDEN : 0)}, c.dst.x1 - c.dst.x0,
@@ -584,6 +584,7 @@ static shr_status keep_draw(shr_context *ctx, shr__frame *f, uint32_t id, shr_re
  * others. All commands of a group share one clip, so an ON_FILL glyph stays inside its FILL. */
 static shr_status emit_group(shr_context *ctx, shr__frame *f, const shr_lyr *l, const shr__group *g, shr_rect clip) {
     const bool compact = g->compact;
+    const int32_t cw = ctx->cell.w;
     shr_status st = SHR_OK;
     shr_rect screen = {0, 0, ctx->screen.width, ctx->screen.height}, keep = {0, 0, 0, 0}, part = keep;
     size_t begin_cmd = 0, begin_at = 0;
@@ -599,7 +600,7 @@ static shr_status emit_group(shr_context *ctx, shr__frame *f, const shr_lyr *l, 
         const shr__rcmd *rc = compact ? &g->rows[i] : NULL;
         const shr__lcmd *lc = compact ? NULL : &g->cmds[i];
         uint32_t kind = compact ? rc->kind : lc->kind, flags = compact ? rc->flags : lc->flags;
-        shr_rect dst = shr__rect_move(compact ? shr__rcmd_dst(rc) : lc->dst, o.x, o.y);
+        shr_rect dst = shr__rect_move(compact ? shr__rcmd_dst(rc, cw) : lc->dst, o.x, o.y);
         if (kind == SHR__LCMD_CACHE_BEGIN) {
             part = shr__rect_intersect(dst, clip);
             shr_rect inside = shr__rect_intersect(dst, shr__rect_intersect(l->rect, screen));
@@ -642,13 +643,13 @@ static shr_status emit_group(shr_context *ctx, shr__frame *f, const shr_lyr *l, 
             if (!(c = push_cmd(ctx, f, &st))) return st;
             c->kind = SHR_CMD_LINE, c->flags = (uint16_t)((flags & SHR_GLYPH_DIM) | rc->id << SHR_LINE_SHAPE_SHIFT);
             c->dst = band_rect(f, d), c->color = rc->color;
-            c->src_origin = (shr_point){(d.x0 - dst.x0) % SHR_CELL_WIDTH, d.y0 - dst.y0};
-            c->src_rect = (shr_rect){0, 0, SHR_CELL_WIDTH, dst.y1 - dst.y0};
+            c->src_origin = (shr_point){(d.x0 - dst.x0) % cw, d.y0 - dst.y0};
+            c->src_rect = (shr_rect){0, 0, cw, dst.y1 - dst.y0};
         } else {
             shr__lcmd row; /* what emit_resolved reads */
             if (compact)
                 row.kind = rc->kind, row.flags = rc->flags, row.color = rc->color, row.bg = rc->bg, row.id = rc->id,
-                row.res = g->res, row.anchor = (shr_point){rc->x0 * SHR_CELL_WIDTH, rc->y0};
+                row.res = g->res, row.anchor = (shr_point){rc->x0 * cw, rc->y0};
             if ((st = emit_resolved(ctx, f, o, compact ? &row : lc, d, &provisional)) != SHR_OK) return st;
         }
         if (!provisional) continue;

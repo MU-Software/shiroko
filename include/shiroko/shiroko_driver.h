@@ -18,7 +18,8 @@ extern "C" {
 #define SHR_NONBLOCKING
 #endif
 
-/* Build configuration, set by CMake (SHIROKO_CELL_WIDTH, SHIROKO_CELL_HEIGHT, SHIROKO_PIXEL_FORMAT). */
+/* Build configuration, set by CMake (SHIROKO_CELL_WIDTH, SHIROKO_CELL_HEIGHT, SHIROKO_PIXEL_FORMAT); the cell size is
+ * the built-in package's and the default of shr_context_desc. */
 #if !defined(SHR_CELL_WIDTH) || !defined(SHR_CELL_HEIGHT) || !defined(SHR_PIXEL_FORMAT)
 #error "link against the shiroko CMake target: SHR_CELL_WIDTH, SHR_CELL_HEIGHT and SHR_PIXEL_FORMAT are not defined"
 #endif

@@ -30,9 +30,12 @@ configure time, asking for `make fontpack-fetch`, when the inputs or the environ
 The build generates the Unicode tables (`<build dir>/generated/shr_gen_unicode_tables.c`) from `.cache/ucd`, and
 `test_grapheme` reads `GraphemeBreakTest.txt` from there.
 
-The build bakes the fonts for one cell size, `SHIROKO_CELL_WIDTH` x `SHIROKO_CELL_HEIGHT` (default 8x16; width 6..64,
+The build bakes the fonts for one cell size, `SHIROKO_CELL_WIDTH` x `SHIROKO_CELL_HEIGHT` (default 8x16; width 6..32,
 height 8..127; `make CELL_WIDTH=10 CELL_HEIGHT=20 ...`; the Tab5 targets take `TAB5_CELL_WIDTH` x `TAB5_CELL_HEIGHT`,
-default 12x24). The built-in package (ASCII + U+FFFD) is compiled into the library; the other packages go to
+default 12x24). That size is the default of a context; `shr_context_desc.cell_width` and `cell_height` choose another
+one when the context is created, with packages baked for it (`fontpack.py build --cell WxH`) and an `open` callback
+there that gives `shr_create()` the Latin package to check. The built-in package (ASCII + U+FFFD) is compiled into the
+library for the build's size only; the other packages go to
 `<build dir>/fonts` with their NOTICE, LICENSES/ and inventory.json (target `shiroko_fonts`, part of the default build
 when Shiroko is the top-level project). `shr_pl_res_bitmap_font_package_info()` reads a package's role, CJK locale and
 cell size from its source, so an `open()` callback can pick among packages baked for several cell sizes.
@@ -388,7 +391,7 @@ find_package(shiroko 0.1 CONFIG REQUIRED)   # CMAKE_PREFIX_PATH=/opt/shiroko
 target_link_libraries(app PRIVATE shiroko::shiroko)
 ```
 
-The cell size and pixel format are fixed when Shiroko is built and reach consumers as compile definitions.
+The pixel format and the default cell size are fixed when Shiroko is built and reach consumers as compile definitions.
 A project that adds Shiroko with `add_subdirectory` needs uv and the fetched inputs too; set
 `SHIROKO_FONT_CACHE` and `SHIROKO_UCD_CACHE` to where `make fontpack-fetch FONT_CACHE=... UCD_CACHE=...` put them
 if not in Shiroko's `.cache/`.

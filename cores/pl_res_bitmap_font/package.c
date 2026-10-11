@@ -63,7 +63,7 @@ static shr_status parse_meta(shr__pkg *pkg, const uint8_t *region, const char **
     uint16_t lh = shr__rd16(in + 4), cw = shr__rd16(in + 6), aw = shr__rd16(in + 36), ah = shr__rd16(in + 38);
     int16_t baseline = (int16_t)shr__rd16(in + 12);
     uint8_t format = in[3];
-    if (lh != SHR_CELL_HEIGHT || cw != SHR_CELL_WIDTH) return *why = "no instance for the cell size", SHR_E_UNSUPPORTED;
+    if (lh != f->ch || cw != f->cw) return *why = "no instance for the cell size", SHR_E_UNSUPPORTED;
     if (len[BOX_CTRI] < SHR_PKG_CTRI) return *why = "ctri size", SHR_E_FORMAT;
     uint32_t l2 = shr__rd32(ct), dc = shr__rd32(ct + 4);
     uint64_t at = SHR_PKG_CTRI + 128ull * l2, data = (at + 63) & ~63ull;
@@ -321,14 +321,6 @@ void shr__pkg_load_done(shr__pkg *pkg, shr_status result) {
         return;
     }
     pkg_fail(pkg, st, why);
-}
-
-/* The built-in package is baked by the build for the cell size: its one instance, stored. */
-shr__line_metrics shr__bitmap_font_line_metrics(void) {
-    const uint8_t *d = shr__builtin_package, *e = d + SHR_PKG_HEADER + 24;
-    while (memcmp(e, "inst", 4)) e += SHR_PKG_ENTRY;
-    const uint8_t *s = d + shr__rd64(e + 8) + 16;
-    return (shr__line_metrics){(int16_t)shr__rd16(s + 12), (int16_t)shr__rd16(s + 14), (int16_t)shr__rd16(s + 16)};
 }
 
 shr_status shr_pl_res_bitmap_font_activation_select(const uint8_t *a, size_t a_length, const uint8_t *b,

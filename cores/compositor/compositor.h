@@ -176,15 +176,16 @@ typedef struct shr__group {
     uint64_t key[2];        /* a row's CACHE_BEGIN key */
 } shr__group;
 
-static inline shr_rect shr__rcmd_dst(const shr__rcmd *r) {
-    return (shr_rect){r->x0 * SHR_CELL_WIDTH, r->y0, r->x1 * SHR_CELL_WIDTH, r->y1};
+/* A row command's rect, in cells `cw` pixels wide. */
+static inline shr_rect shr__rcmd_dst(const shr__rcmd *r, int32_t cw) {
+    return (shr_rect){r->x0 * cw, r->y0, r->x1 * cw, r->y1};
 }
 
-/* Command i of `g` in the full form. */
-static inline shr__lcmd shr__group_cmd(const shr__group *g, size_t i) {
+/* Command i of `g` in the full form, for cells `cw` pixels wide. */
+static inline shr__lcmd shr__group_cmd(const shr__group *g, size_t i, int32_t cw) {
     if (!g->compact) return g->cmds[i];
     const shr__rcmd *r = &g->rows[i];
-    shr__lcmd c = {.kind = r->kind, .flags = r->flags, .color = r->color, .dst = shr__rcmd_dst(r)};
+    shr__lcmd c = {.kind = r->kind, .flags = r->flags, .color = r->color, .dst = shr__rcmd_dst(r, cw)};
     if (r->kind == SHR__LCMD_CACHE_BEGIN)
         c.key[0] = g->key[0], c.key[1] = g->key[1], c.end = g->n - 1 - i;
     else
@@ -218,6 +219,7 @@ struct shr_context {
     shr__alloc al;
     bool dma_alloc; /* the application's allocator serves SHR_ALLOC_DMA */
     shr_context_desc desc;
+    shr__cell_info cell;
     shr_framebuffer_driver driver;
     shr_output output;
     bool shutting_down, in_callback;
