@@ -146,7 +146,10 @@ committed regression inputs in `tests/fuzz/corpus/<target>`.
   the limit.
 - Translucent IMAGE into RGB565: the software driver blends from a plane of the RGBA8888 buffer (8 bytes per pixel) that
   the first such draw derives, while its planes fit in 8 MiB from its allocator (`shr_software_driver_image_planes()`
-  sets the size, 0 makes none); a draw without one blends from the buffer, the same pixels.
+  sets the size, 0 makes none); a draw without one blends from the buffer, the same pixels. A plane is freed when its id
+  is registered again or released, and destroying a context does neither: a driver that serves one context after
+  another keeps the planes of ids the later context does not register again, within that size, until
+  `shr_software_driver_image_planes()` (the Tab5 example calls it as each scene closes) or the driver's destroy.
 - Scaled images: `shr_pl_res_image_create_scaled()` makes a scaled copy once (bilinear, or box for shrinking) from RGBA,
   RGB, gray or gray-alpha rows; `shr_pl_res_image_view()` shows part of an image scaled, drawn by drivers with
   `SHR_DRIVER_SCALE` (the software and ANGLE drivers) at every draw without a copy, otherwise copied once. Both give the

@@ -261,6 +261,8 @@ desktop-run: $(FETCHED)
 # the example's build options (e.g. TAB5_DEFS="-D TAB5_REPLAY=1 -D TAB5_LOADS=0xff"; CMake keeps them until changed).
 # TAB5_BOARD=headless builds for an ESP32-P4 board without a panel into build/tab5-headless (sdkconfig.defaults.headless).
 # The build folder's sdkconfig is made anew when the defaults or the Kconfig change (menuconfig edits are lost).
+# All builds of one tree share build/tab5-host (made again by every build) and examples/tab5/managed_components (which
+# the first build of a fresh tree downloads without a lock): run one Tab5 build of a tree at a time.
 TAB5_HOST := build/tab5-host
 # Tab5's own cell size, whatever CELL is.
 TAB5_CELL_WIDTH ?= 12

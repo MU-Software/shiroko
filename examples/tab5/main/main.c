@@ -8,13 +8,14 @@
  * PPA rotations in order, so the work of a frame runs on while the next one is built: a frame is presented once the
  * work of the frame before it is done; its tail runs until its own is.
  * Per scene: an R line with set_cell, build, draw (software), rotate (queueing the hardware work and waiting for it),
- * present (cache write-back), frame and busy (frame less the hardware waits and the cap's sleep) p50/p95/max after WARM,
- * the largest frame of all loop frames, max1 (loop frame 0 left out, as frames are judged), settle, transitions, flash
- * reads and traffic per frame; an M line (move waits, tail, PSRAM traffic); a P line (keep copies by the DMA2D and by
- * the CPU, small, off a cache line or by rule (tests/bench/tab5_copy.h), and ROTATEs the CPU ran); a frame buffer
- * checksum every mode and rep must agree on. A round ends with each scene's median and largest over its reps and a
- * DMA-PATHS line, FAIL naming the scenes with keep copies the CPU took by rule or ROTATEs it ran. Loop frames run back
- * to back unless CONFIG_SHIROKO_TAB5_FPS_CAP (or TAB5_FPS_CAP) caps them (0 = uncapped).
+ * present (cache write-back), frame and busy (frame less the hardware waits and the cap's sleep, so it leaves out what
+ * the worker runs meanwhile) p50/p95/max after WARM, the largest frame of all loop frames, max1 (loop frame 0 left out,
+ * as frames are judged), settle, transitions, flash reads and traffic per frame; an M line (move waits, tail, PSRAM
+ * traffic); a P line (keep copies by the DMA2D and by the CPU, small, off a cache line or by rule
+ * (tests/bench/tab5_copy.h), and ROTATEs the CPU ran); a frame buffer checksum every mode and rep must agree on. A
+ * round ends with each scene's median and largest over its reps and a DMA-PATHS line, FAIL naming the scenes with keep
+ * copies the CPU took by rule or ROTATEs it ran. Loop frames run back to back unless CONFIG_SHIROKO_TAB5_FPS_CAP (or
+ * TAB5_FPS_CAP) caps them (0 = uncapped).
  * Build options: TAB5_LOADS=<mask> (bit n: load n), TAB5_MOVES=0 (draw moved rows again), TAB5_DMA_MBPS (DMA2D rate
  * cap), TAB5_MOVE_CHUNKS (runs of rows per move), TAB5_STEPS (scroll steps per frame), TAB5_REPLAY=1 (each scene's
  * batches and calls replayed; TAB5_REPLAY_PARTS bits driver-sw, driver-p4, compositor; TAB5_REPLAY_FRAMES=1 adds BF
