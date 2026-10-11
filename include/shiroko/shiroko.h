@@ -440,7 +440,7 @@ shr_status shr_pl_lyr_tilemap_set_cell(shr_lyr *layer, int32_t row, int32_t col,
  * grid with cols >= 1; at most 4 per column of the grid (SHR_E_LIMIT). The limit is checked on `lines` alone: clears
  * that split lines and resizes that cut them can leave a row holding more; such a list passed back gives SHR_E_LIMIT.
  * SHR_E_UNKNOWN_STYLE: an unknown kind, shape or flag or a colour alpha other than 0, 128 and 255 (err->item_index:
- * the line). On error nothing changes. */
+ * the line). On error nothing changes, except SHR_E_NO_MEMORY (no room for the lines): the row then has none. */
 shr_status shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_text_line *lines, size_t count,
                                         shr_error_info *err);
 
@@ -465,7 +465,8 @@ typedef struct shr_row {
 
 /* As shr_pl_lyr_tilemap_set_cell() for each cell in turn from (row, col), then set_lines() when `lines` is set; cells
  * that equal what the grid holds are left as they are. The whole row is validated first: on error nothing changes and
- * err->item_index is the cell's index (the style's for a bad style, the line's for a bad line). */
+ * err->item_index is the cell's index (the style's for a bad style, the line's for a bad line). When only the lines
+ * find no room, the cells are set, the row has no lines and it returns SHR_E_NO_MEMORY with item_index SIZE_MAX. */
 shr_status shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t col, const shr_row *in, shr_error_info *err);
 /* Text laid out by the renderer from (row, col) as shr_pl_lyr_tilemap_measure() lays it out in
  * `cols - col` columns: Unicode clusters and widths, LF/CR/CRLF, TAB stops counted from `col` and,

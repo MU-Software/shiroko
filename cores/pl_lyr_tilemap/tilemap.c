@@ -565,12 +565,16 @@ static shr_status lines_check(const shr__tilemap *t, const shr_text_line *in, si
     return SHR_OK;
 }
 
-/* Checked lines of row r, with room for them. */
-static void lines_set(shr__tilemap *t, int32_t r, const shr_text_line *in, size_t n) {
+/* Checked lines of row r; without room for them the row has none (it keeps its room). */
+static shr_status lines_set(shr__tilemap *t, int32_t r, const shr_text_line *in, size_t n, shr_error_info *err) {
     shr__lines *l = row_lines(t, r);
-    if (l->n == n && (!n || !memcmp(l->at, in, n * sizeof(*in)))) return; /* unchanged */
-    if (n) memcpy(l->at, in, n * sizeof(*in));
-    l->n = (uint32_t)n, t->line[r] |= DIRTY;
+    bool room = lines_room(t, l, n);
+    if (!room) n = 0;
+    if (l->n != n || (n && memcmp(l->at, in, n * sizeof(*in)))) { /* else unchanged */
+        if (n) memcpy(l->at, in, n * sizeof(*in));
+        l->n = (uint32_t)n, t->line[r] |= DIRTY;
+    }
+    return room ? SHR_OK : shr__fail(err, SHR_E_NO_MEMORY, SIZE_MAX, SIZE_MAX, "no memory");
 }
 
 shr_status shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_text_line *lines, size_t count,
@@ -581,10 +585,7 @@ shr_status shr_pl_lyr_tilemap_set_lines(shr_lyr *layer, int32_t row, const shr_t
     if (st != SHR_OK) return shr__fail(err, st, SIZE_MAX, SIZE_MAX, "not a tilemap layer or context busy");
     if (row < 0 || row >= t->rows) return shr__fail(err, SHR_E_INVALID_ARG, SIZE_MAX, SIZE_MAX, "row outside the grid");
     if ((st = lines_check(t, lines, count, err)) != SHR_OK) return st;
-    if (!lines_room(t, row_lines(t, row), count))
-        return shr__fail(err, SHR_E_NO_MEMORY, SIZE_MAX, SIZE_MAX, "no memory");
-    lines_set(t, row, lines, count);
-    return SHR_OK;
+    return lines_set(t, row, lines, count, err);
 }
 
 /* The UTF-8 of a code point in the low bytes of a word, and its length. */
@@ -639,10 +640,8 @@ shr_status shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t col, 
     for (size_t s = 0; s < in->style_count; s++)
         if ((st = shr__style_check(&in->styles[s], err, s)) != SHR_OK) return st;
     if (in->lines && (st = lines_check(t, in->lines, in->line_count, err)) != SHR_OK) return st;
-    if (in->lines && !lines_room(t, row_lines(t, row), in->line_count))
-        return shr__fail(err, SHR_E_NO_MEMORY, SIZE_MAX, SIZE_MAX, "no memory");
     /* Cells of several code points are made first; the others take their glyph from the memo or the font without
-     * allocating, so nothing after this loop fails. */
+     * allocating, so after this loop only the lines' room can fail. */
     t->placed.len = 0;
     int64_t c = col;
     size_t i = 0;
@@ -677,8 +676,7 @@ shr_status shr_pl_lyr_tilemap_set_row(shr_lyr *layer, int32_t row, int32_t col, 
         }
     }
     t->placed.len = 0;
-    if (in->lines) lines_set(t, row, in->lines, in->line_count);
-    return SHR_OK;
+    return in->lines ? lines_set(t, row, in->lines, in->line_count, err) : SHR_OK;
 }
 
 typedef struct text_sink {

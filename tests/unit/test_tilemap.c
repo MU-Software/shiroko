@@ -1202,6 +1202,42 @@ TEST emptied_rows_lend_the_smallest_line_room(void) {
     PASS();
 }
 
+/* Lines that find no room leave the row without lines, never with those of its old content; set_row still sets the
+ * cells. Both report SHR_E_NO_MEMORY, and a later call with room sets the lines. */
+TEST lines_without_room_leave_the_row_without_lines(void) {
+    g_fa = (fail_alloc){-1, 0};
+    shr_lyr *l = open_grid(2, 8, use_fail_alloc);
+    shr_error_info err;
+    shr_text_line five[5];
+    for (int i = 0; i < 5; i++) five[i] = (shr_text_line){(uint16_t)i, 1, SHR_LINE_UNDER, SHR_LINE_SINGLE, 0, RED};
+    const shr_row_cell ab[2] = {{'a', 0, 1, 1}, {'b', 0, 1, 1}};
+    const shr_row_cell xyz[3] = {{'x', 0, 1, 1}, {'y', 0, 1, 1}, {'z', 0, 1, 1}};
+    const shr_row old = {ab, 2, &plain, 1, NULL, 0, five, 2}, now = {xyz, 3, &plain, 1, NULL, 0, five, 5};
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 0, five, 2, NULL), SHR_OK); /* room for 4 */
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(l, 1, 0, &old, NULL), SHR_OK);
+    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_LINE), 2);
+    ASSERT_EQ_LL(count_kind(l, 1, SHR__LCMD_LINE), 2);
+    g_fa.budget = 0;
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 0, five, 5, &err), SHR_E_NO_MEMORY);
+    ASSERT_EQ_LL(err.item_index, SIZE_MAX);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 0, five, 5, &err), SHR_E_NO_MEMORY); /* already without lines */
+    ASSERT_STR_EQ(err.reason, "no memory");
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(l, 1, 0, &now, &err), SHR_E_NO_MEMORY);
+    ASSERT_EQ_LL(err.item_index, SIZE_MAX);
+    g_fa.budget = -1;
+    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_LINE), 0);
+    ASSERT_STR_EQ(row_text(l, 1), "xyz.....");
+    ASSERT_EQ_LL(count_kind(l, 1, SHR__LCMD_LINE), 0);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_lines(l, 0, five, 5, NULL), SHR_OK);
+    ASSERT_EQ_LL(shr_pl_lyr_tilemap_set_row(l, 1, 0, &now, NULL), SHR_OK);
+    ASSERT_EQ_LL(count_kind(l, 0, SHR__LCMD_LINE), 5);
+    ASSERT_STR_EQ(row_text(l, 1), "xyz.....");
+    ASSERT_EQ_LL(count_kind(l, 1, SHR__LCMD_LINE), 5);
+    close_grid(l);
+    ASSERT_EQ_LL(g_fa.live, 0);
+    PASS();
+}
+
 /* Colour alpha: fg 255 / 128 / 0, bg 255 / 0; other values are refused by every call taking a style. */
 TEST style_alpha_selects_dim_conceal_and_background(void) {
     shr_lyr *l = open_grid(1, 8, NULL);
@@ -2129,6 +2165,7 @@ int main(int argc, char **argv) {
     RUN_TEST(line_bands_fit_every_cell_size);
     RUN_TEST(set_lines_validates_and_keeps_equal_lists);
     RUN_TEST(emptied_rows_lend_the_smallest_line_room);
+    RUN_TEST(lines_without_room_leave_the_row_without_lines);
     RUN_TEST(style_alpha_selects_dim_conceal_and_background);
     RUN_TEST(lines_move_with_rows_and_clears_cut_them);
     RUN_TEST(clears_cut_lines_over_the_wide_cells_they_reach);

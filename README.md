@@ -173,7 +173,8 @@ committed regression inputs in `tests/fuzz/corpus/<target>`.
 - `shr_pl_lyr_tilemap_set_row(layer, row, col, row_in, err)` takes a row at once as the VT engine holds it: cells by
   code point (`shr_row_cell`: text, style index, span, code point count), one style array, the code points of longer
   clusters and optionally the row's lines. It equals set_cell for each cell then set_lines, checks the whole row before
-  changing anything, and skips cells the grid already holds.
+  changing anything, and skips cells the grid already holds; when only the lines find no room it still sets the
+  cells, leaves the row without lines and returns `SHR_E_NO_MEMORY`.
 - `shr_pl_lyr_tilemap_resize()` takes an optional background colour for cells without a bg of their own;
   `shr_pl_lyr_tilemap_measure()` lays text out into a caller array of `shr_text_cluster`.
 
@@ -327,11 +328,15 @@ MacBook Pro M4 Max (software driver, without the rotation). On the ST7121 board 
 
 The renderer and the app also share the internal RAM (on Tab5 the example has about 400 KiB of it free once its bands,
 panel and driver are set up). Shiroko allocates while it warms up (the first frames of a screen, rows longer than any
-before, font pages first used, the driver's caches growing) and then nothing per frame: `tests/unit/test_alloczero.c`
-refuses every allocation after each scene of the example has run once, and the example built with
-`TAB5_DEFS="-D TAB5_SOAK=1"` prints a `Z` line per scene with the allocations of its last 10 frames (a `FAIL` line if
-any; the heap count needs `CONFIG_HEAP_USE_HOOKS=y`). What still allocates after warm-up: cells holding a cluster of
-over 12 bytes (each new one, and `shr_pl_lyr_tilemap_set_text` even when unchanged) and glyph pages loaded later.
+before, a tilemap row given more lines than its room holds, font pages first used, the driver's caches growing) and
+then nothing per frame: `tests/unit/test_alloczero.c` refuses every allocation after each scene of the example has
+run once, and the example built with `TAB5_DEFS="-D TAB5_SOAK=1"` prints a `Z` line per scene with the allocations of
+its last 10 frames (a `FAIL` line if any; the heap count needs `CONFIG_HEAP_USE_HOOKS=y`). What still allocates after
+warm-up: cells holding a cluster of over 12 bytes (each new one, and `shr_pl_lyr_tilemap_set_text` even when
+unchanged) and glyph pages loaded later. Line rooms grow in powers of two up to 4 lines per column and are traded
+between rows, so on a scrolling screen they can take long to stop growing; when one cannot be had,
+`shr_pl_lyr_tilemap_set_lines` or `set_row` returns `SHR_E_NO_MEMORY` and only that row's lines are missing until a
+later call finds room.
 
 - Allocate what must be internal RAM (task stacks, DMA buffers and descriptors, Wi-Fi and LWIP buffers, anything
   used while the flash cache is off) before creating the renderer, or statically: once a scene has warmed up, the
