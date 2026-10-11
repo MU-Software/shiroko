@@ -4,7 +4,7 @@ cores/pl_lyr_tilemap/tilemap.c shr_pl_lyr_tilemap_set_cell __stack_chk_fail cell
 cores/pl_lyr_tilemap/tilemap.c shr_pl_lyr_tilemap_set_row __stack_chk_fail cell_new cp_utf8 lines_check lines_room lines_set place row_cluster shr__ctx_refused shr__lyr_state
 cores/pl_lyr_tilemap/tilemap.c build_rows XXH3_hashLong_128b_default XXH3_len_129to240_128b __stack_chk_fail shr__bitmap_font_res shr__lyr_group_set shr__lyr_row_begin shr__lyr_row_commit shr__vec_reserve
 cores/pl_lyr_tilemap/tilemap.c build_row inlined
-cores/compositor/frame.c emit_rect shr__lru_oldest shr__lru_push shr__lru_remove shr__vec_push shr__vec_reserve shr_format_row_bytes
+cores/compositor/frame.c emit_rect shr__hidden shr__lru_oldest shr__lru_push shr__lru_remove shr__vec_push shr__vec_reserve shr_format_row_bytes
 cores/compositor/frame.c emit_group inlined
 ports/software/software_driver.c sw_execute memcpy shr__raster_buffer_check shr__raster_check shr__raster_prep shr__raster_reads_dst shr__synth_drop trim_cmds ~draw
 ports/software/software_driver.c draw image shr__raster_draw shr__raster_line shr__synth_draw

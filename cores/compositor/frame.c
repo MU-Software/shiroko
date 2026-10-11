@@ -674,24 +674,42 @@ static shr_status emit_group(shr_context *ctx, shr__frame *f, const shr_lyr *l, 
     return SHR_OK;
 }
 
-bool shr__hides(const shr_lyr *l, shr_rect r) {
-    int32_t y = r.y0;
-    for (size_t i = 0; l->visible && i < l->groups.len && y < r.y1; i++) {
+shr_rect shr__hidden(const shr_lyr *l, shr_rect r, bool *whole) {
+    int32_t y = r.y0, yw = r.y0, x0 = r.x0, x1 = r.x1;
+    size_t n = l->visible && shr__lyr_reaches(l, r) ? l->groups.len : 0;
+    for (size_t i = 0; i < n && (y < r.y1 || yw < r.y1); i++) {
         const shr__group *g = SHR_VEC_AT(&l->groups, shr__group, i);
         shr_point at = shr__group_at(l, g);
-        shr_rect o = shr__rect_move(g->opaque, at.x, at.y);
-        o = shr__rect_intersect(o, l->rect);
-        if (o.x0 <= r.x0 && o.x1 >= r.x1 && o.y0 <= y && o.y1 > y) y = o.y1;
+        shr_rect o = shr__rect_intersect(shr__rect_move(g->opaque, at.x, at.y), l->rect);
+        if (o.x0 <= r.x0 && o.x1 >= r.x1 && o.y0 <= yw && o.y1 > yw) yw = o.y1;
+        o = shr__rect_intersect(o, r);
+        if (shr__rect_empty(o) || o.y0 > y || o.y1 <= y || (y > r.y0 && (o.x0 > x0 || o.x1 < x1))) continue;
+        if (y == r.y0) x0 = o.x0, x1 = o.x1;
+        y = o.y1;
     }
-    return y >= r.y1;
+    *whole = yw >= r.y1;
+    return (shr_rect){x0, r.y0, x1, y};
 }
 
-/* Draws `rect` from the topmost layer that hides it, else from the clear colour up. */
+/* Draws `rect` from the topmost layer that hides it; else, when a layer hides at least half of it from its top, the
+ * largest such part from that layer up and the rest of `rect` on its own; else from the clear colour up. */
 static shr_status emit_rect(shr_context *ctx, shr__frame *f, shr_rect rect) {
     shr_status st = SHR_OK;
-    const shr_lyr *from = NULL;
-    for (const shr_lyr *l = ctx->layers; l; l = l->next)
-        if (shr__hides(l, rect)) from = l;
+    const shr_lyr *from = NULL, *top = NULL;
+    shr_rect in = rect;
+    int64_t most = (shr__rect_area(rect) + 1) / 2;
+    for (const shr_lyr *l = ctx->layers; l; l = l->next) {
+        bool whole;
+        shr_rect h = shr__hidden(l, rect, &whole);
+        top = whole ? l : top;
+        if (!whole && shr__rect_area(h) >= most) from = l, in = h, most = shr__rect_area(h);
+    }
+    if (top) from = top, in = rect;
+    const shr_rect rest[3] = {{rect.x0, rect.y0, in.x0, in.y1}, {in.x1, rect.y0, rect.x1, in.y1},
+                              {rect.x0, in.y1, rect.x1, rect.y1}};
+    for (int k = 0; k < 3; k++)
+        if (!shr__rect_empty(rest[k]) && (st = emit_rect(ctx, f, rest[k])) != SHR_OK) return st;
+    rect = in;
     if (!from) {
         shr_draw_cmd *c = push_cmd(ctx, f, &st);
         if (!c) return st;
@@ -700,7 +718,7 @@ static shr_status emit_rect(shr_context *ctx, shr__frame *f, shr_rect rect) {
     }
     for (const shr_lyr *l = from; l; l = l->next) {
         shr_rect clip = shr__rect_intersect(rect, l->rect);
-        if (!l->visible || shr__rect_empty(clip)) continue;
+        if (!l->visible || shr__rect_empty(clip) || !shr__lyr_reaches(l, clip)) continue;
         for (size_t i = 0; i < l->groups.len; i++) {
             const shr__group *g = SHR_VEC_AT(&l->groups, shr__group, i);
             shr_point at = shr__group_at(l, g);

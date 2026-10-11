@@ -113,7 +113,8 @@ shr_status shr_lyr_create(shr_context *ctx, int32_t z, shr_rect rect, shr_lyr **
     if (shr__ctx_refused(ctx)) return SHR_E_STATE;
     shr_lyr *l = SHR_NEW(&ctx->al, shr_lyr);
     if (!l) return SHR_E_NO_MEMORY;
-    *l = (shr_lyr){.ctx = ctx, .z = z, .seq = ctx->next_layer_seq++, .rect = rect, .visible = true};
+    *l = (shr_lyr){.ctx = ctx, .z = z, .seq = ctx->next_layer_seq++, .rect = rect, .visible = true,
+                   .reach_x0 = INT32_MAX, .reach_x1 = INT32_MIN};
     SHR_VEC_INIT_HOT(&l->groups, shr__group);
     SHR_VEC_INIT_HOT(&l->pending, shr__lcmd);
     link(l);
@@ -242,6 +243,7 @@ static void groups_clear(shr_lyr *l, size_t most) {
     }
     l->groups.len = 0;
     l->peak = 0;
+    l->reach_x0 = INT32_MAX, l->reach_x1 = INT32_MIN;
     classes_set(l, most);
 }
 
@@ -382,6 +384,8 @@ static shr_status group_set(shr_lyr *l, uint32_t id, int32_t oy, shr__group in) 
         in.id = id, in.cap = l->spare_cap, in.oy = oy, in.bounds = grown(bounds), in.blink = grown(blink);
         in.opaque = opaque, in.res = in.compact ? in.res : one, in.uses = uses;
         *g = in;
+        l->reach_x0 = bounds.x0 < l->reach_x0 ? bounds.x0 : l->reach_x0;
+        l->reach_x1 = bounds.x1 > l->reach_x1 ? bounds.x1 : l->reach_x1;
         l->spare = NULL;
     }
     spare_put(l, old, old_cap, old_unit);
@@ -438,8 +442,9 @@ static void move_record(shr_lyr *l, uint32_t first, uint32_t last, shr_rect a, i
     shr__damage *s = &ctx->staged;
     shr_rect dst = shr__rect_intersect(a, shr__rect_move(a, 0, dy));
     int64_t h = (int64_t)a.y1 - a.y0, d = dy < 0 ? -(int64_t)dy : dy;
-    if (!(ctx->driver.caps.flags & SHR_DRIVER_CHEAP_MOVE) || 2 * d >= h || !shr__hides(l, dst) ||
-        MOVE_COVER * covered_above(l, a, dy, false) > shr__rect_area(dst)) {
+    bool whole = false;
+    if ((ctx->driver.caps.flags & SHR_DRIVER_CHEAP_MOVE) && 2 * d < h) shr__hidden(l, dst, &whole);
+    if (!whole || MOVE_COVER * covered_above(l, a, dy, false) > shr__rect_area(dst)) {
         shr__damage_add(ctx, s, a);
         return;
     }

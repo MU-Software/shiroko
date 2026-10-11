@@ -1,7 +1,7 @@
 /* M5Stack Tab5: the software driver draws the desktop example's load modes over the full grid in landscape, and the
  * PPA rotates that into the portrait MIPI-DSI panel's frame buffer: (A) composed in PSRAM and rotated once per frame,
- * (B) drawn band by band into one internal-RAM band, (C) into two; in B and C a band the PPA still reads is drawn into
- * a PSRAM spare instead. CONFIG_SHIROKO_TAB5_BANDS internal bands are taken (2 by default), and only their mode runs
+ * (B) drawn band by band into one internal-RAM band, (C) into two; in B and C the CPU draws a band once the hardware is
+ * done with it. CONFIG_SHIROKO_TAB5_BANDS internal bands are taken (2 by default), and only their mode runs
  * (C, or B with one) unless CONFIG_SHIROKO_TAB5_ALL_MODES (also A). A worker task on the main task's core starts the
  * queued DMA2D copies (keeps; in B and C also scrolled rows moved inside the frame buffer, once a boot self-test proved
  * the moves right; keeps of rows of any length once another proved those copies right, else of 32-byte multiples) and
@@ -96,8 +96,6 @@
 #define DMA_QUEUE 16
 #define DMA_BURST 128      /* bytes per DMA2D burst (16..128): smaller ones hold PSRAM in shorter turns, slower */
 #define CHAIN 64           /* queued copies, and rotations */
-#define SPARES 3           /* PSRAM bands drawn into while an internal band still waits for the hardware */
-#define SLOTS (BANDS + SPARES)
 #define PLANE_BYTES (2u << 20) /* the software driver's planes for translucent images */
 
 #define FONT_SUBTYPE 0x40
@@ -203,7 +201,7 @@ static void fb_sync(int dir) {
 /* ===== DMA2D copies and PPA rotations: queued by the main task, started in order by a worker task on its core ===== */
 
 /* Copies start in queue order, each once the copies up to dma_after and the rotations up to ppa_after are done;
- * rotations likewise after the copies up to dma_after, the last writing their slots or the frame buffer. Copy n and
+ * rotations likewise after the copies up to dma_after, the last writing their bands or the frame buffer. Copy n and
  * rotation n are tickets n; rotations finish in order, copies in any (the DMA2D runs two at once), so a copy ticket
  * counts as done once it and all before it are. */
 typedef struct dma_op {
@@ -230,9 +228,8 @@ static struct {
     float *t, *tail; /* per frame: waits while a move was due; the tail */
 } mv = {.t = log_ram.move_t, .tail = log_ram.move_tail};
 
-/* Slots: the internal bands, then the PSRAM spares. last: the tickets of the last copy and rotation touching each;
- * dma_wr: of the last copy writing each, dma_fb: writing the frame buffer. The main task is notified once what it
- * waits for (want_*, or any completion) is done. */
+/* Per band, last: the tickets of the last copy and rotation touching it; dma_wr: of the last copy writing it, dma_fb:
+ * writing the frame buffer. The main task is notified once what it waits for (want_*, or any completion) is done. */
 static struct {
     TaskHandle_t worker;
     async_color_convert_handle_t conv;
@@ -243,11 +240,9 @@ static struct {
     volatile uint8_t finished[64]; /* copies finished past dma_done */
     uint32_t dma_started, ppa_started;
     uint64_t dma_queued, ppa_queued;
-    uint32_t dma_last[SLOTS], ppa_last[SLOTS], dma_wr[SLOTS], dma_fb;
+    uint32_t dma_last[BANDS], ppa_last[BANDS], dma_wr[BANDS], dma_fb;
     volatile uint32_t want_dma, want_ppa;
     volatile bool waiting, any;
-    uint8_t *spare[SPARES];
-    int phys[BANDS]; /* the slot each band draws into */
     bool cpu[BANDS]; /* whether the CPU draws into it */
     bool held;       /* held_op: band 0's rotation, waiting to go with band 1's */
     ppa_srm_oper_config_t held_op;
@@ -430,7 +425,7 @@ static uint32_t ppa_queue(ppa_srm_oper_config_t op, uint32_t dma_after) {
 
 static uint32_t later(uint32_t t, uint32_t u) { return done(t, u) ? t : u; }
 
-/* A rotation reading slot s waits for the copies writing it or the frame buffer, not for those reading it. */
+/* A rotation reading band s waits for the copies writing it or the frame buffer, not for those reading it. */
 static uint32_t rot_after(int s) { return later(hw.dma_wr[s], hw.dma_fb); }
 
 static void held_flush(void) {
@@ -442,33 +437,7 @@ static void hw_drain(void) {
     hw_wait((uint32_t)hw.dma_queued, (uint32_t)hw.ppa_queued);
 }
 
-static uint8_t *slot_px(unsigned s) { return s < BANDS ? a.bands[s].pixels : hw.spare[s - BANDS]; }
-
-static int slot_of(const void *p) {
-    for (int s = 0; s < SLOTS; s++) {
-        const uint8_t *b = slot_px(s);
-        if (b && (const uint8_t *)p >= b && (const uint8_t *)p < b + a.bands[0].byte_length) return s;
-    }
-    return -1;
-}
-
-static bool slot_free(int s) { return done(hw.dma_done, hw.dma_last[s]) && done(hw.ppa_done, hw.ppa_last[s]); }
-
-static bool slot_started(int s) { return done(hw.dma_started, hw.dma_last[s]) && done(hw.ppa_started, hw.ppa_last[s]); }
-
-/* The slot band k the CPU draws goes to: its own once its work started, else a free spare, else its own, but while
- * moves run (its rotation may wait for all of them) the one whose last rotation comes first. */
-static int slot_for(int k) {
-    if (slot_started(k)) return k;
-    int e = BANDS;
-    for (int i = BANDS; i < SLOTS; i++) {
-        if (slot_free(i)) return i;
-        e = done(hw.ppa_last[i], hw.ppa_last[e]) ? e : i;
-    }
-    return done(hw.dma_done, mv.last) || done(hw.ppa_last[e], hw.ppa_last[k]) ? k : e;
-}
-
-static void slot_wait(int s) {
+static void band_wait(int s) {
     if (s >= 0) hw_wait(hw.dma_last[s], hw.ppa_last[s]);
 }
 
@@ -537,17 +506,17 @@ _Static_assert(CONFIG_CACHE_L2_CACHE_LINE_SIZE == TAB5_COPY_LINE, "tab5_copy.h's
 _Static_assert(BSP_LCD_V_RES * 2 % TAB5_COPY_LINE == 0, "band rows start cache lines");
 
 /* The software driver's copier. The DMA writes whole cache lines from dst on: dst starts one, and its rows do too or
- * are contiguous (a keep). A copy into a slot starts once the copies and rotations before it touching the slot are
- * done (a keep-only batch does not wait for the batches before it); one left to the CPU waits for its slots. */
+ * are contiguous (a keep). A copy into a band starts once the copies and rotations before it touching the band are
+ * done (a keep-only batch does not wait for the batches before it); one left to the CPU waits for its bands. */
 static uint64_t keep_copy(void *user, void *dst, size_t dst_stride, const void *src, size_t src_stride, size_t bytes,
                           int32_t rows) {
     (void)user;
-    int sd = slot_of(dst), ss = slot_of(src), s = sd >= 0 ? sd : ss;
+    int sd = band_of(dst), ss = band_of(src), s = sd >= 0 ? sd : ss;
     unsigned why = tab5_copy_why((uintptr_t)dst, dst_stride, (uintptr_t)src, bytes, bytes * rows, copy_len, true);
     a.bytes.copied[1] += bytes * rows;
     if (why) {
         a.bytes.cpu[why & TAB5_COPY_SMALL ? 0 : why & TAB5_COPY_LINE_START ? 1 : 2] += bytes * rows;
-        slot_wait(sd), slot_wait(ss);
+        band_wait(sd), band_wait(ss);
         return 0;
     }
     uint32_t t =
@@ -565,15 +534,14 @@ static void keep_wait(void *user, uint64_t ticket) {
     hw_wait((uint32_t)ticket, 0);
 }
 
-/* A trimmed keep draw into an internal band: once the copies and rotations before it touching the slot are done, its
+/* A trimmed keep draw into an internal band: once the copies and rotations before it touching the band are done, its
  * copy starts and the band columns around it are filled (dma_go), without the main task waiting. Elsewhere, or when
  * the whole rows would not go to the DMA2D, the whole rows are copied. */
 static uint64_t keep_copy_trim(void *user, void *dst, size_t dst_stride, const void *src, size_t src_stride,
                                size_t bytes, int32_t rows, const shr_software_trim *t) {
-    int s = slot_of(dst);
+    int s = band_of(dst);
     size_t all = bytes + t->lo + t->hi;
-    if (s < 0 || s >= BANDS ||
-        tab5_copy_why((uintptr_t)dst, dst_stride, (uintptr_t)src, bytes, all * rows, copy_len, false))
+    if (s < 0 || tab5_copy_why((uintptr_t)dst, dst_stride, (uintptr_t)src, bytes, all * rows, copy_len, false))
         return keep_copy(user, (uint8_t *)dst - t->lo, dst_stride, (const uint8_t *)src - t->lo, src_stride, all, rows);
     a.bytes.copied[0] += bytes * rows;
     hw.dma_last[s] = hw.dma_wr[s] =
@@ -745,9 +713,9 @@ static void copy_setup(void) {
            copy_len == TAB5_COPY_LEN ? "of any length" : "of 32-byte multiples only");
 }
 
-/* (B, C) A batch rotating parts of one band from the slot it was drawn into: queued, not waited for. In C, two whole
- * bands of keeps next to each other, band 0's above, turn as one block of the two internal bands (adjacent in memory):
- * band 0's rotation is held until band 1's comes. */
+/* (B, C) A batch rotating parts of one band: queued, not waited for. In C, two whole bands of keeps next to each other,
+ * band 0's above, turn as one block of the two internal bands (adjacent in memory): band 0's rotation is held until band
+ * 1's comes. */
 static bool ppa_band(const shr_surface *d, const shr_draw_cmd *c, size_t n) {
     int k = band_of(c->src.pixels);
     for (size_t i = 0; i < n; i++)
@@ -755,11 +723,10 @@ static bool ppa_band(const shr_surface *d, const shr_draw_cmd *c, size_t n) {
             (c[i].dst.x0 | c[i].dst.y0) % PPA_ALIGN)
             return false;
     const shr_surface *b = &a.bands[k];
-    int s = hw.phys[k];
     bool cw = c->rotation == SHR_ROTATE_90_CW;
-    bool whole = n == 1 && s == k && !hw.cpu[k] && c->src.pixels == b->pixels && c->src.width == b->width &&
+    bool whole = n == 1 && !hw.cpu[k] && c->src.pixels == b->pixels && c->src.width == b->width &&
                  c->src.height == b->height && (cw || c->rotation == SHR_ROTATE_90_CCW);
-    hw.phys[k] = k, hw.cpu[k] = true; /* the band's next draw batch sets them again */
+    hw.cpu[k] = true; /* the band's next draw batch sets it again */
     shr_rect all = {0, 0, b->width, b->height};
     /* Band 0 (rows above) turns to the right of band 1 clockwise, to its left counterclockwise. */
     int32_t hx = hw.held_op.out.block_offset_x;
@@ -781,8 +748,8 @@ static bool ppa_band(const shr_surface *d, const shr_draw_cmd *c, size_t n) {
         size_t off = (size_t)((const uint8_t *)c[i].src.pixels - (const uint8_t *)b->pixels);
         int32_t x = (int32_t)(off % b->stride / 2), y = (int32_t)(off / b->stride);
         shr_rect r = {x, y, x + c[i].src.width, y + c[i].src.height};
-        hw.ppa_last[s] = ppa_queue(
-            ppa_config(d, slot_px(s), b->width, b->height, r, c[i].dst.x0, c[i].dst.y0, c[i].rotation), rot_after(s));
+        hw.ppa_last[k] = ppa_queue(
+            ppa_config(d, b->pixels, b->width, b->height, r, c[i].dst.x0, c[i].dst.y0, c[i].rotation), rot_after(k));
     }
     return true;
 }
@@ -807,18 +774,13 @@ static shr_status p4_execute(void *user, const shr_surface *d, const shr_draw_cm
         return st != SHR_OK || p == n ? st : p4_execute(user, d, c + p, n - p, f);
     }
     /* A band drawing only keeps is queued at once. */
-    shr_surface ds = *d;
     if (k >= 0) {
         bool cpu = false;
         for (size_t i = 0; i < n; i++) cpu |= c[i].kind < SHR_CMD_KEEP_DRAW || c[i].kind == SHR_CMD_LINE;
         hw.cpu[k] = cpu;
-        int s = cpu ? slot_for(k) : k;
-        if (cpu) slot_wait(s);
-        hw.phys[k] = s, ds.pixels = slot_px(s);
-    } else { /* the CPU may read the bands (ROTATE the PPA cannot take): their pixels back where they were drawn */
+        if (cpu) band_wait(k);
+    } else { /* the CPU may read the bands (ROTATE the PPA cannot take) */
         hw_drain();
-        for (int j = 0; j < BANDS; j++)
-            if (hw.phys[j] != j) memcpy(a.bands[j].pixels, slot_px(hw.phys[j]), a.bands[j].byte_length), hw.phys[j] = j;
     }
     int64_t t1 = esp_timer_get_time();
     a.rotate_us += t1 - t0, t0 = t1;
@@ -831,7 +793,7 @@ static shr_status p4_execute(void *user, const shr_surface *d, const shr_draw_cm
                                          r.x1 > u->x1 ? r.x1 : u->x1, r.y1 > u->y1 ? r.y1 : u->y1};
     }
     for (size_t i = 0; i < n; i++) a.bytes.rot_cpu += c[i].kind == SHR_CMD_ROTATE;
-    shr_status st = a.sw.execute(a.sw.user, &ds, c, n, f);
+    shr_status st = a.sw.execute(a.sw.user, d, c, n, f);
     if (d->pixels == a.fb.pixels) fb_sync(ESP_CACHE_MSYNC_FLAG_DIR_C2M); /* rotations only invalidate */
     a.draw_us += esp_timer_get_time() - t0;
     return st;
@@ -1541,9 +1503,6 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_timer_create(&(esp_timer_create_args_t){.callback = dma_paced, .name = "dma pace"}, &hw.pace));
     hw.dq = heap_caps_malloc(CHAIN * sizeof(dma_op), MALLOC_CAP_SPIRAM), hw.pq = heap_caps_malloc(CHAIN * sizeof(ppa_op), MALLOC_CAP_SPIRAM);
     if (!hw.dq || !hw.pq) check(SHR_E_NO_MEMORY, "queues");
-    for (int i = 0; i < SPARES; i++)
-        if (!(hw.spare[i] = heap_caps_aligned_alloc(CONFIG_CACHE_L2_CACHE_LINE_SIZE, band_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA)))
-            check(SHR_E_NO_MEMORY, "spare bands");
     if (xTaskCreatePinnedToCore(worker, "hw", 4096, NULL, 5, &hw.worker, xPortGetCoreID()) != pdPASS)
         check(SHR_E_NO_MEMORY, "worker");
     check(shr_software_driver_set_copier(&a.sw, &p4_copier), "copier");

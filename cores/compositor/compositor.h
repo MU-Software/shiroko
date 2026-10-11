@@ -199,6 +199,7 @@ struct shr_lyr {
     uint64_t seq;
     shr_rect rect;
     bool visible, building;
+    int32_t reach_x0, reach_x1; /* the columns its groups drew in since they were cleared, or more (layer coordinates) */
     shr__vec groups;  /* shr__group, ascending id */
     shr__vec pending; /* shr__lcmd between shr_lyr_cmd_begin and commit */
     /* Group memory in GROUP_CLASSES sizes, class_cap commands each (ascending, the last the most a group asked for):
@@ -318,6 +319,11 @@ static inline shr_point shr__group_at(const shr_lyr *l, const shr__group *g) {
     return (shr_point){l->rect.x0, shr__clamp32((int64_t)l->rect.y0 + g->oy)};
 }
 
+/* Whether `r` (screen coordinates) meets the columns `l`'s groups drew in: outside them it draws nothing. */
+static inline bool shr__lyr_reaches(const shr_lyr *l, shr_rect r) {
+    return ((int64_t)r.x1 - l->rect.x0 > l->reach_x0) & ((int64_t)r.x0 - l->rect.x0 < l->reach_x1);
+}
+
 void shr__push_event(shr_context *ctx, const shr_event *ev);
 bool shr__blink_visible(const shr_context *ctx, uint64_t *next_boundary);
 void shr__damage_add(const shr_context *ctx, shr__damage *d, shr_rect r);
@@ -335,9 +341,10 @@ bool shr__io_ready(const shr_context *ctx);
 uint64_t shr__io_deadline(const shr_context *ctx);
 void shr__io_cancel_all(shr_context *ctx);
 
-/* Whether the opaque parts of `l`'s groups, in order, cover `r` (screen coordinates) row by row. May miss a cover,
- * never claims a false one. */
-bool shr__hides(const shr_lyr *l, shr_rect r);
+/* The part of `r` (screen coordinates) from its top that the opaque parts of `l`'s groups hide: the columns of the first
+ * part over its top row, down as far as later parts, in order, cover them row by row. *whole: whether those that span
+ * its width cover all of `r` so. May miss a cover, never claims a false one. */
+shr_rect shr__hidden(const shr_lyr *l, shr_rect r, bool *whole);
 /* Group `g` moved on screen: the keeps of its keep group (its first command) stay recent. */
 void shr__keep_moved(shr_context *ctx, const shr__group *g);
 bool shr__blink_any(const shr_context *ctx);

@@ -3717,6 +3717,84 @@ TEST test_hidden_layers_skipped(void) {
     PASS();
 }
 
+static bool in_any(const shr_rect *r, size_t n, int32_t x, int32_t y) {
+    bool in = false;
+    for (size_t i = 0; i < n; i++) in |= x >= r[i].x0 && x < r[i].x1 && y >= r[i].y0 && y < r[i].y1;
+    return in;
+}
+
+/* A damaged rect no layer hides whole: the largest part a layer hides from its top (the columns of its first opaque
+ * part there, as far down as later parts cover them) is drawn from that layer up and the rest on its own, the clear
+ * colour only where nothing hides it; the pixels are those of drawing it whole. */
+TEST test_partly_hidden_rect_split(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_rec);
+    const int32_t w = HW - 6;
+    static const struct {
+        shr_rect groups[5];
+        size_t n;
+        shr_rect damage, clear;
+    } cases[] = {
+        {{{0, 0, HW - 6, 8}, {0, 8, HW - 6, 16}}, 2, {HW - 10, 2, HW, 14}, {HW - 6, 2, HW, 14}}, /* a strip beside */
+        {{{0, 0, HW - 6, 8}, {0, 12, HW - 6, 16}}, 2, {0, 0, 8, 16}, {0, 8, 8, 16}},              /* below, a gap */
+        {{{0, 0, HW - 6, 8}, {0, 0, HW - 6, 4}, {2, 8, HW - 6, 12}, {0, 8, HW - 8, 12}, {0, 8, HW - 6, 16}},
+         5, {0, 0, HW, 16}, {HW - 6, 0, HW, 16}}, /* parts above, or narrower than the first, pass */
+    };
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        ASSERT_EQ_LL(shr__lyr_groups_clear(l, 0), SHR_OK);
+        for (size_t i = 0; i < cases[k].n; i++) {
+            shr__lcmd c = fill(cases[k].groups[i], BLUE);
+            ASSERT_EQ_LL(shr__lyr_group_set(l, (uint32_t)i, &c, 1), SHR_OK);
+        }
+        frame(ctx);
+        shr__damage_add(ctx, &ctx->staged, cases[k].damage);
+        frame(ctx);
+        shr_rect d = cases[k].damage, c = cases[k].clear;
+        int clears = 0;
+        for (size_t i = 0; i < rec.n; i++) clears += rec.cmds[i].kind == SHR_CMD_FILL && rec.cmds[i].color == SHR_RGB(0, 0, 0);
+        ASSERT_EQ_LL(clears, 1);
+        ASSERT(fill_sent(SHR_RGB(0, 0, 0), c.x0, c.y0) && fill_sent(SHR_RGB(0, 0, 0), c.x1 - 1, c.y1 - 1));
+        for (int32_t y = d.y0; y < d.y1; y++)
+            for (int32_t x = d.x0; x < d.x1; x++)
+                ASSERT_EQ_LL(px(h.out.shown, x, y), in_any(cases[k].groups, cases[k].n, x, y) ? BLUE : 0u);
+    }
+    ASSERT_EQ_LL(shr__lyr_groups_clear(l, 0), SHR_OK);
+
+    /* Layers: a narrow one, a wider one above it (the largest part), a small one above both and an invisible one. */
+    shr__lcmd narrow = fill((shr_rect){0, 0, 4, 16}, GREEN), row = fill((shr_rect){0, 0, w, 16}, BLUE);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, &narrow, 1), SHR_OK);
+    shr_lyr *mid, *top = solid(ctx, 2, (shr_rect){w - 8, 0, w - 4, 4}, RED), *off = solid(ctx, 3, FULL, WHITE);
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 1, FULL, &mid), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_group_set(mid, 0, &row, 1), SHR_OK);
+    ASSERT_EQ_LL(shr_lyr_set_visible(off, false), SHR_OK);
+    frame(ctx);
+    shr__damage_add(ctx, &ctx->staged, (shr_rect){0, 0, HW, 16});
+    frame(ctx);
+    ASSERT(fill_sent(SHR_RGB(0, 0, 0), w, 0) && !fill_sent(GREEN, 1, 1));
+    ASSERT(px(h.out.shown, 1, 1) == BLUE && px(h.out.shown, w - 6, 1) == RED && px(h.out.shown, w - 2, 1) == BLUE);
+    ASSERT_EQ_LL(px(h.out.shown, w + 2, 1), 0u);
+    shr_lyr *all[4] = {l, mid, top, off};
+    destroy_layers(all, 4);
+
+    /* A later part wider than the first keeps the first's columns: what lies left of it shows. */
+    shr_lyr *under = solid(ctx, 0, (shr_rect){0, 0, 8, 16}, RED), *rows;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 1, FULL, &rows), SHR_OK);
+    shr__lcmd parts[2] = {fill((shr_rect){8, 0, w, 8}, BLUE), fill((shr_rect){0, 8, w, 16}, BLUE)};
+    ASSERT_EQ_LL(shr__lyr_group_set(rows, 0, &parts[0], 1), SHR_OK);
+    ASSERT_EQ_LL(shr__lyr_group_set(rows, 1, &parts[1], 1), SHR_OK);
+    frame(ctx);
+    shr__damage_add(ctx, &ctx->staged, (shr_rect){0, 0, HW, 16});
+    frame(ctx);
+    ASSERT(px(h.out.shown, 2, 2) == RED && px(h.out.shown, 2, 10) == BLUE && px(h.out.shown, 10, 2) == BLUE);
+    ASSERT_EQ_LL(px(h.out.shown, w + 2, 2), 0u);
+    shr_lyr *both[2] = {under, rows};
+    destroy_layers(both, 2);
+    harness_close(&h);
+    PASS();
+}
+
 /* A frame skips the blocks of a large group that its damage does not reach; what it draws is unchanged. */
 TEST test_large_group_blocks_skipped(void) {
     harness h;
@@ -5679,6 +5757,26 @@ TEST test_band_regions_merge(void) {
     PASS();
 }
 
+/* With bands, damage widened past what a layer covers clears only the columns it does not cover, ahead of the rest. */
+TEST test_band_clears_uncovered_columns(void) {
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_klog_moves);
+    shr_surface b[2] = {band_surface(0, 0), band_surface(1, 0)};
+    ASSERT_EQ_LL(configure_bands(ctx, b, 2, 16), SHR_OK);
+    shr_lyr *l = solid(ctx, 0, (shr_rect){0, 0, HW - 6, HH}, BLUE);
+    frame(ctx);
+    shr__damage_add(ctx, &ctx->staged, (shr_rect){HW - 10, 18, HW - 8, 20});
+    klog_reset();
+    frame(ctx);
+    ASSERT_EQ_LL(klog_count(SHR_CMD_FILL), 2);
+    ASSERT(rect_eq(klog_nth(SHR_CMD_FILL, 0)->dst, (shr_rect){HW - 6, 0, HW, 16}) &&
+           klog_nth(SHR_CMD_FILL, 0)->color == ctx->screen.clear);
+    ASSERT(rect_eq(klog_nth(SHR_CMD_FILL, 1)->dst, (shr_rect){HW - 16, 0, HW - 6, 16}));
+    destroy_layers(&l, 1);
+    harness_close(&h);
+    PASS();
+}
+
 /* The keeps of moved rows stay recent; rows that left, rows without a keep group and the blink phase never stored
  * are passed over. */
 static void tweak_keep_moves(shr_context_desc *d, shr_framebuffer_driver *drv) {
@@ -5883,6 +5981,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_plugin_owned_layers);
     RUN_TEST(test_resource_users_counted);
     RUN_TEST(test_hidden_layers_skipped);
+    RUN_TEST(test_partly_hidden_rect_split);
     RUN_TEST(test_large_group_blocks_skipped);
     RUN_TEST(test_keep_rows);
     RUN_TEST(test_keep_hit_skips_to_its_end);
@@ -5928,6 +6027,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_moves_racing_frames);
     RUN_TEST(test_moves_with_bands);
     RUN_TEST(test_band_regions_merge);
+    RUN_TEST(test_band_clears_uncovered_columns);
     RUN_TEST(test_band_conversion_refused);
     RUN_TEST(test_band_move_while_running);
     RUN_TEST(test_moves_keep_rows_recent);
