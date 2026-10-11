@@ -192,11 +192,12 @@ shr_status shr_create(const shr_context_desc *d, shr_context **out) {
     SHR_VEC_INIT_HOT(&ctx->frame.provisional, shr_rect);
     SHR_VEC_INIT_HOT(&ctx->frame.resolved, shr__res *);
     SHR_VEC_INIT_HOT(&ctx->frame.prologue, shr_draw_cmd);
-    SHR_VEC_INIT_HOT(&ctx->frame.planned, shr__planned);
+    SHR_VEC_INIT(&ctx->frame.planned, shr__planned);
     SHR_VEC_INIT_HOT(&ctx->frame.kept, shr__kept);
     SHR_VEC_INIT_HOT(&ctx->frame.batches, shr__batch);
     lists &= shr__vec_reserve(&ctx->staged.rects, &al, SHR_MAX_DAMAGE) &&
-             shr__vec_reserve(&ctx->frame.damage, &al, SHR_MAX_DAMAGE);
+             shr__vec_reserve(&ctx->frame.damage, &al, SHR_MAX_DAMAGE) &&
+             shr__vec_reserve(&ctx->frame.planned, &al, (size_t)drv->caps.max_buffers + 1); /* + one refused an id */
     ctx->io = shr__calloc(&al, ctx->nio, sizeof(shr__io), SHR_ALIGNOF(shr__io), SHR_ALLOC_DESCRIPTOR);
     ctx->events = shr__calloc(&al, ctx->event_cap, sizeof(shr_event), SHR_ALIGNOF(shr_event), SHR_ALLOC_DESCRIPTOR);
     ctx->unreleased = shr__calloc(&al, d->max_unreleased_frames, sizeof(uint64_t), 8, SHR_ALLOC_DESCRIPTOR);

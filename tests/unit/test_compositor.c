@@ -2776,8 +2776,8 @@ static void tweak_limits_oom(shr_context_desc *d, shr_framebuffer_driver *drv) {
     drv->caps.max_buffers = limit_ids;
 }
 
-/* Every allocation of the buffer plan may fail (also while the plan grows past its earlier size, evicting or
- * releasing): the frame fails and the registry stays consistent. */
+/* Every allocation of the buffer plan may fail (evicting or releasing): the frame fails and the registry stays
+ * consistent. */
 TEST test_buffer_plan_out_of_memory(void) {
     static fake fk[25];
     limit_ids = 20;
@@ -2933,6 +2933,35 @@ TEST test_damage_lists_need_no_memory(void) {
     ASSERT_EQ_LL(ctx->targets[0].damage.rects.len, SHR_MAX_DAMAGE);
     frame(ctx);
     destroy_layers(&l, 1);
+    harness_close(&h);
+    ASSERT_EQ_LL(oom.live, 0);
+    PASS();
+}
+
+/* The buffer plan gets its room with the context, one more than the driver's ids: a frame drawing from more buffers
+ * than any before, one of them left without an id, asks for no memory. */
+TEST test_buffer_plan_needs_no_memory(void) {
+    static fake fk[10];
+    limit_ids = 9;
+    harness h;
+    shr_context *ctx = harness_open(&h, PRESERVED, tweak_limits_oom);
+    ASSERT(ctx->frame.planned.cap == limit_ids + 1 && ctx->frame.planned.kind == SHR_ALLOC_PAYLOAD);
+    for (int i = 0; i < 10; i++) fake_attach(&fk[i], ctx, &fk_ops);
+    shr_lyr *l;
+    ASSERT_EQ_LL(shr_lyr_create(ctx, 0, FULL, &l), SHR_OK);
+    shr__lcmd c[10];
+    for (int i = 0; i < 10; i++) c[i] = glyph(&fk[i], i % 5 * 8, i / 5 * 16, WHITE);
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, c, 10), SHR_OK);
+    frame(ctx);
+    for (int i = 0; i < 10; i++) c[i].color = GREEN;
+    ASSERT_EQ_LL(shr__lyr_group_set(l, 0, c, 10), SHR_OK);
+    oom.budget = 0;
+    frame(ctx);
+    oom.budget = -1;
+    ASSERT_EQ_LL(count_events(ctx, SHR_EVENT_PRESENT_FAILED, NULL), 0);
+    ASSERT(h.out.presents == 2 && ctx->short_bufs == 1);
+    destroy_layers(&l, 1);
+    for (int i = 0; i < 10; i++) fk[i].res.dead = true;
     harness_close(&h);
     ASSERT_EQ_LL(oom.live, 0);
     PASS();
@@ -5834,6 +5863,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_lines_out_of_memory);
     RUN_TEST(test_scattered_damage);
     RUN_TEST(test_damage_lists_need_no_memory);
+    RUN_TEST(test_buffer_plan_needs_no_memory);
     RUN_TEST(test_async_frames_keep_presenting);
     RUN_TEST(test_frame_out_of_memory_returns_damage);
     RUN_TEST(test_automatic_frames_wait_for_submit);

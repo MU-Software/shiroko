@@ -110,9 +110,7 @@ static shr_status plan_take(shr_context *ctx, shr__frame *f, shr__buf *b) {
 static shr_status frame_use(shr_context *ctx, shr__frame *f, shr__buf *b, bool spare) {
     if (b->used == f->frame_id) return SHR_OK;
     if (spare && f->taken + 1 >= ctx->driver.caps.max_buffers) return SHR_E_WOULD_BLOCK;
-    shr__planned *p = shr__vec_push(&f->planned, &ctx->al);
-    if (!p) return SHR_E_NO_MEMORY;
-    *p = (shr__planned){b, b->id};
+    *SHR_VEC_AT(&f->planned, shr__planned, f->planned.len++) = (shr__planned){b, b->id};
     uint64_t used = b->used;
     b->used = f->frame_id;
     shr__slot *s = b->id ? &ctx->slots[b->id - 1] : NULL;
