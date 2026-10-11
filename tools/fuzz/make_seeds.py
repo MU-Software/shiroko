@@ -386,6 +386,12 @@ SEEDS = {
         + limages(0, (0, (0, 0, 8, 8), (0, 0)), (1, (0, 0, 8, 8), (10, 0)), (2, (0, 0, 8, 8), (20, 0))) + SUBMIT + PUMP
         + ASYNC + SUBMIT + PUMP + update_image(0, (0, 0, 4, 4)) + COMPLETE + PUMP + SYNC + bytes([17, 0x41])
         + SUBMIT + PUMP + SUBMIT + PUMP + check(),
+        # two ids for three images: the top layer's image is left out, then drawn by the next frame alone; the check
+        # hides that layer; then again with two bands
+        bytes([1 | 8 | 16 | 32 | 64]) + image(0, 8, 8) + image(1, 8, 8) + image(2, 4, 4) + layer(0, 0, (0, 0, 64, 48))
+        + limages(0, (0, (0, 0, 8, 8), (0, 0)), (1, (0, 0, 8, 8), (10, 0))) + layer(1, 1, (0, 20, 64, 48))
+        + limage(1, 2, (0, 0, 4, 4), (20, 4)) + SUBMIT + PUMP + PUMP + PUMP + check() + bytes([25, 0x60, 7, 3])
+        + bytes([4, 0x81]) + SUBMIT + PUMP + PUMP + PUMP + check(),
     ],
 }
 

@@ -7,6 +7,8 @@
  *   - the driver only writes buffers the compositor owns; acquired surfaces always come back; an accepted
  *     submission's commands, destination and the memory it reads (buffers it names, composition) stay unchanged
  *     until its fence resolves
+ *   - with fewer ids than images (2), draws that get no id are left out and no frame fails for it; with 16 ids none
+ *     goes without; once a check hides the top layers until the shown images fit the ids, the output shows the model
  *   - buffer commands lead each batch with ids in 1..max_buffers, draws name registered ids (also after a failed
  *     batch, which forgets every id or first runs its buffer commands, or a reset, which forgets every id), and a
  *     driver keeping copies holds at most buffer_bytes at every REGISTER and draws what the images hold: every
@@ -113,6 +115,8 @@ static uint64_t clock_fn(void *user) {
 static void trace_fn(void *user, const shr_trace_event *ev) {
     (void)user;
     if (ev->kind == SHR_TRACE_SUBMIT && ev->id < MAX_FRAMES) h.submitted[ev->id] = true;
+    if (ev->kind == SHR_TRACE_RASTER_END)
+        FUZZ_CHECK(ev->value1 <= NIMAGES && (h.caps.max_buffers < NIDS || !ev->value1));
     if (ev->kind == SHR_TRACE_RASTER_BEGIN) {
         FUZZ_CHECK(now >= h.next_start);
         h.next_start = now + h.cap;
@@ -321,7 +325,7 @@ static void drain_events(void) {
             break;
         case SHR_EVENT_PRESENT_FAILED:
         case SHR_EVENT_FRAME_SUPERSEDED:
-            FUZZ_CHECK(ev.kind == SHR_EVENT_FRAME_SUPERSEDED || ev.status != SHR_OK);
+            FUZZ_CHECK(ev.kind == SHR_EVENT_FRAME_SUPERSEDED || (ev.status != SHR_OK && ev.status != SHR_E_LIMIT));
             if (f) {
                 FUZZ_CHECK(*f == FRAME_NONE);
                 *f = FRAME_ENDED;
@@ -397,9 +401,33 @@ static void draw_model(const shr_surface *screen, shr_color clear) {
     }
 }
 
+/* Hides the top layers until the images the shown layers draw fit the driver's ids. */
+static void fit_ids(void) {
+    for (;;) {
+        bool used[NIMAGES] = {0};
+        uint32_t n = 0;
+        int top = -1;
+        for (int i = 0; i < NLAYERS; i++) {
+            const mlayer *l = &h.layers[i];
+            bool images = false;
+            for (int j = 0; l->l && l->visible && j < l->n; j++)
+                if (l->cmds[j].image) {
+                    n += !used[l->cmds[j].img];
+                    used[l->cmds[j].img] = images = true;
+                }
+            const mlayer *t = top < 0 ? NULL : &h.layers[top];
+            if (images && (!t || l->z > t->z || (l->z == t->z && l->seq > t->seq))) top = i;
+        }
+        if (n <= h.caps.max_buffers) return;
+        FUZZ_CHECK(shr_lyr_set_visible(h.layers[top].l, false) == SHR_OK);
+        h.layers[top].visible = false;
+    }
+}
+
 /* Removes every fault, asks for the current state and lets everything finish; the output then shows the
  * model exactly. */
 static void check_model(const shr_screen_desc *sd) {
+    fit_ids();
     h.acquire_result = h.present_result = SHR_OK;
     h.driver_fail = h.driver_block = 0;
     h.async = false;
@@ -465,7 +493,7 @@ static int run_input(const uint8_t *data, size_t size, uint64_t cap) {
     shr_framebuffer_driver_init(&drv);
     drv.execute = d_execute, drv.reset = d_reset, drv.cancel = d_cancel;
     drv.caps.timeout_ns = (setup & 4) ? 1000 : 0;
-    drv.caps.max_buffers = (setup & 64) ? NIMAGES : NIDS; /* each image draws from one of its two buffers */
+    drv.caps.max_buffers = (setup & 64) ? NIMAGES - ((setup & 16) != 0) : NIDS; /* 2: fewer ids than images */
     drv.caps.buffer_flags = (setup & 128) ? SHR_BUFFER_COPIES : 0;
     drv.caps.buffer_bytes = (setup & 128) ? NIMAGES * IMAGE_BYTES : 0;
     drv.caps.max_keeps = (setup & 64) ? 2 : 0;

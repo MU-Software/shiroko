@@ -3,7 +3,7 @@ set(SHIROKO_FUZZ_CORPUS ${CMAKE_CURRENT_SOURCE_DIR}/corpus)
 
 # fuzz_package also starts from reduced real packages for this build's cell size, zstd and stored, in the smallest
 # page shape of at least two cells by one line (small enough for libFuzzer's input limit); byte 0 picks the role and
-# mode, byte 1 reseals the checksums (or also maps the package at an odd address).
+# mode, byte 1 reseals the checksums (or also maps the package at an odd address, or gives the driver 2 buffer ids).
 set(_pkgs ${CMAKE_CURRENT_BINARY_DIR}/seed-packages)
 set(_seeds ${CMAKE_CURRENT_BINARY_DIR}/seeds/fuzz_package)
 math(EXPR _min_w "2 * ${SHIROKO_CELL_WIDTH}")
@@ -24,7 +24,7 @@ for method in ("zstd", "stored"):
     for role, name in enumerate(["latin", "cjk-ko", "symbols", "emoji", "nerd"]):
         data = (src / method / f"shiroko-{name}.shrf").read_bytes()
         for mode, flags in ((0, 1), (0, 3), (0, 5), (0x08, 1), (0x08, 5), (0x10, 1), (0x20, 1), (0x20, 5), (0x40, 1),
-                            (0x40, 5), (0x80, 1), (0x88, 1)):
+                            (0x40, 5), (0x80, 1), (0x88, 1), (0, 9), (0x20, 9)):
             (out / f"shiroko-{name}-{method}-{mode:02x}-{flags}").write_bytes(bytes([role | mode, flags]) + data)
 (out / ".stamp").touch()
 ]])
