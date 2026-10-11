@@ -388,6 +388,7 @@ static size_t free_put(uint8_t *d, size_t at, size_t head, size_t align, size_t 
 }
 
 #ifdef SHR_ZSTD
+#define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
 
 static uint8_t zbuf[3][SY_CAP];
@@ -627,6 +628,50 @@ TEST test_out_of_memory(void) {
             }
         }
     }
+    PASS();
+}
+
+#ifdef SHR_ZSTD
+/* Hands the decoder's workspace out 4 bytes off 8, as ESP-IDF's malloc may. */
+static void *skew_base;
+static int skews;
+
+static void *skew_alloc(void *user, size_t size, size_t align, shr_alloc_kind kind) {
+    if (size != ZSTD_estimateDCtxSize()) return fa_alloc(user, size, align, kind);
+    skews++;
+    skew_base = fa_alloc(user, size + 8, 8, kind);
+    return skew_base ? (char *)skew_base + 4 : NULL;
+}
+
+static void skew_free(void *user, void *p, size_t size, size_t align, shr_alloc_kind kind) {
+    if (skew_base && p == (char *)skew_base + 4) p = skew_base, skew_base = NULL;
+    fa_free(user, p, size, align, kind);
+}
+#endif
+
+/* A decoder workspace the allocator did not align is freed and fails the package for good, reported. */
+TEST test_zstd_misaligned_workspace(void) {
+#ifdef SHR_ZSTD
+    oom = (fail_alloc){-1, 0};
+    oom_allocator = (shr_allocator){&oom, skew_alloc, skew_free, 0};
+    spkg d;
+    synth_m(&d, ROLE_LATIN, "", 'A', 'B', SY_A4, SY_ZSTD);
+    for (int mode = SRC_READ; mode <= SRC_MAP; mode++) {
+        harness h;
+        shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, tweak_oom);
+        tsrc s = {d.d, d.n, .mode = mode};
+        lib l = {.src = {[ROLE_LATIN] = &s}};
+        shr_pl_res_bitmap_font *f = h.font = font_new(ctx, &l, NULL);
+        shr__resolved r = {0};
+        skews = 0;
+        ASSERT_EQ_LL(load(ctx, f, glyph1(f, 'A'), &r), SHR_OK);
+        ASSERT(skews == 1 && !skew_base && !r.provisional && !f->zdc && f->pkg[ROLE_LATIN].state == PKG_FAILED);
+        ASSERT_EQ_LL(last_failure(ctx), SHR_E_INVALID_ARG);
+        ASSERT(!shr__bitmap_font_res(f)->ops->has_work(shr__bitmap_font_res(f)));
+        harness_close(&h);
+        ASSERT_EQ_LL(oom.live, 0);
+    }
+#endif
     PASS();
 }
 
@@ -3368,6 +3413,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_cluster_memo);
     RUN_TEST(test_synthetic_glyphs);
     RUN_TEST(test_zstd_round_trip);
+    RUN_TEST(test_zstd_misaligned_workspace);
     RUN_TEST(test_zstd_frames);
     RUN_TEST(test_trimmed_page);
     RUN_TEST(test_staging_charged);

@@ -190,7 +190,7 @@ shr_status shr__page_streams(const shr__page *p, const uint8_t *b, shr__streams 
 bool shr__page_valid(const shr__page *p, const uint8_t *atlas, const uint8_t *recs);
 
 /* decode.c, the only part that knows zstd */
-/* The font's decoder, once a package declares zstd in `features`. */
+/* The font's decoder, once a package declares zstd in `features`; SHR_E_INVALID_ARG: allocator ignored alignment. */
 shr_status shr__zinit(shr_pl_res_bitmap_font *f, uint32_t features);
 void shr__zfree(shr_pl_res_bitmap_font *f);
 /* Box `b` at `x` (its checksum checked) whose header is its entry's: its payload, in place when stored and `place`,

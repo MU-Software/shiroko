@@ -19,8 +19,8 @@ typedef struct shr__alloc {
 
 static inline void *shr__default_alloc(void *user, size_t size, size_t align, shr_alloc_kind kind) {
     (void)user, (void)kind;
-    if (align <= _Alignof(max_align_t)) return malloc(size);
-    return aligned_alloc(align, (size + align - 1) / align * align);
+    size_t a = align < sizeof(void *) ? sizeof(void *) : align; /* ESP-IDF malloc aligns to 4 only */
+    return size > SIZE_MAX - a ? NULL : aligned_alloc(a, (size + a - 1) / a * a);
 }
 
 static inline void shr__default_free(void *user, void *p, size_t size, size_t align, shr_alloc_kind kind) {

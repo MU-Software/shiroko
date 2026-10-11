@@ -64,9 +64,9 @@ typedef enum shr_alloc_kind {
     SHR_ALLOC_HOT = 1 << 8
 } shr_alloc_kind;
 
-/* Both functions or neither (NULL allocator = malloc/free). SHR_ALLOC_DMA
- * requests must return memory a DMA-only driver can access. flags: the hints (SHR_ALLOC_HOT) `kind` may carry; 0 =
- * plain kinds. free() receives the kind alloc() received. Other bits are SHR_E_INVALID_ARG. */
+/* Both functions or neither (NULL allocator = aligned_alloc/free). alloc() must honour `align`. SHR_ALLOC_DMA requests
+ * must return memory a DMA-only driver can access. flags: the hints (SHR_ALLOC_HOT) `kind` may carry; 0 = plain kinds.
+ * free() receives the kind alloc() received. Other bits are SHR_E_INVALID_ARG. */
 typedef struct shr_allocator {
     void *user;
     void *(*alloc)(void *user, size_t size, size_t align, shr_alloc_kind kind);

@@ -78,12 +78,18 @@ TEST hints_reach_only_allocators_asking_for_them(void) {
     PASS();
 }
 
-TEST default_allocator_honours_large_alignment(void) {
+/* Every alignment, not only what malloc gives (4 on ESP-IDF); sizes it cannot round up fail. */
+TEST default_allocator_honours_alignment(void) {
     shr__alloc al;
     shr__alloc_init(&al, NULL);
-    void *p = shr__malloc(&al, 3, 256, SHR_ALLOC_PAYLOAD);
-    ASSERT(p && (uintptr_t)p % 256 == 0);
-    shr__free(&al, p, 3, 256, SHR_ALLOC_PAYLOAD);
+    for (size_t align = 1; align <= 256; align *= 2)
+        for (size_t size = 1; size <= 33; size += 4) {
+            void *p = shr__malloc(&al, size, align, SHR_ALLOC_PAYLOAD);
+            ASSERT(p && (uintptr_t)p % align == 0);
+            memset(p, 0xA5, size);
+            shr__free(&al, p, size, align, SHR_ALLOC_PAYLOAD);
+        }
+    ASSERT(!shr__malloc(&al, SIZE_MAX, 8, SHR_ALLOC_PAYLOAD));
     uint64_t *q = SHR_NEW_ARRAY(&al, uint64_t, 4);
     ASSERT(q && q[0] == 0 && q[3] == 0);
     SHR_FREE_ARRAY(&al, q, uint64_t, 4);
@@ -387,7 +393,7 @@ int main(int argc, char **argv) {
     RUN_TEST(checked_sizes_detect_overflow);
     RUN_TEST(alloc_init_defaults_and_rejects_half_allocators);
     RUN_TEST(hints_reach_only_allocators_asking_for_them);
-    RUN_TEST(default_allocator_honours_large_alignment);
+    RUN_TEST(default_allocator_honours_alignment);
     RUN_TEST(calloc_zeroes_and_fails_cleanly);
     RUN_TEST(vec_grows_by_doubling_and_keeps_contents);
     RUN_TEST(vec_failures_leave_it_unchanged);

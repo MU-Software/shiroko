@@ -11,8 +11,10 @@ shr_status shr__zinit(shr_pl_res_bitmap_font *f, uint32_t features) {
     size_t n = ZSTD_estimateDCtxSize();
     void *ws = shr__malloc(&f->al, n, 8, SHR_ALLOC_PAYLOAD);
     if (!ws) return SHR_E_NO_MEMORY;
-    f->zdc = ZSTD_initStaticDCtx(ws, n); /* ws itself: zstd never allocates */
-    return SHR_OK;
+    f->zdc = ZSTD_initStaticDCtx(ws, n); /* ws itself: zstd never allocates; NULL when ws is not 8-aligned */
+    if (f->zdc) return SHR_OK;
+    shr__free(&f->al, ws, n, 8, SHR_ALLOC_PAYLOAD);
+    return SHR_E_INVALID_ARG;
 }
 
 void shr__zfree(shr_pl_res_bitmap_font *f) { shr__free(&f->al, f->zdc, ZSTD_estimateDCtxSize(), 8, SHR_ALLOC_PAYLOAD); }

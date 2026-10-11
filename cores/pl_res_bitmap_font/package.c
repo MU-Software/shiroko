@@ -164,9 +164,11 @@ bool shr__page_valid(const shr__page *p, const uint8_t *atlas, const uint8_t *re
     return true;
 }
 
-/* What decoding the metadata takes: the region buffer (read packages), `meta`, the decoder, and the page table. */
-static shr_status pkg_alloc(shr__pkg *pkg) {
+/* What decoding the metadata takes: the region buffer (read packages), `meta`, the decoder, and the page table.
+ * SHR_E_INVALID_ARG: the allocator ignored an alignment. */
+static shr_status pkg_alloc(shr__pkg *pkg, const char **why) {
     shr_pl_res_bitmap_font *f = pkg->font;
+    *why = "allocator did not align the zstd decoder workspace to 8";
     size_t region = pkg->ix.mapped ? 0 : (size_t)(pkg->ix.hi - pkg->ix.lo);
     if (!pkg->buf && region && !(pkg->buf = shr__malloc(&f->al, region, 8, SHR_ALLOC_PAYLOAD))) return SHR_E_NO_MEMORY;
     pkg->buf_len = region;
@@ -195,20 +197,25 @@ shr_status shr__pkg_map(shr__pkg *pkg, const char **why) {
     *why = "package too small";
     shr_status st = ix->size < SHR_PKG_HEADER ? SHR_E_FORMAT : shr__pkg_header(ix, why);
     if (st == SHR_OK) st = shr__pkg_index_parse(ix, ix->hdr + SHR_PKG_HEADER, why);
-    if (st == SHR_OK) st = pkg_alloc(pkg);
+    if (st == SHR_OK) st = pkg_alloc(pkg, why);
     if (st == SHR_OK) st = parse_meta(pkg, ix->hdr + ix->lo, why);
     if (st == SHR_OK) pkg_ready(pkg);
     return st;
 }
 
-/* A mapped package, decoded in place of the reads; one out of memory waits. */
+/* Out of memory waits; any other failure is final. */
+static void pkg_settle(shr__pkg *pkg, shr_status st, const char *why) {
+    if (st == SHR_E_NO_MEMORY)
+        shr__retry_memory(pkg->font, &pkg->retry);
+    else
+        pkg_fail(pkg, st, why);
+}
+
+/* A mapped package, decoded in place of the reads. */
 static void pkg_mapped(shr__pkg *pkg) {
     const char *why;
     shr_status st = shr__pkg_map(pkg, &why);
-    if (st == SHR_E_NO_MEMORY)
-        shr__retry_memory(pkg->font, &pkg->retry);
-    else if (st != SHR_OK)
-        pkg_fail(pkg, st, why);
+    if (st != SHR_OK) pkg_settle(pkg, st, why);
 }
 
 void shr__pkg_name(const shr__pkg *pkg, char name[40]) {
@@ -277,10 +284,17 @@ void shr__pkg_advance(shr__pkg *pkg) {
         if (!pkg->buf && (pkg->buf = shr__malloc(&f->al, len, 8, SHR_ALLOC_PAYLOAD))) pkg->buf_len = len;
         dst = pkg->buf;
         break;
-    default: /* LOAD_META */
+    default: { /* LOAD_META */
         off = pkg->ix.lo, len = (uint32_t)(pkg->ix.hi - pkg->ix.lo);
-        dst = pkg_alloc(pkg) == SHR_OK ? pkg->buf : NULL;
+        const char *why;
+        shr_status st = pkg_alloc(pkg, &why);
+        if (st != SHR_OK) {
+            pkg_settle(pkg, st, why);
+            return;
+        }
+        dst = pkg->buf;
         break;
+    }
     }
     if (!dst) {
         shr__retry_memory(f, &pkg->retry);
