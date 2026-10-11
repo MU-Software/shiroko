@@ -2,6 +2,7 @@
 #define SHIROKO_SHR_BITMAP_FONT_H
 
 #include "shr_compositor.h"
+#include "shr_package.h"
 #include "shr_unicode.h"
 
 /* The built-in package (ASCII + U+FFFD), baked by the build into the library for the build's cell size. */
@@ -18,10 +19,6 @@ shr_status shr__bitmap_font_glyph(shr_pl_res_bitmap_font *font, const uint32_t *
 shr__res *shr__bitmap_font_res(shr_pl_res_bitmap_font *font);
 
 /* Line positions from the cell top, from the built-in package (same font and cell size). */
-typedef struct shr__line_metrics {
-    int32_t baseline, underline_y, strike_y;
-} shr__line_metrics;
-
 shr__line_metrics shr__bitmap_font_line_metrics(void);
 
 #endif

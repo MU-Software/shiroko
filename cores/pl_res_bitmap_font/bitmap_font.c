@@ -2,7 +2,7 @@
 
 static shr_pl_res_bitmap_font *font_of(const shr__res *res) { return SHR_CONTAINER(res, shr_pl_res_bitmap_font, res); }
 
-static bool has_async(const shr__pkg *pkg) { return !pkg->mapped && pkg->src.read; }
+static bool has_async(const shr__pkg *pkg) { return !pkg->ix.mapped && pkg->src.read; }
 
 static void font_free(shr_pl_res_bitmap_font *f) {
     for (int r = 0; r < ROLE_COUNT; r++) shr__pkg_release(&f->pkg[r]);

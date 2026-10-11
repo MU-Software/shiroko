@@ -360,6 +360,31 @@ typedef struct shr_activation {
 shr_status shr_pl_res_bitmap_font_activation_select(const uint8_t *a, size_t a_length, const uint8_t *b,
                                                     size_t b_length, shr_activation *out);
 
+typedef enum shr_package_role {
+    SHR_PACKAGE_LATIN = 1,
+    SHR_PACKAGE_CJK,
+    SHR_PACKAGE_SYMBOLS,
+    SHR_PACKAGE_EMOJI,
+    SHR_PACKAGE_NERD
+} shr_package_role;
+
+typedef struct shr_package_info {
+    shr_package_role role;
+    char locale[9];        /* a CJK package's glyph variant ("ko", "ja", "zh-Hans", ...); "" for the other roles */
+    uint16_t cell_width;   /* the cell size the package was baked for */
+    uint16_t cell_height;
+} shr_package_info;
+
+/* Describes a package without a font, e.g. for open() to pick among packages baked for several cell sizes. Checks
+ * the header, the index and the mani and inst boxes as a font does when it opens the package (the other boxes and
+ * the pages only then), at any cell size. Reads a read() source from the calling thread: four reads of at most
+ * 1048 bytes, each finished before read() returns. A source whose read() may return SHR_IN_PROGRESS must have
+ * cancel(): such a read is cancelled and gives SHR_E_UNSUPPORTED. SHR_E_WOULD_BLOCK from read() is returned, other
+ * failed reads give SHR_E_IO. The source is not closed; pass one no font holds. SHR_E_FORMAT, SHR_E_CHECKSUM,
+ * SHR_E_UNSUPPORTED, SHR_E_PROFILE_MISMATCH or SHR_E_LIMIT as a font would fail the package; *out is zeroed on
+ * error. */
+shr_status shr_pl_res_bitmap_font_package_info(const shr_asset_source *source, shr_package_info *out);
+
 /* ===== Tilemap layer =====
  * A grid of SHR_CELL_WIDTH x SHR_CELL_HEIGHT cells in a layer, updated cell by cell. */
 

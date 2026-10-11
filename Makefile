@@ -110,10 +110,10 @@ define cov_run
 	awk '/^TOTAL/ { for (i = 4; i <= NF; i += 3) if ($$i + 0 < $(COV_MIN)) bad = 1 } END { exit bad }' $(1)/report.txt \
 	    || { echo "coverage below $(COV_MIN)%"; exit 1; }
 endef
-# The font plugin also without zstd, where decode.c is stored-only.
+# The font plugin and the package checks also without zstd, where decode.c is stored-only.
 coverage: $(FETCHED)
 	$(call cov_run,$(COV),,cores ports/software)
-	$(call cov_run,$(COV)-nozstd,-DSHIROKO_ZSTD=OFF,cores/pl_res_bitmap_font)
+	$(call cov_run,$(COV)-nozstd,-DSHIROKO_ZSTD=OFF,cores/pl_res_bitmap_font cores/shared/shr_package.c)
 
 bench: $(FETCHED)
 	cmake --preset release $(CMAKE_HOST)

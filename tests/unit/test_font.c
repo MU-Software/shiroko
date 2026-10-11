@@ -69,6 +69,18 @@ static void ts_complete(shr_context *ctx, tsrc *s, shr_status result) {
     ASSERT_EQ_LL(shr_asset_complete(ctx, r.request, result), SHR_OK);
 }
 
+static shr_asset_source ts_source(tsrc *s) {
+    shr_asset_source src;
+    shr_asset_source_init(&src);
+    src.user = s;
+    src.size = s->claim ? s->claim : s->size;
+    if (s->mode == SRC_MAP) src.data = s->data;
+    if (s->mode == SRC_READ) src.read = ts_read;
+    src.cancel = s->cancellable ? ts_cancel : NULL;
+    src.close = ts_close;
+    return src;
+}
+
 /* The packages an open() callback serves, by role; NULL = not installed. */
 typedef struct lib {
     tsrc *src[ROLE_COUNT];
@@ -96,13 +108,7 @@ static shr_status lib_open(void *user, const char *name, shr_asset_source *out) 
     tsrc *s = role < ROLE_COUNT ? l->src[role] : NULL;
     if (!s) return SHR_E_NOT_FOUND;
     if (s->open_result) return s->open_result;
-    shr_asset_source_init(out);
-    out->user = s;
-    out->size = s->claim ? s->claim : s->size;
-    if (s->mode == SRC_MAP) out->data = s->data;
-    if (s->mode == SRC_READ) out->read = ts_read;
-    out->cancel = s->cancellable ? ts_cancel : NULL;
-    out->close = ts_close;
+    *out = ts_source(s);
     return SHR_OK;
 }
 
@@ -771,6 +777,11 @@ static void run_cases(const mutation *cases, size_t n, const sy_raw *base, bool 
             shr_status st = pkg_status(ctx, &s);
             if (st != cases[i].want) fprintf(stderr, "mode %d case %zu\n", mode, i);
             ASSERT_EQ_LL(st, cases[i].want);
+            tsrc t = {d.d, d.n, .mode = mode}; /* package_info checks a part of what the font does */
+            shr_asset_source src = ts_source(&t);
+            shr_package_info info;
+            shr_status is = shr_pl_res_bitmap_font_package_info(&src, &info);
+            ASSERT_EQ_LL(is == SHR_OK || is == st, 1);
             if (pages && mode == SRC_READ) ASSERT_EQ_LL(s.calls, 3 + (st == SHR_E_CHECKSUM ? 4 : 1) + 1);
         }
     harness_close(&h);
@@ -3191,6 +3202,118 @@ TEST test_powerline_meets_cell_edge(void) {
 
 /* ===== Activation records ===== */
 
+static shr_status info_of(tsrc *s, shr_package_info *out) {
+    shr_asset_source src = ts_source(s);
+    return shr_pl_res_bitmap_font_package_info(&src, out);
+}
+
+static bool info_is(const shr_package_info *i, shr_package_role role, const char *locale, int w, int h) {
+    return i->role == role && !strcmp(i->locale, locale) && i->cell_width == w && i->cell_height == h;
+}
+
+TEST test_package_info(void) {
+    static const char *const names[5] = {"latin", "cjk-ko", "symbols", "emoji", "nerd"};
+    shr_package_info info;
+    for (int i = 0; i < 5; i++) { /* this build's packages, mapped and read from their files */
+        blob b = read_package(names[i]);
+        ASSERT(b.size > 0);
+        tsrc s = {b.data, b.size, .mode = SRC_MAP};
+        ASSERT_EQ_LL(info_of(&s, &info), SHR_OK);
+        ASSERT(info_is(&info, (shr_package_role)(i + 1), i == 1 ? "ko" : "", CW, CH));
+        free(b.data);
+        char file[40];
+        snprintf(file, sizeof(file), "shiroko-%s.shrf", names[i]);
+        shr_asset_source src;
+        ASSERT_EQ_LL(font_dir_open(NULL, file, &src), SHR_OK);
+        memset(&info, 0xFF, sizeof(info));
+        ASSERT_EQ_LL(shr_pl_res_bitmap_font_package_info(&src, &info), SHR_OK);
+        ASSERT(info_is(&info, (shr_package_role)(i + 1), i == 1 ? "ko" : "", CW, CH));
+        src.close(src.user);
+    }
+    shr_asset_source builtin;
+    shr_asset_source_init(&builtin);
+    builtin.data = shr__builtin_package, builtin.size = shr__builtin_package_size;
+    shr__pkg_desc desc;
+    const char *why;
+    ASSERT_EQ_LL(shr__pkg_describe(&builtin, &desc, &why), SHR_OK);
+    shr__line_metrics lm = shr__bitmap_font_line_metrics();
+    ASSERT(desc.role == ROLE_LATIN && desc.cell_width == CW && desc.line_height == CH &&
+           (desc.format == SY_A4 || desc.format == SY_A8) && desc.page_width >= 64 && desc.page_height >= 64 && !why);
+    ASSERT(desc.lines.baseline == lm.baseline && desc.lines.underline_y == lm.underline_y &&
+           desc.lines.strike_y == lm.strike_y);
+
+    static sy_raw r;
+    static spkg d;
+    harness h;
+    shr_context *ctx = harness_open(&h, SHR_OUTPUT_RELEASE_ON_PRESENT, NULL);
+    sy_init(&r, ROLE_LATIN, "", 'A', 'B', SY_A4); /* another cell size: described, but no font takes it */
+    put(r.box[BOX_INST] + 4, CH + 2, 2), put(r.box[BOX_INST] + 6, CW + 1, 2);
+    assemble(&d, &r, SY_STORED);
+    for (int mode = SRC_READ; mode <= SRC_MAP; mode++) {
+        tsrc s = {d.d, d.n, .mode = mode};
+        ASSERT_EQ_LL(info_of(&s, &info), SHR_OK);
+        ASSERT(info_is(&info, SHR_PACKAGE_LATIN, "", CW + 1, CH + 2));
+        ASSERT_EQ_LL(s.calls, mode == SRC_READ ? 4 : 0);
+        ASSERT_EQ_LL(pkg_status(ctx, &s), SHR_E_UNSUPPORTED);
+    }
+    harness_close(&h);
+    synth_as(&d, ROLE_CJK, "zh-Hant", 'A', 'B', SY_A8); /* what the package says, whatever its file name */
+    for (int mode = SRC_READ; mode <= SRC_MAP; mode++) {
+        tsrc s = {d.d, d.n, .mode = mode};
+        ASSERT_EQ_LL(info_of(&s, &info), SHR_OK);
+        ASSERT(info_is(&info, SHR_PACKAGE_CJK, "zh-Hant", CW, CH));
+    }
+
+    static const mutation cases[] = {
+        {AT_LEN, BOX_MANI, 0, 0, 100, SHR_E_FORMAT}, /* boxes larger than a mani or inst can be */
+        {AT_LEN, BOX_INST, 0, 0, 100, SHR_E_FORMAT},
+        {AT_BOX, BOX_INST, 8, 2, 1, SHR_E_FORMAT},  /* box header unlike its entry */
+        {AT_RAW, BOX_INST, 4, 2, 0, SHR_E_FORMAT},  /* instance size */
+        {AT_FILE, 0, 16, 2, 5, SHR_E_FORMAT},       /* format v5 */
+        {AT_RAW, BOX_MANI, 0, 1, 7, SHR_E_FORMAT},  /* role */
+    };
+    sy_init(&r, ROLE_LATIN, "", 'A', 'B', SY_A4);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        for (int mode = SRC_READ; mode <= SRC_MAP; mode++) {
+            mutate(&d, &r, SY_STORED, &cases[i]);
+            tsrc s = {d.d, d.n, .mode = mode};
+            memset(&info, 0xFF, sizeof(info));
+            ASSERT_EQ_LL(info_of(&s, &info), cases[i].want);
+            ASSERT(info_is(&info, (shr_package_role)0, "", 0, 0)); /* zeroed */
+        }
+    for (int box = 0; box < 2; box++) /* a mani or inst whose bytes differ from its checksum */
+        for (int mode = SRC_READ; mode <= SRC_MAP; mode++) {
+            synth(&d);
+            sy_box(d.d, box ? "inst" : "mani")[20] ^= 1;
+            tsrc s = {d.d, d.n, .mode = mode};
+            ASSERT_EQ_LL(info_of(&s, &info), SHR_E_CHECKSUM);
+        }
+
+    synth(&d);
+    for (int mode = SRC_READ; mode <= SRC_NONE; mode++) { /* too small; a source with neither data nor read() */
+        tsrc s = {d.d, 127, .mode = mode};
+        ASSERT_EQ_LL(info_of(&s, &info), mode == SRC_NONE ? SHR_E_INVALID_ARG : SHR_E_FORMAT);
+    }
+    tsrc s = {d.d, d.n, .mode = SRC_READ};
+    shr_asset_source src = ts_source(&s);
+    ASSERT_EQ_LL(shr_pl_res_bitmap_font_package_info(NULL, &info), SHR_E_INVALID_ARG);
+    ASSERT_EQ_LL(shr_pl_res_bitmap_font_package_info(&src, NULL), SHR_E_INVALID_ARG);
+    static const shr_status reads[][4] = {
+        /* the header, index, mani and inst reads: a deferred one is cancelled, a refused one returned */
+        {SHR_IN_PROGRESS}, {0, SHR_E_WOULD_BLOCK}, {0, 0, SHR_E_IO}, {0, 0, 0, SHR_E_TIMEOUT}};
+    static const shr_status want[] = {SHR_E_UNSUPPORTED, SHR_E_WOULD_BLOCK, SHR_E_IO, SHR_E_IO};
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        s = (tsrc){d.d, d.n, .mode = SRC_READ, .cancellable = true};
+        memcpy(s.script, reads[i], sizeof(reads[i]));
+        ASSERT_EQ_LL(info_of(&s, &info), want[i]);
+        ASSERT(s.cancels == (i == 0) && !s.pending);
+    }
+    s = (tsrc){d.d, d.n, .mode = SRC_READ, .script = {SHR_IN_PROGRESS}}; /* without cancel(): left to the source */
+    ASSERT_EQ_LL(info_of(&s, &info), SHR_E_UNSUPPORTED);
+    ASSERT(s.pending == 1 && !s.closes);
+    PASS();
+}
+
 TEST test_activation_select(void) {
     uint8_t a[64] = "SHRFACT2", b[64] = "SHRFACT2";
     put(a + 8, 1, 8), put(b + 8, 2, 8);
@@ -3289,6 +3412,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_real_packages);
     RUN_TEST(test_real_emoji_sequences);
     RUN_TEST(test_powerline_meets_cell_edge);
+    RUN_TEST(test_package_info);
     RUN_TEST(test_activation_select);
     GREATEST_MAIN_END();
 }

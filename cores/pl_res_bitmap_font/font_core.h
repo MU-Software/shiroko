@@ -5,43 +5,24 @@
 #include "shr_hash.h"
 #include "shr_lru.h"
 
-#define SHR_PKG_VERSION 6
-#define SHR_PKG_HEADER 128
-#define SHR_PKG_ENTRY 32 /* sidx entries */
-#define SHR_PKG_PTAB 24  /* ptab entries */
 #define SHR_PKG_CTRI 2192 /* offset of the ctri level-2 blocks */
-#define SHR_PKG_MAX_BOXES 32
-#define SHR_PKG_MAX_RECORDS (1u << 22)
 #define SHR_PKG_MAX_PAGES (1u << 16)
 #define SHR_PKG_MAX_PAGE_GLYPHS 4096
 #define SHR_PKG_MAX_PAGE_BYTES (1u << 20)
 #define SHR_PKG_PAGE_ALIGN 256 /* stored atlases in the file */
-#define SHR_PKG_MAX_META ((uint64_t)128 << 20)
 #define SHR_PKG_MAX_WINDOW (1u << 18)
-#define SHR_PKG_REQUIRED 1u /* box flag */
-#define SHR_PKG_ZSTD 8u     /* required feature: some box is zstd */
-#ifdef SHR_ZSTD
-#define SHR_PKG_FEATURES 15u
-#else
-#define SHR_PKG_FEATURES 7u
-#endif
 /* Glyph values besides page << 12 | record: no glyph, a glyph that draws nothing, a cluster not looked up yet. */
 #define SHR_GID_MISS 0xFFFFFFFFu
 #define SHR_GID_BLANK 0xFFFFFFFEu
 #define SHR_GID_UNKNOWN 0xFFFFFFFDu
-#define SHR_MAX_CELL_SIZE 1024
 #define SHR_FONT_MAX_CLUSTERS (1u << 16)
 #define SHR_FONT_MEMO_BITS 9
 #define SHR_FONT_MEMO (1u << SHR_FONT_MEMO_BITS)
 
-/* Package roles as stored in MANIFEST; the built-in package takes slot 0. */
-enum { ROLE_BUILTIN, ROLE_LATIN, ROLE_CJK, ROLE_SYMBOLS, ROLE_EMOJI, ROLE_NERD, ROLE_COUNT };
 enum { PKG_UNOPENED, PKG_ABSENT, PKG_LOADING, PKG_READY, PKG_FAILED };
 enum { LOAD_HEADER, LOAD_INDEX, LOAD_META };
 enum { PAGE_ABSENT, PAGE_LOADING, PAGE_READY, PAGE_FAILED };
 enum { GLYPH_READY, GLYPH_PENDING, GLYPH_MISSING, GLYPH_BLANK, GLYPH_NO_MEMORY };
-/* The metadata boxes, in their file order. */
-enum { BOX_MANI, BOX_STRS, BOX_SRCS, BOX_INST, BOX_CTRI, BOX_SEQS, BOX_POOL, BOX_PTAB, BOX_COVR, BOX_COUNT };
 
 /* Attempts of a package or page. A failed or refused one runs again from `at` or once a source signals
  * readiness after `ready` was read. One waiting for memory (`wake` set) runs again once the font's wake moved
@@ -82,26 +63,17 @@ typedef struct shr__page {
     shr__lru_node lru; /* in the font's lru (unpinned) or pinned list */
 } shr__page;
 
-/* A metadata box from the index; size 0 = absent. */
-typedef struct shr__box {
-    uint64_t off, xxh3;
-    uint32_t size, raw, flags;
-} shr__box;
-
 struct shr__pkg {
     shr_pl_res_bitmap_font *font;
     uint8_t role, state, step;
-    bool mapped, step_busy, wanted;
+    bool step_busy, wanted;
     shr_asset_source src;
-    const uint8_t *hdr; /* `header` or the mapped data */
+    shr__pkg_index ix; /* ix.hdr: `header` or the mapped data */
     uint8_t header[SHR_PKG_HEADER];
     uint8_t *buf, *meta; /* the index or metadata region being read; the decoded metadata boxes */
-    size_t buf_len, meta_len;
-    shr__box box[BOX_COUNT];
-    uint8_t order[BOX_COUNT], nbox; /* the boxes present, by offset */
-    uint64_t lo, hi, end;           /* the metadata region; the end of the last indexed box */
+    size_t buf_len;
     shr__retry retry;
-    uint32_t nseqs, npages;
+    uint32_t nseqs;
     const uint8_t *ctri, *ctri_data, *seqs, *pool, *ptab; /* ctri_data: its data blocks */
     uint8_t format;
     int16_t baseline;
@@ -190,11 +162,6 @@ static inline uint32_t shr__ctri_get(const shr__pkg *pkg, uint32_t cp) {
     uint32_t b = shr__rd16(pkg->ctri + 16 + 2 * (cp >> 10));
     uint32_t d = shr__rd16(pkg->ctri + SHR_PKG_CTRI + 128 * b + 2 * (cp >> 4 & 63));
     return shr__rd32(pkg->ctri_data + 64 * d + 4 * (cp & 15));
-}
-
-/* Bytes of `meta` a box takes, in multiples of 64: none when stored in a mapped package (used in place). */
-static inline size_t shr__box_room(const shr__pkg *pkg, const shr__box *b) {
-    return (((size_t)b->raw + 63) & ~(size_t)63) * ((pkg->mapped == 0) | (b->flags >> 4));
 }
 
 /* The streams of a page box. */

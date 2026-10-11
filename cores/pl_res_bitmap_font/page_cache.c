@@ -103,7 +103,7 @@ static shr_status page_fill(shr_pl_res_bitmap_font *f, shr__page *p, const uint8
     *why = "font page invalid";
     shr_status st = shr__page_streams(p, b, &s);
     if (st != SHR_OK) return st;
-    if (pkg->mapped & (s.method == 0)) {
+    if (pkg->ix.mapped & (s.method == 0)) {
         if (!shr__page_valid(p, s.atlas, s.recs)) return SHR_E_FORMAT;
         shr__page_slot *w = SHR_NEW(&f->al, shr__page_slot);
         if (!w) return SHR_E_NO_MEMORY;
@@ -133,12 +133,12 @@ static shr_status page_fill(shr_pl_res_bitmap_font *f, shr__page *p, const uint8
 /* The built-in package's pages, ready for the font's lifetime outside the page cache. */
 shr_status shr__pages_builtin(shr__pkg *pkg) {
     shr_pl_res_bitmap_font *f = pkg->font;
-    for (uint32_t i = 0; i < pkg->npages; i++) {
+    for (uint32_t i = 0; i < pkg->ix.npages; i++) {
         shr__page *p = pkg->pages[i] = SHR_NEW(&f->al, shr__page);
         if (!p) return SHR_E_NO_MEMORY;
         *p = (shr__page){.pkg = pkg, .index = i, .state = PAGE_READY};
         const char *why;
-        shr_status st = page_fill(f, p, pkg->hdr + shr__rd64(shr__page_rec(p)), false, &why);
+        shr_status st = page_fill(f, p, pkg->ix.hdr + shr__rd64(shr__page_rec(p)), false, &why);
         if (st != SHR_OK) return st;
     }
     return SHR_OK;
@@ -147,9 +147,9 @@ shr_status shr__pages_builtin(shr__pkg *pkg) {
 /* With the package: no page is in a list (the package never became ready) or the font goes away. */
 void shr__pages_free(shr__pkg *pkg) {
     shr_pl_res_bitmap_font *f = pkg->font;
-    for (uint32_t i = 0; pkg->pages && i < pkg->npages; i++)
+    for (uint32_t i = 0; pkg->pages && i < pkg->ix.npages; i++)
         if (pkg->pages[i]) page_free(f, pkg->pages[i]);
-    shr__free(&f->al, pkg->pages, pkg->npages * sizeof(shr__page *), SHR_ALIGNOF(shr__page *), SHR_ALLOC_PAYLOAD);
+    shr__free(&f->al, pkg->pages, pkg->ix.npages * sizeof(shr__page *), SHR_ALIGNOF(shr__page *), SHR_ALLOC_PAYLOAD);
 }
 
 static void page_fail(shr__page *p, shr_status st, const char *why) {
@@ -195,7 +195,7 @@ void shr__page_done(shr__page *p, shr_status result) {
 bool shr__page_due(const shr__page *p, uint64_t now) {
     const shr_pl_res_bitmap_font *f = p->pkg->font;
     return p->want == f->frame && p->state == PAGE_ABSENT && shr__retry_due(f, &p->retry, now) &&
-           (p->pkg->mapped || !f->blocked); /* cooling pages leave the wants in the pump that cools them */
+           (p->pkg->ix.mapped || !f->blocked); /* cooling pages leave the wants in the pump that cools them */
 }
 
 static void page_load(shr_pl_res_bitmap_font *f, shr__page *p, uint64_t now) {
@@ -204,8 +204,8 @@ static void page_load(shr_pl_res_bitmap_font *f, shr__page *p, uint64_t now) {
     uint32_t size = shr__rd32(e + 16);
     const char *why = "font page checksum";
     shr_status st = SHR_E_CHECKSUM;
-    if (pkg->mapped) {
-        const uint8_t *b = pkg->hdr + shr__rd64(e);
+    if (pkg->ix.mapped) {
+        const uint8_t *b = pkg->ix.hdr + shr__rd64(e);
         if (XXH3_64bits(b, size) == shr__rd64(e + 8)) st = page_fill(f, p, b, true, &why);
     } else {
         why = "font page beyond the page cache or driver";
@@ -222,7 +222,7 @@ static void page_load(shr_pl_res_bitmap_font *f, shr__page *p, uint64_t now) {
         page_fail(p, st, why);
         return;
     }
-    if (pkg->mapped) {
+    if (pkg->ix.mapped) {
         page_ready(f, p);
         return;
     }
@@ -259,8 +259,8 @@ int shr__preload_role(const shr_pl_res_bitmap_font *f) {
     if (f->wants.len || f->preloading || f->delivered) return 0; /* frames first, one page per pump */
     for (int r = ROLE_LATIN; r < ROLE_COUNT; r++) {
         const shr__pkg *pkg = &f->pkg[r];
-        if (pkg->state == PKG_READY && pkg->preload_next < pkg->preload && pkg->preload_next < pkg->npages &&
-            (pkg->mapped || !f->blocked))
+        if (pkg->state == PKG_READY && pkg->preload_next < pkg->preload && pkg->preload_next < pkg->ix.npages &&
+            (pkg->ix.mapped || !f->blocked))
             return r;
     }
     return 0;
@@ -274,7 +274,8 @@ void shr__pages_preload(shr_pl_res_bitmap_font *f) {
     shr__pkg *pkg = &f->pkg[role];
     uint32_t i = pkg->preload_next++;
     const uint8_t *e = pkg->ptab + SHR_PKG_PTAB * (uint64_t)i;
-    uint64_t need = (uint64_t)pkg->atlas_h * pkg->stride + 16ull * shr__rd16(e + 20) + shr__rd32(e + 16) * !pkg->mapped;
+    uint64_t need =
+        (uint64_t)pkg->atlas_h * pkg->stride + 16ull * shr__rd16(e + 20) + shr__rd32(e + 16) * !pkg->ix.mapped;
     if (f->page_bytes + need > f->cache_bytes) pkg->preload = 0;
     if (pkg->pages[i] || !pkg->preload) return;
     shr__page *p = SHR_NEW(&f->al, shr__page);

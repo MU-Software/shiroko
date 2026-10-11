@@ -1,10 +1,5 @@
 #include "font_core.h"
 
-static bool header_is(const shr__box *b, const char *type, const uint8_t *x) {
-    return shr__rd32(x) == b->size && !memcmp(x + 4, type, 4) && !shr__rd16(x + 8) && shr__rd16(x + 10) == b->flags &&
-           shr__rd32(x + 12) == b->raw;
-}
-
 #ifdef SHR_ZSTD
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
@@ -33,7 +28,7 @@ static bool unzstd(shr_pl_res_bitmap_font *f, const uint8_t *src, size_t n, uint
 
 const uint8_t *shr__box_payload(shr_pl_res_bitmap_font *f, const shr__box *b, const char *type, const uint8_t *x,
                                 uint8_t *dst, bool place) {
-    if (!header_is(b, type, x)) return NULL;
+    if (!shr__box_header_is(b, type, x)) return NULL;
     if (b->flags >> 4) return unzstd(f, x + 16, b->size - 16, dst, b->raw) ? dst : NULL;
     return place ? x + 16 : memcpy(dst, x + 16, b->raw);
 }
@@ -61,7 +56,7 @@ void shr__zfree(shr_pl_res_bitmap_font *f) { (void)f; }
 const uint8_t *shr__box_payload(shr_pl_res_bitmap_font *f, const shr__box *b, const char *type, const uint8_t *x,
                                 uint8_t *dst, bool place) {
     (void)f;
-    if (!header_is(b, type, x)) return NULL;
+    if (!shr__box_header_is(b, type, x)) return NULL;
     return place ? x + 16 : memcpy(dst, x + 16, b->raw);
 }
 

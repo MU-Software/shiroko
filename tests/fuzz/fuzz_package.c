@@ -10,7 +10,8 @@
  * (else 256-aligned, so stored pages can be drawn in place), PRELOAD preloads all its pages first, FEW_IDS gives the
  * driver 2 buffer ids (glyphs on pages beyond them draw fallbacks). Invariants: no out-of-bounds access, every frame
  * rasters (bad packages or pages, or pages without an id, fall back), both paths draw the same pixels while reads are
- * faithful, each opened source is closed. */
+ * faithful, each opened source is closed, shr_pl_res_bitmap_font_package_info() describes the package alike mapped
+ * and read. */
 #include "fuzz_common.h"
 #include "shr_hash.h"
 
@@ -225,6 +226,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     FUZZ_CHECK(buf);
     memcpy(pkg, data + 2, n);
     if (flags & RESEAL) reseal(pkg, n);
+    pkg_source plain = {.data = pkg, .size = n};
+    shr_asset_source mapped, read;
+    shr_asset_source_init(&mapped), shr_asset_source_init(&read);
+    mapped.data = pkg, mapped.size = read.size = n, read.user = &plain, read.read = src_read;
+    shr_package_info a, b;
+    shr_status sa = shr_pl_res_bitmap_font_package_info(&mapped, &a),
+               sb = shr_pl_res_bitmap_font_package_info(&read, &b);
+    FUZZ_CHECK(sa == sb && a.role == b.role && !memcmp(a.locale, b.locale, sizeof(a.locale)) &&
+               a.cell_width == b.cell_width && a.cell_height == b.cell_height);
     preload = flags & PRELOAD;
     few_ids = flags & FEW_IDS;
     const char *name = roles[(mode & 7) % 5];

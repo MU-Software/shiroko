@@ -34,7 +34,8 @@ The build bakes the fonts for one cell size, `SHIROKO_CELL_WIDTH` x `SHIROKO_CEL
 height 8..127; `make CELL_WIDTH=10 CELL_HEIGHT=20 ...`; the Tab5 targets take `TAB5_CELL_WIDTH` x `TAB5_CELL_HEIGHT`,
 default 12x24). The built-in package (ASCII + U+FFFD) is compiled into the library; the other packages go to
 `<build dir>/fonts` with their NOTICE, LICENSES/ and inventory.json (target `shiroko_fonts`, part of the default build
-when Shiroko is the top-level project).
+when Shiroko is the top-level project). `shr_pl_res_bitmap_font_package_info()` reads a package's role, CJK locale and
+cell size from its source, so an `open()` callback can pick among packages baked for several cell sizes.
 
 The default packages are `latin`, `cjk-ko`, `symbols`, `emoji` and `nerd`, so the only CJK glyph variant is
 Korean. For the `ja`, `zh-Hans`, `zh-Hant` and `zh-HK` variants (`shr_pl_res_bitmap_font_desc.locale`),
